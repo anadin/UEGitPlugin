@@ -53,6 +53,19 @@ namespace GitSourceControlConstants
 {
 /** The maximum number of files we submit in a single Git command */
 const int32 MaxFilesPerBatch = 50;
+
+/**
+ * If a Git subprocess produces no output on stdout or stderr for this long, assume it has
+ * hung (waiting on a credential prompt that can never be answered, a dead network socket,
+ * a stale lock, ...) and terminate it rather than freezing the calling thread forever.
+ * Long-but-healthy operations (clone, big fetch, LFS transfer) keep printing progress and
+ * so keep resetting this timer.
+ * TODO: expose as a source control setting.
+ */
+const double CommandIdleTimeoutSeconds = 300.0;
+
+/** Rough upper bound for a single command line before the OS rejects it (Windows ~32767). */
+const int32 MaxCommandLineLength = 30000;
 } // namespace GitSourceControlConstants
 
 FGitScopedTempFile::FGitScopedTempFile(const FText& InText)
@@ -80,11 +93,24 @@ const FString& FGitScopedTempFile::GetFilename() const
 	return Filename;
 }
 
+FCriticalSection FGitLockedFilesCache::Mutex;
 FDateTime FGitLockedFilesCache::LastUpdated = FDateTime::MinValue();
 TMap<FString, FString> FGitLockedFilesCache::LockedFiles = TMap<FString, FString>();
 
-void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks)
-{	
+FDateTime FGitLockedFilesCache::GetLastUpdated()
+{
+	FScopeLock Lock(&Mutex);
+	return LastUpdated;
+}
+
+TMap<FString, FString> FGitLockedFilesCache::GetLockedFiles()
+{
+	FScopeLock Lock(&Mutex);
+	return LockedFiles;
+}
+
+void FGitLockedFilesCache::SetLockedFilesInternal(const TMap<FString, FString>& newLocks)
+{
 	for (auto lock : LockedFiles)
 	{
 		if (!newLocks.Contains(lock.Key))
@@ -92,26 +118,35 @@ void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks
 			OnFileLockChanged(lock.Key, lock.Value, false);
 		}
 	}
-	
+
 	for (auto lock : newLocks)
-	{		
+	{
 		if (!LockedFiles.Contains(lock.Key))
 		{
 			OnFileLockChanged(lock.Key, lock.Value, true);
-		}		
+		}
 	}
 
 	LockedFiles = newLocks;
 }
 
+void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks, const FDateTime& InLastUpdated)
+{
+	FScopeLock Lock(&Mutex);
+	SetLockedFilesInternal(newLocks);
+	LastUpdated = InLastUpdated;
+}
+
 void FGitLockedFilesCache::AddLockedFile(const FString& filePath, const FString& lockUser)
 {
+	FScopeLock Lock(&Mutex);
 	LockedFiles.Add(filePath, lockUser);
 	OnFileLockChanged(filePath, lockUser, true);
 }
 
 void FGitLockedFilesCache::RemoveLockedFile(const FString& filePath)
 {
+	FScopeLock Lock(&Mutex);
 	FString user;
 	LockedFiles.RemoveAndCopyValue(filePath, user);
 	OnFileLockChanged(filePath, user, false);
@@ -191,6 +226,144 @@ namespace GitSourceControlUtils
 		return ChangeRepositoryRootIfSubmodule(AbsoluteFilePaths, PathToRepositoryRoot);
 	}
 
+// Wrap a single argument in double quotes, escaping any embedded quotes so that file paths
+// containing spaces (or, in theory, quotes) survive the trip through the OS command line
+// parser intact.
+static FString QuoteGitArgument(const FString& InArg)
+{
+	FString Escaped = InArg;
+	Escaped.ReplaceInline(TEXT("\""), TEXT("\\\""), ESearchCase::CaseSensitive);
+	return FString::Printf(TEXT("\"%s\""), *Escaped);
+}
+
+#if ENGINE_MAJOR_VERSION >= 5
+// Decode a whole captured stream as UTF-8 in one pass, so multi-byte characters that landed
+// on a pipe-read boundary are not corrupted (which is why we accumulate raw bytes below
+// rather than concatenating the FString overload of ReadPipe).
+static FString Utf8BytesToString(const TArray<uint8>& InBytes)
+{
+	if (InBytes.Num() == 0)
+	{
+		return FString();
+	}
+	FUTF8ToTCHAR Converter(reinterpret_cast<const ANSICHAR*>(InBytes.GetData()), InBytes.Num());
+	return FString(Converter.Length(), Converter.Get());
+}
+
+// Run a child process, capturing stdout and stderr separately, and abort it if it stops
+// producing output for CommandIdleTimeoutSeconds (i.e. it has hung).
+// Returns false if the process could not be launched or was terminated.
+static bool RunChildProcessWithTimeout(const FString& InUrl, const FString& InParams, const FString& InWorkingDir,
+									   int32& OutReturnCode, FString& OutStdOut, FString& OutStdErr)
+{
+	void* PipeReadOut = nullptr;
+	void* PipeWriteOut = nullptr;
+	void* PipeReadErr = nullptr;
+	void* PipeWriteErr = nullptr;
+	if (!FPlatformProcess::CreatePipe(PipeReadOut, PipeWriteOut) || !FPlatformProcess::CreatePipe(PipeReadErr, PipeWriteErr))
+	{
+		if (PipeReadOut || PipeWriteOut)
+		{
+			FPlatformProcess::ClosePipe(PipeReadOut, PipeWriteOut);
+		}
+		OutStdErr = TEXT("Failed to create pipes for Git command");
+		OutReturnCode = -1;
+		return false;
+	}
+
+	uint32 ProcessID = 0;
+	const TCHAR* WorkingDir = InWorkingDir.IsEmpty() ? nullptr : *InWorkingDir;
+	FProcHandle ProcHandle = FPlatformProcess::CreateProc(*InUrl, *InParams, /*bLaunchDetached*/ false, /*bLaunchHidden*/ true,
+		/*bLaunchReallyHidden*/ true, &ProcessID, /*PriorityModifier*/ 0, WorkingDir, PipeWriteOut, /*PipeReadChild*/ nullptr, PipeWriteErr);
+
+	if (!ProcHandle.IsValid())
+	{
+		FPlatformProcess::ClosePipe(PipeReadOut, PipeWriteOut);
+		FPlatformProcess::ClosePipe(PipeReadErr, PipeWriteErr);
+		OutStdErr = FString::Printf(TEXT("Failed to launch '%s'"), *InUrl);
+		OutReturnCode = -1;
+		return false;
+	}
+
+	const double StartSeconds = FPlatformTime::Seconds();
+	double LastOutputSeconds = StartSeconds;
+	bool bTimedOut = false;
+
+	TArray<uint8> RawOut;
+	TArray<uint8> RawErr;
+
+	auto DrainPipes = [&](bool& bOutGotData)
+	{
+		TArray<uint8> ChunkOut;
+		TArray<uint8> ChunkErr;
+		FPlatformProcess::ReadPipeToArray(PipeReadOut, ChunkOut);
+		FPlatformProcess::ReadPipeToArray(PipeReadErr, ChunkErr);
+		bOutGotData = ChunkOut.Num() > 0 || ChunkErr.Num() > 0;
+		RawOut.Append(MoveTemp(ChunkOut));
+		RawErr.Append(MoveTemp(ChunkErr));
+	};
+
+	while (true)
+	{
+		const bool bStillRunning = FPlatformProcess::IsProcRunning(ProcHandle);
+
+		bool bGotData = false;
+		DrainPipes(bGotData);
+
+		const double NowSeconds = FPlatformTime::Seconds();
+		if (bGotData)
+		{
+			LastOutputSeconds = NowSeconds;
+		}
+
+		if (!bStillRunning)
+		{
+			break;
+		}
+
+		if (NowSeconds - LastOutputSeconds > GitSourceControlConstants::CommandIdleTimeoutSeconds)
+		{
+			bTimedOut = true;
+			FPlatformProcess::TerminateProc(ProcHandle, /*bKillTree*/ true);
+			break;
+		}
+
+		FPlatformProcess::Sleep(0.01f);
+	}
+
+	// Drain whatever is left in the pipes now that the process has stopped; the tail may be
+	// larger than a single pipe buffer, so keep reading until both come back empty.
+	for (bool bMore = true; bMore; )
+	{
+		DrainPipes(bMore);
+	}
+
+	// Append rather than assign, matching FPlatformProcess::ExecProcess()'s contract.
+	OutStdOut += Utf8BytesToString(RawOut);
+	OutStdErr += Utf8BytesToString(RawErr);
+
+	if (!FPlatformProcess::GetProcReturnCode(ProcHandle, &OutReturnCode))
+	{
+		OutReturnCode = -1;
+	}
+	FPlatformProcess::CloseProc(ProcHandle);
+	FPlatformProcess::ClosePipe(PipeReadOut, PipeWriteOut);
+	FPlatformProcess::ClosePipe(PipeReadErr, PipeWriteErr);
+
+	if (bTimedOut)
+	{
+		OutReturnCode = -1;
+		if (OutStdErr.IsEmpty())
+		{
+			OutStdErr = FString::Printf(TEXT("Git command produced no output for %.0f seconds and was terminated"), GitSourceControlConstants::CommandIdleTimeoutSeconds);
+		}
+		return false;
+	}
+
+	return true;
+}
+#endif // ENGINE_MAJOR_VERSION >= 5
+
 // Launch the Git command line process and extract its results & errors
 bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode /* = 0 */)
 {
@@ -214,9 +387,9 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 		}
 
 		// Specify the working copy (the root) of the git repository (before the command itself)
-		FullCommand = TEXT("-C \"");
-		FullCommand += RepositoryRoot;
-		FullCommand += TEXT("\" ");
+		FullCommand = TEXT("-C ");
+		FullCommand += QuoteGitArgument(RepositoryRoot);
+		FullCommand += TEXT(" ");
 	}
 	// then the git command itself ("status", "log", "commit"...)
 	LogableCommand += InCommand;
@@ -229,13 +402,19 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 	}
 	for (const auto& File : InFiles)
 	{
-		LogableCommand += TEXT(" \"");
-		LogableCommand += File;
-		LogableCommand += TEXT("\"");
+		LogableCommand += TEXT(" ");
+		LogableCommand += QuoteGitArgument(File);
 	}
 	// Also, Git does not have a "--non-interactive" option, as it auto-detects when there are no connected standard input/output streams
 
 	FullCommand += LogableCommand;
+
+	if (FullCommand.Len() > GitSourceControlConstants::MaxCommandLineLength)
+	{
+		// The caller is responsible for batching files (see RunCommand); if we still land here
+		// the OS may silently truncate or reject the command, so make the cause obvious.
+		UE_LOG(LogSourceControl, Error, TEXT("RunCommand: 'git %s' command line is %d characters, which may exceed the OS limit"), *InCommand, FullCommand.Len());
+	}
 
 #if UE_BUILD_DEBUG
 	UE_LOG(LogSourceControl, Log, TEXT("RunCommand: 'git %s'"), *LogableCommand);
@@ -266,7 +445,20 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 	}
 #endif
 
+#if ENGINE_MAJOR_VERSION >= 5
+	// Use a monitored child process so a hung Git invocation (credential prompt, dead socket,
+	// stale lock) cannot freeze the calling worker thread indefinitely. Working directory is
+	// left unset: the "-C <root>" argument already tells Git which repository to operate on,
+	// matching the previous ExecProcess() behaviour.
+	const bool bLaunched = RunChildProcessWithTimeout(PathToGitOrEnvBinary, FullCommand, FString(), ReturnCode, OutResults, OutErrors);
+	if (!bLaunched)
+	{
+		UE_LOG(LogSourceControl, Error, TEXT("RunCommand: 'git %s' did not complete: %s"), *InCommand, *OutErrors);
+		return false;
+	}
+#else
 	FPlatformProcess::ExecProcess(*PathToGitOrEnvBinary, *FullCommand, &ReturnCode, &OutResults, &OutErrors);
+#endif
 
 #if UE_BUILD_DEBUG
 	// TODO: add a setting to easily enable Verbose logging
@@ -277,7 +469,9 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 	}
 #endif
 
-	// Move push/pull progress information from the error stream to the info stream
+	// Move push/pull progress information from the error stream to the info stream.
+	// Git writes progress and other non-error status to stderr, so on success we fold it into
+	// the results where callers expect to find it. On failure stderr is left intact.
 	if(ReturnCode == ExpectedReturnCode && OutErrors.Len() > 0)
 	{
 		OutResults.Append(OutErrors);
@@ -1586,7 +1780,7 @@ bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallba
 	bool bCacheExpired = bInvalidateCache;
 	if (!bInvalidateCache)
 	{
-		const FTimespan CacheTimeElapsed = CurrentTime - FGitLockedFilesCache::LastUpdated;
+		const FTimespan CacheTimeElapsed = CurrentTime - FGitLockedFilesCache::GetLastUpdated();
 		bCacheExpired = CacheTimeElapsed > CacheLimit;
 	}
 	bool bResult = false;
@@ -1607,8 +1801,9 @@ bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallba
 #endif
 				OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
 			}
-			FGitLockedFilesCache::LastUpdated = CurrentTime;
-			FGitLockedFilesCache::SetLockedFiles(OutLocks);
+			// Publish the fresh set atomically with its timestamp so concurrent readers
+			// never observe a half-updated cache.
+			FGitLockedFilesCache::SetLockedFiles(OutLocks, CurrentTime);
 			return bResult;
 		}
 		// We tried to invalidate the UE cache, but we failed for some reason. Try updating lock state from LFS cache.

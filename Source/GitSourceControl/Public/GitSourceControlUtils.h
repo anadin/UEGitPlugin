@@ -7,6 +7,8 @@
 
 #include "GitSourceControlRevision.h"
 #include "GitSourceControlState.h"
+#include "HAL/CriticalSection.h"
+#include "Misc/DateTime.h"
 #include "Runtime/Launch/Resources/Version.h"
 #if ENGINE_MAJOR_VERSION == 5
 #include "UObject/ObjectSaveContext.h"
@@ -42,15 +44,26 @@ struct FGitVersion;
 class FGitLockedFilesCache
 {
 public:
-	static FDateTime LastUpdated;
-
- static const TMap<FString, FString>& GetLockedFiles() { return LockedFiles; }
- static void SetLockedFiles(const TMap<FString, FString>& newLocks);
+ /** Timestamp of the last successful remote locks query. */
+ static FDateTime GetLastUpdated();
+ static TMap<FString, FString> GetLockedFiles();
+ /** Replace the cached lock set and stamp it with the time it was fetched, as one atomic update. */
+ static void SetLockedFiles(const TMap<FString, FString>& newLocks, const FDateTime& InLastUpdated);
  static void AddLockedFile(const FString& filePath, const FString& lockUser);
  static void RemoveLockedFile(const FString& filePath);
 
 private:
+ // Assumes Mutex is already held by the caller.
+ static void SetLockedFilesInternal(const TMap<FString, FString>& newLocks);
  static void OnFileLockChanged(const FString& filePath, const FString& lockUser, bool locked);
+
+ /**
+  * Guards LastUpdated and LockedFiles. The cache is read and written from multiple
+  * worker threads (concurrent async source control commands) as well as the game
+  * thread, so every access must be made under this lock.
+  */
+ static FCriticalSection Mutex;
+ static FDateTime LastUpdated;
  // update local read/write state when our own lock statuses change
 	static TMap<FString, FString> LockedFiles;
 };
