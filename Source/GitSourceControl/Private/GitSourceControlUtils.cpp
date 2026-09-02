@@ -1486,7 +1486,7 @@ R  Content/Textures/T_Perlin_Noise_M.uasset -> Content/Textures/T_Perlin_Noise_M
 !! BasicCode.sln
 */
 static void ParseFileStatusResult(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TSet<FString>& InFiles,
-								  const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
+								  const TSet<FString>& InExplicitFiles, const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
 {
 	FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
 	if (!GitSourceControl)
@@ -1530,8 +1530,14 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 		else
 		{
 			FileState.State.FileState = EFileState::Unknown;
-			// File not found in status
-			if (FPaths::FileExists(File))
+			// File not found in status.
+			// A path that came from "git ls-files" (i.e. not one we were explicitly asked about) is tracked;
+			// absent from "git status" means it is unmodified and present, so skip the per-file stat.
+			if (!InExplicitFiles.Contains(File))
+			{
+				FileState.State.TreeState = ETreeState::Unmodified;
+			}
+			else if (FPaths::FileExists(File))
 			{
 				// usually means the file is unchanged,
 				FileState.State.TreeState = ETreeState::Unmodified;
@@ -1609,6 +1615,7 @@ void ParseStatusResults(const FString& InPathToGitBinary, const FString& InRepos
 							   const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
 {
 	TSet<FString> Files;
+	TSet<FString> ExplicitFiles;
 	for (const auto& File : InFiles)
 	{
 		if (FPaths::DirectoryExists(File))
@@ -1626,9 +1633,10 @@ void ParseStatusResults(const FString& InPathToGitBinary, const FString& InRepos
 		else
 		{
 			Files.Add(File);
+			ExplicitFiles.Add(File);
 		}
 	}
-	ParseFileStatusResult(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, Files, InResults, OutStates);
+	ParseFileStatusResult(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, Files, ExplicitFiles, InResults, OutStates);
 }
 
 void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& Files,

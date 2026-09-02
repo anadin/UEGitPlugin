@@ -220,6 +220,9 @@ public:
 	const FString& GetRemoteBranchName() const { return RemoteBranchName; }
 
 	TArray<FString> GetStatusBranchNames() const;
+
+	/** Drop the cached status branch name resolution so the next query re-runs 'git branch'. */
+	void InvalidateStatusBranchNamesCache() const;
 	
 	/** Indicates editor binaries are to be updated upon next sync */
 	bool bPendingRestart;
@@ -318,6 +321,13 @@ private:
 
 	/** Array of branch name patterns for status queries */
 	TArray<FString> StatusBranchNamePatternsInternal;
+
+	/** Guards the cached status branch name resolution below (queried from game and worker threads). */
+	mutable FCriticalSection StatusBranchNamesCacheCriticalSection;
+	/** Last resolved set of status branch names, cached to avoid re-spawning 'git branch' on every query. */
+	mutable TArray<FString> StatusBranchNamesCache;
+	/** FPlatformTime::Seconds() when StatusBranchNamesCache was last populated; 0 means empty/invalid. */
+	mutable double StatusBranchNamesCacheSeconds = 0.0;
 		
 	class FGitSourceControlRunner* Runner = nullptr;
 };

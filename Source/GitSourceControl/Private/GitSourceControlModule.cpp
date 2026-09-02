@@ -182,12 +182,11 @@ TSharedRef<FExtender> FGitSourceControlModule::OnExtendContentBrowserAssetSelect
 
 void FGitSourceControlModule::CreateGitContentBrowserAssetMenu(FMenuBuilder& MenuBuilder, const TArray<FAssetData> SelectedAssets)
 {
-	if (!FGitSourceControlModule::Get().GetProvider().GetStatusBranchNames().Num())
+	const TArray<FString> StatusBranchNames = FGitSourceControlModule::Get().GetProvider().GetStatusBranchNames();
+	if (!StatusBranchNames.Num())
 	{
 		return;
 	}
-	
-	const TArray<FString>& StatusBranchNames = FGitSourceControlModule::Get().GetProvider().GetStatusBranchNames();
 	const FString& BranchName = StatusBranchNames[0];
 	MenuBuilder.AddMenuEntry(
 		FText::Format(LOCTEXT("StatusBranchDiff", "Diff against status branch"), FText::FromString(BranchName)),

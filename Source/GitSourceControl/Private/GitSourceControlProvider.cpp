@@ -24,6 +24,7 @@
 #include "Async/Async.h"
 #include "GenericPlatform/GenericPlatformFile.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/App.h"
 #include "Misc/EngineVersion.h"
@@ -37,6 +38,14 @@
 #include "UObject/Package.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
+
+namespace
+{
+	// How long a resolved set of status branch names stays valid before we re-run "git branch".
+	// Remote-tracking refs only change on fetch/pull and the background runner fetches on a similar
+	// cadence, so a short TTL removes the per-query subprocess storm without noticeable staleness.
+	constexpr double GStatusBranchNamesCacheTTLSeconds = 30.0;
+}
 
 static FName ProviderName("Git LFS 2");
 
@@ -328,7 +337,7 @@ FText FGitSourceControlProvider::GetStatusText() const
 
 	Args.Add(TEXT("ErrorText"), FormattedError);
 
-	return FText::Format( NSLOCTEXT("GitStatusText", "{ErrorText}Enabled: {IsAvailable}", "Local repository: {RepositoryName}\nRemote: {RemoteUrl}\nUser: {UserName}\nE-mail: {UserEmail}\n[{BranchName} {CommitId}] {CommitSummary}"), Args );
+	return FText::Format( NSLOCTEXT("GitStatusText", "StatusText", "{ErrorText}Enabled: {IsAvailable}\nLocal repository: {RepositoryName}\nRemote: {RemoteUrl}\nUser: {UserName}\nE-mail: {UserEmail}\n[{BranchName} {CommitId}] {CommitSummary}"), Args );
 }
 
 /** Quick check if revision control is enabled */
@@ -897,6 +906,14 @@ bool FGitSourceControlProvider::QueryStateBranchConfig(const FString& ConfigSrc,
 void FGitSourceControlProvider::RegisterStateBranches(const TArray<FString>& BranchNames, const FString& ContentRootIn)
 {
 	StatusBranchNamePatternsInternal = BranchNames;
+	InvalidateStatusBranchNamesCache();
+}
+
+void FGitSourceControlProvider::InvalidateStatusBranchNamesCache() const
+{
+	FScopeLock Lock(&StatusBranchNamesCacheCriticalSection);
+	StatusBranchNamesCache.Reset();
+	StatusBranchNamesCacheSeconds = 0.0;
 }
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
@@ -946,10 +963,22 @@ int32 FGitSourceControlProvider::GetStateBranchIndex(const FString& StateBranchN
 
 TArray<FString> FGitSourceControlProvider::GetStatusBranchNames() const
 {
+	if (PathToGitBinary.IsEmpty() || PathToRepositoryRoot.IsEmpty() || StatusBranchNamePatternsInternal.Num() == 0)
+	{
+		return TArray<FString>();
+	}
+
+	// Serve a recent resolution: "git branch --remotes --list" only changes on fetch/pull.
+	{
+		FScopeLock Lock(&StatusBranchNamesCacheCriticalSection);
+		if (StatusBranchNamesCacheSeconds > 0.0
+			&& (FPlatformTime::Seconds() - StatusBranchNamesCacheSeconds) < GStatusBranchNamesCacheTTLSeconds)
+		{
+			return StatusBranchNamesCache;
+		}
+	}
+
 	TArray<FString> StatusBranches;
-	if (PathToGitBinary.IsEmpty() || PathToRepositoryRoot.IsEmpty())
-		return StatusBranches;
-	
 	for (int i = 0; i < StatusBranchNamePatternsInternal.Num(); i++)
 	{
 		TArray<FString> Matches;
@@ -958,11 +987,16 @@ TArray<FString> FGitSourceControlProvider::GetStatusBranchNames() const
 		{
 			for (int j = 0; j < Matches.Num(); j++)
 			{
-				StatusBranches.Add(Matches[j].TrimStartAndEnd());	
+				StatusBranches.Add(Matches[j].TrimStartAndEnd());
 			}
 		}
 	}
-	
+
+	{
+		FScopeLock Lock(&StatusBranchNamesCacheCriticalSection);
+		StatusBranchNamesCache = StatusBranches;
+		StatusBranchNamesCacheSeconds = FPlatformTime::Seconds();
+	}
 	return StatusBranches;
 }
 
