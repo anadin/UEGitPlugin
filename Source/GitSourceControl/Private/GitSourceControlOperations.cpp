@@ -693,6 +693,7 @@ bool FGitFetchWorker::Execute(FGitSourceControlCommand& InCommand)
 		if (InCommand.bCommandSuccessful)
 		{
 			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
+			GitSourceControlUtils::RefreshBranchInfo(InCommand);
 		}
 	}
 
@@ -755,6 +756,7 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 		if (InCommand.bCommandSuccessful)
 		{
 			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
+			GitSourceControlUtils::RefreshBranchInfo(InCommand);
 		}
 	}
 

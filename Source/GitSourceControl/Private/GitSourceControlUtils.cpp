@@ -846,18 +846,21 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 	}
 }
 
-bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName)
+bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName, bool bForceRefresh)
 {
-	const FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
-	if (!GitSourceControl)
+	if (!bForceRefresh)
 	{
-		return false;
-	}
-	const FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
-	if (!Provider.GetBranchName().IsEmpty())
-	{
-		OutBranchName = Provider.GetBranchName();
-		return true;
+		const FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
+		if (!GitSourceControl)
+		{
+			return false;
+		}
+		const FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
+		if (!Provider.GetBranchName().IsEmpty())
+		{
+			OutBranchName = Provider.GetBranchName();
+			return true;
+		}
 	}
 	
 	bool bResults;
@@ -892,18 +895,21 @@ bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepository
 	return bResults;
 }
 
-bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName)
+bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName, bool bForceRefresh)
 {
-	const FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
-	if (!GitSourceControl)
+	if (!bForceRefresh)
 	{
-		return false;
-	}
-	const FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
-	if (!Provider.GetRemoteBranchName().IsEmpty())
-	{
-		OutBranchName = Provider.GetRemoteBranchName();
-		return true;
+		const FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
+		if (!GitSourceControl)
+		{
+			return false;
+		}
+		const FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
+		if (!Provider.GetRemoteBranchName().IsEmpty())
+		{
+			OutBranchName = Provider.GetRemoteBranchName();
+			return true;
+		}
 	}
 
 	TArray<FString> InfoMessages;
@@ -928,6 +934,20 @@ bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepo
 		}
 	}
 	return bResults;
+}
+
+void RefreshBranchInfo(FGitSourceControlCommand& InCommand)
+{
+	FString FreshBranch;
+	if (GetBranchName(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FreshBranch, /*bForceRefresh=*/true))
+	{
+		InCommand.BranchName = MoveTemp(FreshBranch);
+		// A missing upstream is a valid answer (empty string); adopt whatever we get.
+		FString FreshRemote;
+		GetRemoteBranchName(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FreshRemote, /*bForceRefresh=*/true);
+		InCommand.RemoteBranchName = MoveTemp(FreshRemote);
+		InCommand.bRepoStatusRefreshed = true;
+	}
 }
 
 bool GetRemoteBranchesWildcard(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& PatternMatch, TArray<FString>& OutBranchNames)
@@ -1437,15 +1457,85 @@ void AbsoluteFilenames(const FString& InRepositoryRoot, TArray<FString>& InFileN
 /** Run a 'git ls-files' command to get all files tracked by Git recursively in a directory.
  *
  * Called in case of a "directory status" (no file listed in the command) when using the "Submit to Revision Control" menu.
+ *
+ * The results are served from a short-lived cache (see FGitLsFilesCache below).
  */
+// "git ls-files <dir>" enumerates every tracked file under a directory. That set only changes
+// when the index changes (add / rm / move / checkout / merge), so a short-lived cache spares
+// repeated subprocess spawns during the periodic full-tree status refresh. Plugin operations
+// that touch the index call InvalidateDirectoryListingCache(); external CLI changes fall out
+// via the TTL -- and remain visible immediately for any file with a pending change, since
+// "git status" reports those regardless of this cache.
+class FGitLsFilesCache
+{
+public:
+	static bool GetTrackedFiles(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles)
+	{
+		{
+			FScopeLock Lock(&Mutex);
+			if (IsExpired(FPlatformTime::Seconds()))
+			{
+				DirToFiles.Reset();
+			}
+			else if (const TArray<FString>* Cached = DirToFiles.Find(InDirectory))
+			{
+				OutFiles = *Cached;
+				return true;
+			}
+		}
+
+		TArray<FString> ErrorMessages;
+		TArray<FString> Directory;
+		Directory.Add(InDirectory);
+		TArray<FString> Files;
+		const bool bResult = RunCommandInternal(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), Directory, Files, ErrorMessages);
+		AbsoluteFilenames(InRepositoryRoot, Files);
+
+		if (bResult)
+		{
+			FScopeLock Lock(&Mutex);
+			const double Now = FPlatformTime::Seconds();
+			if (IsExpired(Now))
+			{
+				DirToFiles.Reset();
+				LastRefreshSeconds = Now;
+			}
+			DirToFiles.Add(InDirectory, Files);
+		}
+		OutFiles = MoveTemp(Files);
+		return bResult;
+	}
+
+	static void Invalidate()
+	{
+		FScopeLock Lock(&Mutex);
+		DirToFiles.Reset();
+		LastRefreshSeconds = 0.0;
+	}
+
+private:
+	static bool IsExpired(double Now)
+	{
+		return LastRefreshSeconds <= 0.0 || (Now - LastRefreshSeconds) >= TTLSeconds;
+	}
+
+	static constexpr double TTLSeconds = 60.0;
+	static FCriticalSection Mutex;
+	static double LastRefreshSeconds;
+	static TMap<FString, TArray<FString>> DirToFiles;
+};
+FCriticalSection FGitLsFilesCache::Mutex;
+double FGitLsFilesCache::LastRefreshSeconds = 0.0;
+TMap<FString, TArray<FString>> FGitLsFilesCache::DirToFiles;
+
 bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles)
 {
-	TArray<FString> ErrorMessages;
-	TArray<FString> Directory;
-	Directory.Add(InDirectory);
-	const bool bResult = RunCommandInternal(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), Directory, OutFiles, ErrorMessages);
-	AbsoluteFilenames(InRepositoryRoot, OutFiles);
-	return bResult;
+	return FGitLsFilesCache::GetTrackedFiles(InPathToGitBinary, InRepositoryRoot, InDirectory, OutFiles);
+}
+
+void InvalidateDirectoryListingCache()
+{
+	FGitLsFilesCache::Invalidate();
 }
 
 /** Parse the array of strings results of a 'git status' command for a directory
@@ -1466,7 +1556,15 @@ static void ParseDirectoryStatusResult(const bool InUsingLfsLocking, const TMap<
 			FileState.State.LockState = ELockState::Unlockable;
 		}
 		FGitStatusParser StatusParser(Result.Value);
-		if ((EFileState::Deleted == StatusParser.FileState) || (EFileState::Missing == StatusParser.FileState) || (ETreeState::Untracked == StatusParser.TreeState))
+		// Deleted/Missing/Untracked are the cases "git ls-files" inherently cannot list. Staged changes
+		// to already-tracked files (Added/Modified/Renamed/Copied/Unmerged) are normally handled by the
+		// enumerated pass, but are picked up here as well so a stale directory listing cache can never
+		// drop a file with pending changes that "git status" (always fresh) reported.
+		const bool bChangedTrackedFile =
+			StatusParser.FileState == EFileState::Added || StatusParser.FileState == EFileState::Modified ||
+			StatusParser.FileState == EFileState::Renamed || StatusParser.FileState == EFileState::Copied ||
+			StatusParser.FileState == EFileState::Unmerged;
+		if ((EFileState::Deleted == StatusParser.FileState) || (EFileState::Missing == StatusParser.FileState) || (ETreeState::Untracked == StatusParser.TreeState) || bChangedTrackedFile)
 		{
 			FileState.State.FileState = StatusParser.FileState;
 			FileState.State.TreeState = StatusParser.TreeState;

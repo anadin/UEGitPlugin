@@ -109,6 +109,12 @@ public:
 	/** Current Commit description's Summary */
 	FString CommitSummary;
 
+	/** Freshly resolved local/remote branch names (only when bRepoStatusRefreshed). */
+	FString BranchName;
+	FString RemoteBranchName;
+	/** True when this command re-resolved the branch names above, so the provider should adopt them. */
+	bool bRepoStatusRefreshed = false;
+
 	/** If true, this command will be automatically cleaned up in Tick() */
 	bool bAutoDelete;
 

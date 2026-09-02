@@ -147,13 +147,21 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
  * @param	OutBranchName		Name of the current checked-out branch (if any, ie. not in detached HEAD)
  * @returns true if the command succeeded and returned no errors
  */
-bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName);
+bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName, bool bForceRefresh = false);
 
 /**
  * Get Git remote tracking branch
  * @returns false if the branch is not tracking a remote
  */
-bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName);
+bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName, bool bForceRefresh = false);
+
+/**
+ * Re-resolve the local and remote branch names for InCommand, bypassing the provider's cached
+ * values, and flag the command so the provider adopts them (on the game thread, in Tick()).
+ * Cheap (reads .git/HEAD and .git/config); call it from the periodic status-refresh paths so an
+ * external "git checkout" is detected.
+ */
+void RefreshBranchInfo(FGitSourceControlCommand& InCommand);
 
  /**
  * Get Git remote tracking branches that match wildcard
@@ -212,6 +220,13 @@ void ReloadPackages(TArray<UPackage*>& InPackagesToReload);
  * Gets all Git tracked files, including within directories, recursively
  */
 bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles);
+
+/**
+ * Drop the cached "git ls-files <dir>" results used by ListFilesInDirectoryRecurse().
+ * Call after any operation that changes which files are tracked (add / rm / move / revert /
+ * sync / branch switch).
+ */
+void InvalidateDirectoryListingCache();
 
 /**
  * Run a Git "commit" command by batches.

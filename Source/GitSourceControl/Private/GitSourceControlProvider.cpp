@@ -688,6 +688,31 @@ void FGitSourceControlProvider::UpdateRepositoryStatus(const class FGitSourceCon
 		CommitId = InCommand.CommitId;
 		CommitSummary = InCommand.CommitSummary;
 	}
+
+	// Adopt branch names re-resolved by the worker (see GitSourceControlUtils::RefreshBranchInfo).
+	// Only write when something actually changed: these members are also read from worker threads,
+	// so keeping the write to the rare branch-switch case minimises an existing benign race.
+	if (InCommand.bRepoStatusRefreshed
+		&& (BranchName != InCommand.BranchName || RemoteBranchName != InCommand.RemoteBranchName))
+	{
+		if (BranchName != InCommand.BranchName)
+		{
+			// HEAD moved to a different branch under us: the tracked-file set may be entirely different.
+			GitSourceControlUtils::InvalidateDirectoryListingCache();
+		}
+		BranchName = InCommand.BranchName;
+		RemoteBranchName = InCommand.RemoteBranchName;
+	}
+
+	// Operations that change which files are tracked invalidate the cached directory listings.
+	static const TSet<FName> TrackedFileMutatingOps = {
+		FName(TEXT("MarkForAdd")), FName(TEXT("Delete")), FName(TEXT("Revert")),
+		FName(TEXT("Sync")), FName(TEXT("CheckIn")), FName(TEXT("Copy")), FName(TEXT("Resolve"))
+	};
+	if (TrackedFileMutatingOps.Contains(InCommand.Operation->GetName()))
+	{
+		GitSourceControlUtils::InvalidateDirectoryListingCache();
+	}
 }
 
 void FGitSourceControlProvider::Tick()
