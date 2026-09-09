@@ -36,6 +36,17 @@
 #include "Misc/MessageDialog.h"
 
 #include "Runtime/Launch/Resources/Version.h"
+
+#if PLATFORM_MAC
+#include "Mac/MacSystemIncludes.h"
+// UE 5.8 moved the autorelease pool helper out of ApplePlatformMisc.h
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+#include "Apple/ScopeAutoreleasePool.h"
+#else
+#include "Apple/ApplePlatformMisc.h"
+#endif
+#endif
+
 #if ENGINE_MAJOR_VERSION == 5 
 #include "UObject/ObjectSaveContext.h"
 #endif
