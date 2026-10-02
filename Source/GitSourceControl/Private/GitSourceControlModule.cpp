@@ -4,6 +4,7 @@
 // or copy at http://opensource.org/licenses/MIT)
 
 #include "GitSourceControlModule.h"
+#include "Workspace/SGitWorkspace.h"
 
 #include "AssetToolsModule.h"
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
@@ -46,6 +47,7 @@ static TSharedRef<IGitSourceControlWorker, ESPMode::ThreadSafe> CreateWorker()
 
 void FGitSourceControlModule::StartupModule()
 {
+	if (!IsRunningCommandlet()) GitWorkspaceUI::Register();
 	// Register our operations (implemented in GitSourceControlOperations.cpp by subclassing from Engine\Source\Developer\SourceControl\Public\SourceControlOperations.h)
 	GitSourceControlProvider.RegisterWorker( "Connect", FGetGitSourceControlWorker::CreateStatic( &CreateWorker<FGitConnectWorker> ) );
 	// Note: this provider uses the "CheckOut" command only with Git LFS 2 "lock" command, since Git itself has no lock command (all tracked files in the working copy are always already checked-out).
@@ -125,6 +127,7 @@ void FGitSourceControlModule::StartupModule()
 
 void FGitSourceControlModule::ShutdownModule()
 {
+	if (!IsRunningCommandlet()) GitWorkspaceUI::Unregister();
 	// shut down the provider, as this module is going away
 	GitSourceControlProvider.Close();
 

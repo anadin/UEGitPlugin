@@ -1325,8 +1325,8 @@ public:
 		}
 	}
 
-	EFileState::Type FileState;
-	ETreeState::Type TreeState;
+	EFileState::Type FileState = EFileState::Unknown;
+	ETreeState::Type TreeState = ETreeState::Working;
 };
 
 /**
@@ -2044,7 +2044,7 @@ bool UpdateChangelistStateByCommand()
 		if (!TChar<TCHAR>::IsWhitespace(Result[0]))
 		{
 			WorkingChangelist->Files.Remove(State);
-			UpdateFileStagingOnSavedInternal(Result);
+			// Status refresh must never mutate the index.
 			State->Changelist = FGitSourceControlChangelist::StagedChangelist;
 			StagedChangelist->Files.AddUnique(State);
 			continue;
@@ -2109,26 +2109,10 @@ void UpdateFileStagingOnSaved(const FString& Filename, UPackage* Pkg, FObjectPos
 	
 bool UpdateFileStagingOnSavedInternal(const FString& Filename)
 {
-	bool bResult = false;
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
-	if (!Provider.IsGitAvailable())
-	{
-		return bResult;
-	}
-	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = Provider.GetStateInternal(Filename);
-
-	if (State->Changelist.GetName().Equals(TEXT("Staged")))
-	{
-		TArray<FString> File;
-		File.Add(Filename);
-		TArray<FString> DummyResults;
-		TArray<FString> DummyMsgs;
-		bResult = RunCommand(TEXT("add"), Provider.GetGitBinaryPath(), Provider.GetPathToRepositoryRoot(), FGitSourceControlModule::GetEmptyStringArray(), File, DummyResults, DummyMsgs);
-	}
-	
-	return bResult;
+    // Kept for source compatibility; saving must never update the staged snapshot.
+    return false;
 }
+
 #endif
 	
 void UpdateStateOnAssetRename(const FAssetData& InAssetData, const FString& InOldName)

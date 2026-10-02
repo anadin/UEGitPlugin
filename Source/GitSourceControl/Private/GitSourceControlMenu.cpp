@@ -4,6 +4,7 @@
 // or copy at http://opensource.org/licenses/MIT)
 
 #include "GitSourceControlMenu.h"
+#include "Workspace/SGitWorkspace.h"
 
 #include "GitSourceControlModule.h"
 #include "GitSourceControlProvider.h"
@@ -251,7 +252,7 @@ void FGitSourceControlMenu::CommitClicked()
 	}
 	
 	FLevelEditorModule & LevelEditorModule = FModuleManager::Get().LoadModuleChecked<FLevelEditorModule>("LevelEditor");
-	FSourceControlWindows::ChoosePackagesToCheckIn(nullptr);
+	GitWorkspaceUI::Open();
 }
 
 void FGitSourceControlMenu::PushClicked()
@@ -538,57 +539,13 @@ void FGitSourceControlMenu::AddMenuExtension(FToolMenuSection& Builder)
 void FGitSourceControlMenu::AddMenuExtension(FMenuBuilder& Builder)
 #endif
 {
-	// UE 5.6 doesn't show the Submit Content button if changelists are enabled
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
-	const FGitSourceControlProvider& Provider = FGitSourceControlModule::Get().GetProvider();
-	if (Provider.UsesChangelists())
-	{
-		Builder.AddMenuEntry(
-			"CommitAndPush",
-			LOCTEXT("GitCommit",				"Submit Content"),
-			LOCTEXT("GitPushTooltip",		"Opens a dialog with check in options for content and levels."),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Submit"),
-			FUIAction(
-				FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::CommitClicked),
-				FCanExecuteAction::CreateRaw(this, &FGitSourceControlMenu::CanCommit)
-			)
-		);
-	}
-#endif
-	
-	Builder.AddMenuEntry(
-#if ENGINE_MAJOR_VERSION >= 5
-		"GitPush",
-#endif
-		LOCTEXT("GitPush",				"Push pending local commits"),
-		LOCTEXT("GitPushTooltip",		"Push all pending local commits to the remote server."),
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Submit"),
-#else
-		FSlateIcon(FEditorStyle::GetStyleSetName(), "SourceControl.Actions.Submit"),
-#endif
-		FUIAction(
-			FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::PushClicked),
-			FCanExecuteAction::CreateRaw(this, &FGitSourceControlMenu::HaveRemoteUrl)
-		)
-	);
-
-	Builder.AddMenuEntry(
-#if ENGINE_MAJOR_VERSION >= 5
-		"GitSync",
-#endif
-		LOCTEXT("GitSync",				"Pull"),
-		LOCTEXT("GitSyncTooltip",		"Update all files in the local repository to the latest version of the remote server."),
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Sync"),
-#else
-		FSlateIcon(FEditorStyle::GetStyleSetName(), "SourceControl.Actions.Sync"),
-#endif
-		FUIAction(
-			FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::SyncClicked),
-			FCanExecuteAction::CreateRaw(this, &FGitSourceControlMenu::HaveRemoteUrl)
-		)
-	);
+    Builder.AddMenuEntry(
+        "GitWorkspace",
+        LOCTEXT("GitWorkspace", "Git Workspace"),
+        LOCTEXT("GitWorkspaceTooltip", "Stage, review and commit local Git changes."),
+        FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Submit"),
+        FUIAction(FExecuteAction::CreateStatic(&GitWorkspaceUI::Open))
+    );
 
 	Builder.AddMenuEntry(
 #if ENGINE_MAJOR_VERSION >= 5

@@ -13,6 +13,9 @@ public class GitSourceControl : ModuleRules
 			new string[] {
 				"Core",
 				"CoreUObject",
+				"Json",
+				"Engine",
+				"AssetRegistry",
 				"Slate",
 				"SlateCore",
 				"InputCore",

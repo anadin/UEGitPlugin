@@ -64,7 +64,7 @@ void FGitSourceControlProvider::Init(bool bForceConnection)
 	}
 
 #if ENGINE_MAJOR_VERSION == 5
-	UPackage::PackageSavedWithContextEvent.AddStatic(&GitSourceControlUtils::UpdateFileStagingOnSaved);
+	// Saving changes the working tree only. Staging is an explicit user operation.
 #endif
 	
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
@@ -465,6 +465,12 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOperationRef& InOperation, FSourceControlChangelistPtr InChangelist, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency, const FSourceControlOperationComplete& InOperationCompleteDelegate )
 #endif
 {
+    if (InOperation->GetName() == "CheckIn" || InOperation->GetName() == "Sync" || InOperation->GetName() == "CheckOut" || InOperation->GetName() == "Revert")
+    {
+        InOperation->AddErrorMessge(LOCTEXT("UseGitWorkspace", "Use Window > Git Workspace for explicit staging, commit and verified locks. Legacy checkout/revert may implicitly release locks and are disabled. Use an external Git client for discard and remote integration."));
+        InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Failed);
+        return ECommandResult::Failed;
+    }
 	if(!IsEnabled() && !(InOperation->GetName() == "Connect")) // Only Connect operation allowed while not Enabled (Repository found)
 	{
 		InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Failed);
@@ -632,6 +638,7 @@ bool FGitSourceControlProvider::UsesSoftRevertOnDelete() const
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
 bool FGitSourceControlProvider::CanExecuteOperation(const FSourceControlOperationRef& InOperation) const {
+    if (InOperation->GetName() == "CheckIn" || InOperation->GetName() == "Sync" || InOperation->GetName() == "CheckOut" || InOperation->GetName() == "Revert") return false;
 	return WorkersMap.Find(InOperation->GetName()) != nullptr;
 }
 

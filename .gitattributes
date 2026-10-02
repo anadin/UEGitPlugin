@@ -1,0 +1,14 @@
+# Portable plugin source; bundled executables and image resources stay binary.
+* text=auto
+*.cpp text eol=lf
+*.h text eol=lf
+*.cs text eol=lf
+*.ini text eol=lf
+*.uplugin text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.png -text
+/git-lfs -text
+/git-lfs.exe -text
+/git-lfs-mac-amd64 -text
+/git-lfs-mac-arm64 -text
