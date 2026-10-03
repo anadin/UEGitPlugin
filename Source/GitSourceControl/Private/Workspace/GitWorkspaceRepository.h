@@ -74,10 +74,20 @@ struct FLockSnapshot
 // Strictly parse a complete, verified LFS response. Never infer ownership from user.name.
 bool ParseVerifiedLocks(const FString& Json, TMap<FString, FLock>& Locks, FString& Error);
 
+enum class EPullPathKind { Documentation, Package, RestartRequired, Unsupported };
+struct FIncomingChange
+{
+    FString Path, OldMode, NewMode;
+    TCHAR Status = '?';
+    EPullPathKind Kind = EPullPathKind::Unsupported;
+};
+// Raw, NUL-delimited, no-rename tree diff; paths are never split on whitespace.
+bool ParseIncomingChanges(const TArray<uint8>& Bytes, TArray<FIncomingChange>& Changes, FString& Error);
+
 struct FRemoteSnapshot
 {
     FString Root, Branch, Head, Remote, RemoteRef, RemoteHead, Context, Error;
-    TArray<FString> IncomingPaths;
+    TArray<FIncomingChange> IncomingChanges;
     int32 Ahead = 0, Behind = 0;
     bool bValid = false;
     FDateTime FetchedAt;

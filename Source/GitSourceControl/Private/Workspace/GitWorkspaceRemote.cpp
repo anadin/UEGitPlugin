@@ -30,6 +30,45 @@ bool IsDocumentation(const FString& Path)
         Path == TEXT("README.md") || Path == TEXT("LICENSE.txt");
 }
 }
+bool ParseIncomingChanges(const TArray<uint8>& Bytes, TArray<FIncomingChange>& Changes, FString& Error)
+{
+    Changes.Empty(); Error.Empty(); FResult Records; Records.Code = 0; Records.Out = Bytes;
+    TArray<FString> Fields;
+    auto Fail = [&]() { Changes.Empty(); Error = TEXT("Cannot read the complete incoming tree diff. Fetch again."); return false; };
+    if (!RemoteRecords(Records, Fields) || Fields.Num() % 2) return Fail();
+    TSet<FString> Seen;
+    for (int32 I = 0; I < Fields.Num(); I += 2)
+    {
+        TArray<FString> Header; Fields[I].ParseIntoArray(Header, TEXT(" "));
+        const FString& Path = Fields[I + 1];
+        if (Header.Num() != 5 || !Header[0].StartsWith(TEXT(":")) || Header[4].Len() != 1 ||
+            !FString(TEXT("AMDT")).Contains(Header[4]) || Path.IsEmpty() || Path.StartsWith(TEXT("/")) || Seen.Contains(Path)) return Fail();
+        TArray<FString> Parts; Path.ParseIntoArray(Parts, TEXT("/"), false);
+        for (const auto& Part : Parts) if (Part.IsEmpty() || Part == TEXT("..") || Part == TEXT(".")) return Fail();
+        auto IsHash = [](const FString& Hash)
+        {
+            if (Hash.Len() != 40 && Hash.Len() != 64) return false;
+            for (TCHAR C : Hash) if (!FChar::IsHexDigit(C)) return false;
+            return true;
+        };
+        if (!IsHash(Header[2]) || !IsHash(Header[3])) return Fail();
+        FIncomingChange Change; Change.Path = Path; Change.OldMode = Header[0].Mid(1); Change.NewMode = Header[1]; Change.Status = Header[4][0];
+        auto ValidMode = [](const FString& Mode) { return Mode.Len() == 6 && Mode.IsNumeric(); };
+        if (!ValidMode(Change.OldMode) || !ValidMode(Change.NewMode)) return Fail();
+        const bool bOldAbsent = Change.OldMode == TEXT("000000"), bNewAbsent = Change.NewMode == TEXT("000000");
+        if ((Change.Status == 'A' && (!bOldAbsent || bNewAbsent)) || (Change.Status == 'D' && (bOldAbsent || !bNewAbsent)) ||
+            ((Change.Status == 'M' || Change.Status == 'T') && (bOldAbsent || bNewAbsent))) return Fail();
+        const bool bRegular = (bOldAbsent || Change.OldMode == TEXT("100644")) && (bNewAbsent || Change.NewMode == TEXT("100644"));
+        if (bRegular)
+        {
+            if (IsDocumentation(Path)) Change.Kind = EPullPathKind::Documentation;
+            else if (Path.EndsWith(TEXT(".uasset")) || Path.EndsWith(TEXT(".umap"))) Change.Kind = EPullPathKind::Package;
+            else Change.Kind = EPullPathKind::RestartRequired;
+        }
+        Changes.Add(MoveTemp(Change)); Seen.Add(Path);
+    }
+    return true;
+}
 bool FRemoteSnapshot::IsFresh() const
 {
     const double Age = FPlatformTime::Seconds() - FetchedSeconds;
@@ -74,8 +113,9 @@ FRemoteSnapshot FRepository::Fetch()
     TArray<FString> Numbers; Counts.Text().TrimEnd().ParseIntoArray(Numbers, TEXT("\t"));
     if (!Counts.Ok() || Numbers.Num() != 2 || !Numbers[0].IsNumeric() || !Numbers[1].IsNumeric()) { R.Error = TEXT("Cannot determine incoming/outgoing commits."); return R; }
     R.Ahead = FCString::Atoi(*Numbers[0]); R.Behind = FCString::Atoi(*Numbers[1]);
-    if (!RemoteRecords(Git({TEXT("diff"), TEXT("--name-only"), TEXT("--no-renames"), TEXT("-z"), R.Head, R.RemoteHead, TEXT("--")}), R.IncomingPaths))
-    { R.Error = TEXT("Cannot read incoming paths."); return R; }
+    const auto Diff = Git({TEXT("diff"), TEXT("--raw"), TEXT("--no-abbrev"), TEXT("--no-renames"), TEXT("-z"), R.Head, R.RemoteHead, TEXT("--")});
+    if (!Diff.Ok()) { R.Error = Diff.Error; return R; }
+    if (!ParseIncomingChanges(Diff.Out, R.IncomingChanges, R.Error)) return R;
     R.bValid = true; R.FetchedAt = FDateTime::UtcNow(); R.FetchedSeconds = FPlatformTime::Seconds(); return R;
 }
 bool FRepository::ValidateRemoteReview(const FRemoteSnapshot& Reviewed, FSnapshot& Current, FString& Error)
@@ -156,18 +196,13 @@ FResult FRepository::Pull(const FRemoteSnapshot& Reviewed)
     if (!Current.Files.IsEmpty()) return RemoteFailure(TEXT("Pull requires a clean index and working tree, including untracked files. No automatic stash or discard."));
     if (Reviewed.Ahead || !Reviewed.Behind || !Git({TEXT("merge-base"), TEXT("--is-ancestor"), Reviewed.Head, Reviewed.RemoteHead}).Ok())
         return RemoteFailure(TEXT("Only a fast-forward Pull is supported. Reconcile divergence externally."));
-    TArray<FString> Paths;
-    if (!RemoteRecords(Git({TEXT("diff"), TEXT("--name-only"), TEXT("--no-renames"), TEXT("-z"), Reviewed.Head, Reviewed.RemoteHead, TEXT("--")}), Paths))
-        return RemoteFailure(TEXT("Cannot inspect incoming paths."));
-    for (const auto& Path : Paths)
+    TArray<FIncomingChange> Changes;
+    const auto Diff = Git({TEXT("diff"), TEXT("--raw"), TEXT("--no-abbrev"), TEXT("--no-renames"), TEXT("-z"), Reviewed.Head, Reviewed.RemoteHead, TEXT("--")});
+    if (!Diff.Ok() || !ParseIncomingChanges(Diff.Out, Changes, Error)) return RemoteFailure(TEXT("Cannot inspect incoming paths. ") + Error);
+    for (const auto& Change : Changes)
     {
-        if (!IsDocumentation(Path)) return RemoteFailure(TEXT("Pull changes files that need editor reload/restart coordination. Close the editor and integrate externally: ") + Path);
-        for (const auto& Commit : {Reviewed.Head, Reviewed.RemoteHead})
-        {
-            const auto Tree = Git({TEXT("ls-tree"), Commit, TEXT("--"), Path});
-            if (!Tree.Ok() || (!Tree.Out.IsEmpty() && !Tree.Text().StartsWith(TEXT("100644 blob "))))
-                return RemoteFailure(TEXT("Pull cannot replace a symlink, submodule or executable here: ") + Path);
-        }
+        if (Change.Kind != EPullPathKind::Documentation)
+            return RemoteFailure(TEXT("Pull requires editor reload/restart coordination. Review incoming changes and integrate with the editor closed: ") + Change.Path);
     }
     // Recheck after remote inspection, then integrate the exact reviewed commit.
     Current = RefreshInternal(); FRemoteSnapshot Context;

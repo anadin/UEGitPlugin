@@ -7,6 +7,7 @@
 #include "GitWorkspaceRepository.h"
 
 class SMultiLineEditableTextBox;
+class SWindow;
 struct FGitWorkspaceRow
 {
     GitWorkspace::FFile File;
@@ -38,14 +39,19 @@ public:
     void WaitForWork();
 private:
     friend class FGitWorkspaceEditorAssetsTest;
+    friend class FGitIncomingPackageReviewTest;
+    friend class FGitWorkspaceSelectionTest;
     bool IsIdle() const { return !Pending.IsValid(); }
     void Start(TFunction<FGitWorkspaceTaskResult()> Work);
     FReply Refresh();
     FReply ChangeIndex(bool bStage);
+    TArray<FString> SelectedIndexPaths(bool bStage, int32* SkippedSubmodules = nullptr) const;
     FReply Commit();
     FReply ShowDiff();
     FReply VerifyLocks();
     FReply RemoteAction(int32 Action);
+    FText PushHint() const;
+    FReply ShowIncomingReview();
     FReply ChangeLock(bool bUnlock);
     bool HasDirtyPackages() const;
     FText Inspector() const;
@@ -63,6 +69,8 @@ private:
     TSharedPtr<SMultiLineEditableTextBox> Message;
     FString Feedback;
     FString DiffText;
+    FString FileFilter;
+    TWeakPtr<SWindow> IncomingWindow;
 };
 
 namespace GitWorkspaceUI

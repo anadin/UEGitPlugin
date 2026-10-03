@@ -165,4 +165,52 @@ bool FGitRemoteLockHistoryTest::RunTest(const FString&)
     TestTrue(TEXT("Deleted file uses parent lockable attributes"), DeletedResult.Error.Contains(TEXT("Push requires verified asset locks")));
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitIncomingTreeTest, "GitWorkspace.Remote.IncomingTreeReview", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitIncomingTreeTest::RunTest(const FString&)
+{
+    FRemoteFixture F; GitWorkspace::FRepository Repo(F.Git, F.A);
+    const FString Before = Repo.Refresh().Head;
+    const FString OddPath = TEXT("Docs/a [bracket]\nline.md");
+    F.Write(F.B, OddPath, TEXT("incoming document\n"));
+    F.Write(F.B, TEXT("Docs/executable.md"), TEXT("executable requires review\n"));
+    F.Write(F.B, TEXT("Content/Probe.uasset"), TEXT("package fixture\n"));
+    F.Write(F.B, TEXT("Content/Map.umap"), TEXT("map fixture\n"));
+    F.Write(F.B, TEXT("Config/DefaultGame.ini"), TEXT("[fixture]\n"));
+    F.Write(F.B, TEXT("Source/Probe.cpp"), TEXT("// fixture\n"));
+    TestTrue(TEXT("Rename fixture document"), F.At(F.B, {TEXT("mv"), TEXT("README.md"), TEXT("Docs/renamed.md")}).Ok());
+    F.At(F.B, {TEXT("add"), TEXT("-A")});
+    TestTrue(TEXT("Stage executable tree mode"), F.At(F.B, {TEXT("update-index"), TEXT("--chmod=+x"), TEXT("--"), TEXT("Docs/executable.md")}).Ok());
+    TestTrue(TEXT("Stage disposable gitlink"), F.At(F.B, {TEXT("update-index"), TEXT("--add"), TEXT("--cacheinfo"), TEXT("160000"), Before, TEXT("Plugins/Fixture")}).Ok());
+    TestTrue(TEXT("Commit incoming fixture tree"), F.At(F.B, {TEXT("commit"), TEXT("-qm"), TEXT("incoming mixed tree")}).Ok());
+    TestTrue(TEXT("Publish fixture tree"), F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")}).Ok());
+    const auto Review = Repo.Fetch();
+    if (!TestTrue(TEXT("Fetch classified incoming tree: ") + Review.Error, Review.IsFresh())) return false;
+    TestEqual(TEXT("All incoming paths retained"), Review.IncomingChanges.Num(), 9);
+    auto Check = [&](const FString& Path, GitWorkspace::EPullPathKind Kind, TCHAR Status)
+    {
+        const auto* Change = Review.IncomingChanges.FindByPredicate([&](const auto& C) { return C.Path == Path; });
+        TestTrue(Path + TEXT(" classified with exact literal path/status"), Change && Change->Kind == Kind && Change->Status == Status);
+    };
+    Check(OddPath, GitWorkspace::EPullPathKind::Documentation, 'A');
+    Check(TEXT("README.md"), GitWorkspace::EPullPathKind::Documentation, 'D');
+    Check(TEXT("Docs/renamed.md"), GitWorkspace::EPullPathKind::Documentation, 'A');
+    Check(TEXT("Docs/executable.md"), GitWorkspace::EPullPathKind::Unsupported, 'A');
+    Check(TEXT("Plugins/Fixture"), GitWorkspace::EPullPathKind::Unsupported, 'A');
+    Check(TEXT("Content/Probe.uasset"), GitWorkspace::EPullPathKind::Package, 'A');
+    Check(TEXT("Content/Map.umap"), GitWorkspace::EPullPathKind::Package, 'A');
+    Check(TEXT("Config/DefaultGame.ini"), GitWorkspace::EPullPathKind::RestartRequired, 'A');
+    Check(TEXT("Source/Probe.cpp"), GitWorkspace::EPullPathKind::RestartRequired, 'A');
+    TestFalse(TEXT("Mixed incoming tree is not integrated in editor"), Repo.Pull(Review).Ok());
+    TestEqual(TEXT("Review preserves HEAD"), Repo.Refresh().Head, Before);
+    TestEqual(TEXT("Review preserves README bytes"), F.Read(F.A, TEXT("README.md")), FString(TEXT("base\n")));
+    auto Raw = F.At(F.A, {TEXT("diff"), TEXT("--raw"), TEXT("--no-abbrev"), TEXT("--no-renames"), TEXT("-z"), Before, Review.RemoteHead, TEXT("--")});
+    TArray<GitWorkspace::FIncomingChange> Parsed; FString Error;
+    TestTrue(TEXT("Actual raw diff parses"), GitWorkspace::ParseIncomingChanges(Raw.Out, Parsed, Error));
+    const auto Complete = Raw.Out; Raw.Out.Append(Complete);
+    TestFalse(TEXT("Duplicate paths rejected"), GitWorkspace::ParseIncomingChanges(Raw.Out, Parsed, Error));
+    TestTrue(TEXT("Failed review exposes no partial paths"), Parsed.IsEmpty());
+    Raw.Out = Complete; Raw.Out.Pop();
+    TestFalse(TEXT("Truncated raw diff rejected"), GitWorkspace::ParseIncomingChanges(Raw.Out, Parsed, Error));
+    return true;
+}
 #endif

@@ -1,11 +1,16 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "SGitWorkspace.h"
+#include "GitWorkspacePullReview.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/SWindow.h"
+#include "HAL/PlatformApplicationMisc.h"
 #include "GitSourceControlModule.h"
 #include "Async/Async.h"
 #include "FileHelpers.h"
 #include "Misc/Paths.h"
 #include "Misc/MessageDialog.h"
 #include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Framework/Docking/TabManager.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Layout/SSplitter.h"
@@ -45,8 +50,12 @@ public:
     {
         FString Value;
         if (!Item->Group.IsEmpty()) Value = Column == "Asset" ? Item->Group : FString();
-        else if (Column == "Asset") Value = FPaths::GetCleanFilename(Item->File.Path);
-        else if (Column == "Working") Value = State(Item->File.Working);
+        else if (Column == "Asset") return SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight()
+            [SNew(STextBlock).Clipping(EWidgetClipping::ClipToBounds).Text(Text(FPaths::GetCleanFilename(Item->File.Path))).ToolTipText(Text(Item->File.Path))]
+            + SVerticalBox::Slot().AutoHeight()
+            [SNew(STextBlock).Clipping(EWidgetClipping::ClipToBounds).Font(FAppStyle::GetFontStyle("SmallFont")).Text(Text(Item->File.Path)).ToolTipText(Text(Item->File.Path))];
+        else if (Column == "Working") Value = Item->File.bSubmodule ? TEXT("Submodule") : State(Item->File.Working);
         else if (Column == "Staged") Value = State(Item->File.Index);
         else if (Column == "Lock") return SNew(STextBlock).Clipping(EWidgetClipping::ClipToBounds).Text_Lambda([this] { return Text(Locks->Label(Item->File.Path, Item->File.bLockable)); }).ToolTipText_Lambda([this] { return Text(Item->File.Path + TEXT("\n") + Locks->Label(Item->File.Path, Item->File.bLockable)); });
         return SNew(STextBlock).Clipping(EWidgetClipping::ClipToBounds).Text(Text(Value)).ToolTipText(Text(Item->File.Path));
@@ -114,17 +123,21 @@ void SGitWorkspace::Construct(const FArguments& Args)
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
             [SNew(SButton).Text(Text(TEXT("Fetch upstream"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked_Lambda([this] { return RemoteAction(0); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
-            [SNew(SButton).Text(Text(TEXT("Push…"))).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Ahead > 0 && Remote.Behind == 0; }).OnClicked_Lambda([this] { return RemoteAction(1); })]
+            [SNew(SButton).Text(Text(TEXT("Review incoming…"))).IsEnabled_Lambda([this] { return IsIdle() && Remote.bValid && Remote.Behind > 0; }).OnClicked(this, &SGitWorkspace::ShowIncomingReview)]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Push…"))).ToolTipText(this, &SGitWorkspace::PushHint).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Ahead > 0 && Remote.Behind == 0; }).OnClicked_Lambda([this] { return RemoteAction(1); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 12, 0)
             [SNew(SButton).Text(Text(TEXT("Pull fast-forward…"))).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Behind > 0 && Remote.Ahead == 0; }).OnClicked_Lambda([this] { return RemoteAction(2); })]
-            + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
-            [SNew(STextBlock).AutoWrapText(true).Text_Lambda([this]
-            {
-                if (!Remote.Error.IsEmpty()) return Text(Remote.Error);
-                if (!Remote.IsFresh()) return Text(TEXT("Fetch to review incoming/outgoing commits. Pull currently accepts documentation-only updates."));
-                return Text(Remote.Remote + TEXT(" / ") + Remote.RemoteRef + FString::Printf(TEXT("  |  %d outgoing · %d incoming  |  "), Remote.Ahead, Remote.Behind) + Remote.FetchedAt.ToIso8601());
-            })]
         ]
+        + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
+        [SNew(STextBlock).AutoWrapText(true).Text_Lambda([this]
+            {
+                if (!Remote.Error.IsEmpty()) return Text(Remote.Error + TEXT("\n") + PushHint().ToString());
+                if (!Remote.IsFresh()) return PushHint();
+                return Text(Remote.Remote + TEXT(" / ") + Remote.RemoteRef + FString::Printf(TEXT("  |  %d outgoing · %d incoming  |  "), Remote.Ahead, Remote.Behind) + Remote.FetchedAt.ToIso8601() + TEXT("\n") + PushHint().ToString());
+            })]
+        + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 10)
+        [SNew(STextBlock).Text_Lambda([this] { return Text(IsIdle() ? Feedback : TEXT("Git operation running…")); }).AutoWrapText(true)]
         + SVerticalBox::Slot().FillHeight(1)
         [
             SNew(SSplitter)
@@ -135,10 +148,13 @@ void SGitWorkspace::Construct(const FArguments& Args)
                 [
                     SNew(SHorizontalBox)
                     + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
-                    [SNew(SButton).Text(Text(TEXT("Stage selected"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked_Lambda([this] { return ChangeIndex(true); })]
+                    [SNew(SButton).Text_Lambda([this] { return Text(FString::Printf(TEXT("Stage selected (%d)"), SelectedIndexPaths(true).Num())); }).ToolTipText(Text(TEXT("Stage eligible saved files in the selection. Submodules are skipped and reported."))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && SelectedIndexPaths(true).Num() > 0; }).OnClicked_Lambda([this] { return ChangeIndex(true); })]
                     + SHorizontalBox::Slot().AutoWidth()
-                    [SNew(SButton).Text(Text(TEXT("Unstage selected"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked_Lambda([this] { return ChangeIndex(false); })]
+                    [SNew(SButton).Text_Lambda([this] { return Text(FString::Printf(TEXT("Unstage selected (%d)"), SelectedIndexPaths(false).Num())); }).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && SelectedIndexPaths(false).Num() > 0; }).OnClicked_Lambda([this] { return ChangeIndex(false); })]
                 ]
+                + SVerticalBox::Slot().AutoHeight().Padding(10, 4)
+                [SNew(SSearchBox).HintText(Text(TEXT("Filter files by name or path"))).IsEnabled_Lambda([this] { return IsIdle(); })
+                    .OnTextChanged_Lambda([this](const FText& Value) { FileFilter = Value.ToString().TrimStartAndEnd(); RebuildRows(); })]
                 + SVerticalBox::Slot().FillHeight(1).Padding(8)
                 [
                     SAssignNew(List, SListView<TSharedPtr<FGitWorkspaceRow>>)
@@ -177,12 +193,10 @@ void SGitWorkspace::Construct(const FArguments& Args)
                 .IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && Snapshot.StagedCount() && !Snapshot.HasConflicts() && !Snapshot.bOperationInProgress; })
                 .OnClicked(this, &SGitWorkspace::Commit)]
         ]
-        + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 10)
-        [SNew(STextBlock).Text_Lambda([this] { return Text(IsIdle() ? Feedback : TEXT("Git operation running…")); }).AutoWrapText(true)]
     ];
     Refresh();
 }
-SGitWorkspace::~SGitWorkspace() { WaitForWork(); }
+SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); }
 void SGitWorkspace::WaitForWork() { if (Pending.IsValid()) { Pending.Wait(); Pending = TFuture<FGitWorkspaceTaskResult>(); } }
 void SGitWorkspace::Start(TFunction<FGitWorkspaceTaskResult()> Work)
 {
@@ -225,19 +239,28 @@ FReply SGitWorkspace::Refresh()
 }
 void SGitWorkspace::RebuildRows()
 {
+    if (!List) return;
     Rows.Empty(); Selection.Reset(); DiffText.Empty(); List->ClearSelection();
     if (Snapshot.bValid)
     {
+        auto Files = Snapshot.Files;
+        Files.Sort([](const auto& A, const auto& B)
+        {
+            auto IsAsset = [](const auto& F) { return F.Path.EndsWith(TEXT(".uasset")) || F.Path.EndsWith(TEXT(".umap")); };
+            if (IsAsset(A) != IsAsset(B)) return IsAsset(A);
+            return A.Path < B.Path;
+        });
         for (bool bStaged : {false, true})
         {
-            int32 Count = 0;
-            for (const auto& File : Snapshot.Files) Count += bStaged ? File.HasStaged() : File.HasUnstaged();
+            int32 Count = 0, Visible = 0;
+            for (const auto& File : Files) if (bStaged ? File.HasStaged() : File.HasUnstaged())
+            { ++Count; if (FileFilter.IsEmpty() || File.Path.Contains(FileFilter)) ++Visible; }
             auto Header = MakeShared<FGitWorkspaceRow>();
-            Header->Group = (bStaged ? FString(TEXT("Staged changes · ")) : FString(TEXT("Unstaged changes · "))) + FString::FromInt(Count);
+            Header->Group = (bStaged ? FString(TEXT("Staged changes · ")) : FString(TEXT("Unstaged changes · "))) + (FileFilter.IsEmpty() ? FString::FromInt(Count) : FString::Printf(TEXT("%d of %d"), Visible, Count));
             Rows.Add(Header);
-            for (const auto& File : Snapshot.Files)
+            for (const auto& File : Files)
             {
-                if (bStaged ? File.HasStaged() : File.HasUnstaged())
+                if ((bStaged ? File.HasStaged() : File.HasUnstaged()) && (FileFilter.IsEmpty() || File.Path.Contains(FileFilter)))
                 { auto Row = MakeShared<FGitWorkspaceRow>(); Row->File = File; Row->bStaged = bStaged; Rows.Add(Row); }
             }
         }
@@ -253,7 +276,7 @@ void SGitWorkspace::RebuildRows()
         {
             auto Header = MakeShared<FGitWorkspaceRow>(); Header->Group = TEXT("Clean assets / server locks · ") + FString::FromInt(Clean.Num()); Rows.Add(Header);
             TArray<FString> Paths; Clean.GetKeys(Paths); Paths.Sort();
-            for (const auto& Path : Paths) { auto Row = MakeShared<FGitWorkspaceRow>(); Row->File = Clean[Path]; Rows.Add(Row); }
+            for (const auto& Path : Paths) { if (!FileFilter.IsEmpty() && !Path.Contains(FileFilter)) continue; auto Row = MakeShared<FGitWorkspaceRow>(); Row->File = Clean[Path]; Rows.Add(Row); }
         }
     }
     List->RequestListRefresh();
@@ -266,20 +289,38 @@ bool SGitWorkspace::HasDirtyPackages() const
     FEditorFileUtils::GetDirtyContentPackages(Dirty); FEditorFileUtils::GetDirtyWorldPackages(Dirty);
     return Dirty.Num() > 0;
 }
+TArray<FString> SGitWorkspace::SelectedIndexPaths(bool bStage, int32* SkippedSubmodules) const
+{
+    TArray<FString> Paths;
+    if (SkippedSubmodules) *SkippedSubmodules = 0;
+    if (!List) return Paths;
+    for (const auto& Row : List->GetSelectedItems())
+    {
+        if (!Row->Group.IsEmpty() || Row->bStaged == bStage || !(bStage ? Row->File.HasUnstaged() : Row->File.HasStaged())) continue;
+        if (Row->File.bSubmodule) { if (SkippedSubmodules) ++*SkippedSubmodules; continue; }
+        Paths.AddUnique(Row->File.Path);
+    }
+    return Paths;
+}
 FReply SGitWorkspace::ChangeIndex(bool bStage)
 {
     if (!IsIdle()) return FReply::Handled();
     if (bStage && HasDirtyPackages()) { Feedback = TEXT("Save dirty assets first. Stage uses saved files; saving never stages automatically."); return FReply::Handled(); }
-    TArray<FString> Paths;
-    for (const auto& Row : List->GetSelectedItems())
-        if (Row->Group.IsEmpty() && Row->bStaged != bStage && (bStage ? Row->File.HasUnstaged() : Row->File.HasStaged())) Paths.AddUnique(Row->File.Path);
-    if (!Paths.Num()) { Feedback = bStage ? TEXT("Select files in Unstaged changes.") : TEXT("Select files in Staged changes."); return FReply::Handled(); }
+    int32 Skipped = 0;
+    const auto Paths = SelectedIndexPaths(bStage, &Skipped);
+    if (!Paths.Num())
+    {
+        Feedback = Skipped ? TEXT("Selected submodules need their own repository workflow; no eligible files selected.")
+            : (bStage ? TEXT("Select files in Unstaged changes.") : TEXT("Select files in Staged changes."));
+        return FReply::Handled();
+    }
     auto Repo = Repository;
-    Start([Repo, Paths, bStage]
+    Start([Repo, Paths, bStage, Skipped]
     {
         const auto Op = bStage ? Repo->Stage(Paths) : Repo->Unstage(Paths);
         FGitWorkspaceTaskResult R; R.Snapshot = Repo->Refresh();
-        R.Message = Op.Ok() ? (bStage ? TEXT("Selected saved files staged.") : TEXT("Selected files unstaged. Working files preserved.")) : Op.Error;
+        R.Message = Op.Ok() ? FString::Printf(TEXT("%s %d selected files.%s"), bStage ? TEXT("Staged") : TEXT("Unstaged"), Paths.Num(), bStage ? TEXT("") : TEXT(" Working files preserved.")) : Op.Error;
+        if (Skipped) R.Message += FString::Printf(TEXT(" Skipped %d submodule(s); manage their commits/pointers separately."), Skipped);
         return R;
     });
     return FReply::Handled();
@@ -293,7 +334,7 @@ FReply SGitWorkspace::Commit()
     {
         const auto Op = Repo->Commit(Reviewed, Description);
         FGitWorkspaceTaskResult R; R.Snapshot = Repo->Refresh(); R.bCommitSucceeded = Op.Ok();
-        R.Message = Op.Ok() ? TEXT("Local commit created. Nothing pushed; locks retained.\n") + Op.Text() + Op.Error : Op.Error;
+        R.Message = Op.Ok() ? TEXT("Local commit created. Nothing pushed. Fetch upstream to review this commit for Push.\nNo locks were released. Use Verify locks to confirm server ownership.\n") + Op.Text() + Op.Error : Op.Error;
         return R;
     });
     return FReply::Handled();
@@ -355,10 +396,51 @@ FReply SGitWorkspace::ChangeLock(bool bUnlock)
     return FReply::Handled();
 }
 
+FReply SGitWorkspace::ShowIncomingReview()
+{
+    if (!IsIdle()) return FReply::Handled();
+    const auto Review = GitWorkspace::ReviewIncoming(Remote, Snapshot);
+    if (auto Old = IncomingWindow.Pin()) Old->RequestDestroyWindow();
+    const auto Window = SNew(SWindow).Title(Text(TEXT("Review incoming changes"))).ClientSize(FVector2D(840, 640)).SupportsMinimize(false);
+    IncomingWindow = Window;
+    TWeakPtr<SWindow> WeakWindow = Window;
+    const FString Report = Review.Text;
+    Window->SetContent(SNew(SBorder).Padding(12)
+    [
+        SNew(SVerticalBox)
+        + SVerticalBox::Slot().FillHeight(1)
+        [SNew(SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(Text(Report)).Font(FAppStyle::GetFontStyle("MonoFont"))]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 12, 0, 0)
+        [
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Copy review"))).OnClicked_Lambda([Report] { FPlatformApplicationMisc::ClipboardCopy(*Report); return FReply::Handled(); })]
+            + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SButton).Text(Text(TEXT("Close"))).OnClicked_Lambda([WeakWindow] { if (auto W = WeakWindow.Pin()) W->RequestDestroyWindow(); return FReply::Handled(); })]
+        ]
+    ]);
+    FSlateApplication::Get().AddWindow(Window);
+    return FReply::Handled();
+}
+
+FText SGitWorkspace::PushHint() const
+{
+    if (!IsIdle()) return Text(TEXT("Push unavailable while a Git operation is running."));
+    if (!Remote.IsFresh()) return Text(TEXT("Fetch upstream to enable Push. A new commit or an expired review requires another Fetch."));
+    if (Remote.Ahead > 0 && Remote.Behind > 0) return Text(TEXT("Push blocked: branches have diverged. Reconcile incoming changes externally, then Fetch again."));
+    if (Remote.Behind > 0) return Text(TEXT("Push unavailable: incoming commits need review. Pull currently accepts documentation-only updates."));
+    if (Remote.Ahead == 0) return Text(TEXT("Nothing to push: no outgoing commits."));
+    return Text(TEXT("Push is ready for review. LFS upload and lock ownership are checked before publishing; locks are not released."));
+}
+
 FReply SGitWorkspace::RemoteAction(int32 Action)
 {
     if (!IsIdle()) return FReply::Handled();
-    if (Action == 2 && HasDirtyPackages()) { Feedback = TEXT("Save dirty editor packages before Pull. No assets are saved or stashed automatically."); return FReply::Handled(); }
+    if (Action == 2)
+    {
+        const auto Review = GitWorkspace::ReviewIncoming(Remote, Snapshot);
+        if (!Review.bCanPull) { Feedback = Review.Blocker; return ShowIncomingReview(); }
+    }
     auto Repo = Repository; const auto Reviewed = Remote;
     if (Action && !Reviewed.IsFresh()) { Feedback = TEXT("Fetch and review the upstream first."); return FReply::Handled(); }
     if (Action)
@@ -366,7 +448,7 @@ FReply SGitWorkspace::RemoteAction(int32 Action)
         FString Prompt = (Action == 1 ? TEXT("Push reviewed commit ") + Reviewed.Head : TEXT("Fast-forward to reviewed commit ") + Reviewed.RemoteHead)
             + TEXT("\n") + Reviewed.Remote + TEXT(" / ") + Reviewed.RemoteRef;
         Prompt += Action == 1 ? TEXT("\n\nOnly committed data is published. Staged, working and unsaved edits are excluded. Locks are retained.")
-            : TEXT("\n\nRequires a clean working tree and documentation-only changes. Asset, code and configuration updates require external integration with the editor closed.");
+            : FString::Printf(TEXT("\n\n%d reviewed paths. Requires a clean working tree and documentation-only changes. Use Review incoming for file/package details. Asset, code and configuration updates require external integration with the editor closed."), Reviewed.IncomingChanges.Num());
         if (FMessageDialog::Open(EAppMsgType::YesNo, Text(Prompt)) != EAppReturnType::Yes) return FReply::Handled();
     }
     Remote.bValid = false;
