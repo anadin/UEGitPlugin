@@ -11,6 +11,7 @@
 #include "Misc/MessageDialog.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SSearchBox.h"
+#include "Widgets/Input/SSegmentedControl.h"
 #include "Framework/Docking/TabManager.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Layout/SSplitter.h"
@@ -106,17 +107,12 @@ void SGitWorkspace::Construct(const FArguments& Args)
             + SHorizontalBox::Slot().AutoWidth()
             [SNew(SButton).Text(Text(TEXT("Verify locks"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked(this, &SGitWorkspace::VerifyLocks)]
             + SHorizontalBox::Slot().AutoWidth().Padding(8, 0)
-            [SNew(SButton).Text(Text(TEXT("Lock asset"))).IsEnabled_Lambda([this] { return IsIdle() && Selection && Selection->Group.IsEmpty() && Selection->File.bLockable && Locks.State(Selection->File.Path, true) == GitWorkspace::ELockState::Unlocked; }).OnClicked_Lambda([this] { return ChangeLock(false); })]
+            [SNew(SButton).Text(Text(TEXT("Lock asset"))).ToolTipText(this, &SGitWorkspace::LockHint).IsEnabled(this, &SGitWorkspace::CanLockSelected).OnClicked_Lambda([this] { return ChangeLock(false); })]
             + SHorizontalBox::Slot().AutoWidth()
             [SNew(SButton).Text(Text(TEXT("Unlock…"))).IsEnabled_Lambda([this] { return IsIdle() && Selection && Selection->Group.IsEmpty() && Locks.State(Selection->File.Path, Selection->File.bLockable) == GitWorkspace::ELockState::Ours; }).OnClicked_Lambda([this] { return ChangeLock(true); })]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
-        [SNew(STextBlock).AutoWrapText(true).Text_Lambda([this]
-        {
-            if (!Locks.Error.IsEmpty()) return Text(Locks.Error);
-            if (!Locks.VerifiedAt.GetTicks()) return Text(TEXT("Lock ownership has not been verified. Verify to include clean tracked assets."));
-            return Text(Locks.Endpoint + TEXT("  |  ") + (Locks.IsFresh() ? TEXT("Verified at ") : TEXT("Stale — last verified at ")) + Locks.VerifiedAt.ToIso8601());
-        })]
+        [SNew(STextBlock).AutoWrapText(true).Text(this, &SGitWorkspace::LockStatusText)]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
         [
             SNew(SHorizontalBox)
@@ -137,7 +133,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
                 return Text(Remote.Remote + TEXT(" / ") + Remote.RemoteRef + FString::Printf(TEXT("  |  %d outgoing · %d incoming  |  "), Remote.Ahead, Remote.Behind) + Remote.FetchedAt.ToIso8601() + TEXT("\n") + PushHint().ToString());
             })]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 10)
-        [SNew(STextBlock).Text_Lambda([this] { return Text(IsIdle() ? Feedback : TEXT("Git operation running…")); }).AutoWrapText(true)]
+        [SNew(STextBlock).Text_Lambda([this] { return Text(IsIdle() ? Feedback : bCheckingLocks ? TEXT("Checking locks…") : TEXT("Git operation running…")); }).AutoWrapText(true)]
         + SVerticalBox::Slot().FillHeight(1)
         [
             SNew(SSplitter)
@@ -152,6 +148,11 @@ void SGitWorkspace::Construct(const FArguments& Args)
                     + SHorizontalBox::Slot().AutoWidth()
                     [SNew(SButton).Text_Lambda([this] { return Text(FString::Printf(TEXT("Unstage selected (%d)"), SelectedIndexPaths(false).Num())); }).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && SelectedIndexPaths(false).Num() > 0; }).OnClicked_Lambda([this] { return ChangeIndex(false); })]
                 ]
+                + SVerticalBox::Slot().AutoHeight().Padding(10, 4)
+                [SNew(SSegmentedControl<bool>).Value_Lambda([this] { return bContentOnly; }).IsEnabled_Lambda([this] { return IsIdle(); })
+                    .OnValueChanged_Lambda([this](bool Value) { bContentOnly = Value; RebuildRows(); })
+                    + SSegmentedControl<bool>::Slot(true).Text(Text(TEXT("Content"))).ToolTip(Text(TEXT("Show only files under Content/. This filters the view, not the Git index.")))
+                    + SSegmentedControl<bool>::Slot(false).Text(Text(TEXT("Whole repo"))).ToolTip(Text(TEXT("Show changes and locks throughout the repository, including source, configuration and plugins.")))]
                 + SVerticalBox::Slot().AutoHeight().Padding(10, 4)
                 [SNew(SSearchBox).HintText(Text(TEXT("Filter files by name or path"))).IsEnabled_Lambda([this] { return IsIdle(); })
                     .OnTextChanged_Lambda([this](const FText& Value) { FileFilter = Value.ToString().TrimStartAndEnd(); RebuildRows(); })]
@@ -183,6 +184,9 @@ void SGitWorkspace::Construct(const FArguments& Args)
                 [SNew(SMultiLineEditableTextBox).IsReadOnly(true).Text_Lambda([this] { return Text(DiffText); }).Font(FAppStyle::GetFontStyle("MonoFont"))]
             ]
         ]
+        + SVerticalBox::Slot().AutoHeight().Padding(10, 0)
+        [SNew(STextBlock).AutoWrapText(true).Visibility_Lambda([this] { return HiddenStagedCount() ? EVisibility::Visible : EVisibility::Collapsed; })
+            .Text_Lambda([this] { return Text(FString::Printf(TEXT("%d staged file(s) hidden by this view. Choose Whole repo and clear the search to review all staged files before committing."), HiddenStagedCount())); })]
         + SVerticalBox::Slot().AutoHeight().Padding(10)
         [
             SNew(SHorizontalBox)
@@ -190,7 +194,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
             [SAssignNew(Message, SMultiLineEditableTextBox).HintText(Text(TEXT("Commit message"))).IsEnabled_Lambda([this] { return IsIdle(); })]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
             [SNew(SButton).Text_Lambda([this] { return Text(FString::Printf(TEXT("Commit staged · %d"), Snapshot.StagedCount())); })
-                .IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && Snapshot.StagedCount() && !Snapshot.HasConflicts() && !Snapshot.bOperationInProgress; })
+                .IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && Snapshot.StagedCount() && !HiddenStagedCount() && !Snapshot.HasConflicts() && !Snapshot.bOperationInProgress; })
                 .OnClicked(this, &SGitWorkspace::Commit)]
         ]
     ];
@@ -208,6 +212,7 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
     {
         FGitWorkspaceTaskResult Result = Pending.Get();
         Pending = TFuture<FGitWorkspaceTaskResult>();
+        bCheckingLocks = false;
         if (Result.bRemote) Remote = MoveTemp(Result.Remote);
         else if (!Result.bDiff && (Remote.Head != Result.Snapshot.Head || Remote.Branch != Result.Snapshot.Branch)) Remote.bValid = false;
         if (Result.bLocks)
@@ -229,6 +234,13 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
             if (Result.bCommitSucceeded) Message->SetText(FText::GetEmpty());
             RebuildRows();
         }
+        // Publish local status before starting the network query. Opening a tab
+        // schedules one read-only check; failure must not cause a retry loop.
+        if (bVerifyLocksOnOpen)
+        {
+            bVerifyLocksOnOpen = false;
+            if (Snapshot.bValid) VerifyLocks();
+        }
     }
 }
 FReply SGitWorkspace::Refresh()
@@ -240,6 +252,7 @@ FReply SGitWorkspace::Refresh()
 void SGitWorkspace::RebuildRows()
 {
     if (!List) return;
+    const auto PreviousSelection = List->GetSelectedItems();
     Rows.Empty(); Selection.Reset(); DiffText.Empty(); List->ClearSelection();
     if (Snapshot.bValid)
     {
@@ -254,13 +267,13 @@ void SGitWorkspace::RebuildRows()
         {
             int32 Count = 0, Visible = 0;
             for (const auto& File : Files) if (bStaged ? File.HasStaged() : File.HasUnstaged())
-            { ++Count; if (FileFilter.IsEmpty() || File.Path.Contains(FileFilter)) ++Visible; }
+            { ++Count; if (IsPathVisible(File.Path)) ++Visible; }
             auto Header = MakeShared<FGitWorkspaceRow>();
-            Header->Group = (bStaged ? FString(TEXT("Staged changes · ")) : FString(TEXT("Unstaged changes · "))) + (FileFilter.IsEmpty() ? FString::FromInt(Count) : FString::Printf(TEXT("%d of %d"), Visible, Count));
+            Header->Group = (bStaged ? FString(TEXT("Staged changes · ")) : FString(TEXT("Unstaged changes · "))) + (Visible == Count ? FString::FromInt(Count) : FString::Printf(TEXT("%d of %d"), Visible, Count));
             Rows.Add(Header);
             for (const auto& File : Files)
             {
-                if ((bStaged ? File.HasStaged() : File.HasUnstaged()) && (FileFilter.IsEmpty() || File.Path.Contains(FileFilter)))
+                if ((bStaged ? File.HasStaged() : File.HasUnstaged()) && IsPathVisible(File.Path))
                 { auto Row = MakeShared<FGitWorkspaceRow>(); Row->File = File; Row->bStaged = bStaged; Rows.Add(Row); }
             }
         }
@@ -274,12 +287,27 @@ void SGitWorkspace::RebuildRows()
         for (const auto& File : Snapshot.Files) Clean.Remove(File.Path);
         if (Clean.Num())
         {
-            auto Header = MakeShared<FGitWorkspaceRow>(); Header->Group = TEXT("Clean assets / server locks · ") + FString::FromInt(Clean.Num()); Rows.Add(Header);
             TArray<FString> Paths; Clean.GetKeys(Paths); Paths.Sort();
-            for (const auto& Path : Paths) { if (!FileFilter.IsEmpty() && !Path.Contains(FileFilter)) continue; auto Row = MakeShared<FGitWorkspaceRow>(); Row->File = Clean[Path]; Rows.Add(Row); }
+            const int32 Visible = Paths.FilterByPredicate([this](const auto& Path) { return IsPathVisible(Path); }).Num();
+            auto Header = MakeShared<FGitWorkspaceRow>(); Header->Group = TEXT("Clean assets / server locks · ") + (Visible == Clean.Num() ? FString::FromInt(Visible) : FString::Printf(TEXT("%d of %d"), Visible, Clean.Num())); Rows.Add(Header);
+            for (const auto& Path : Paths) { if (!IsPathVisible(Path)) continue; auto Row = MakeShared<FGitWorkspaceRow>(); Row->File = Clean[Path]; Rows.Add(Row); }
         }
     }
     List->RequestListRefresh();
+    for (const auto& Row : Rows) if (Row->Group.IsEmpty())
+        for (const auto& Old : PreviousSelection)
+            if (Old->Group.IsEmpty() && Old->File.Path == Row->File.Path && Old->bStaged == Row->bStaged)
+            { List->SetItemSelection(Row, true); break; }
+}
+bool SGitWorkspace::IsPathVisible(const FString& Path) const
+{
+    return (!bContentOnly || Path.StartsWith(TEXT("Content/"), ESearchCase::CaseSensitive)) && (FileFilter.IsEmpty() || Path.Contains(FileFilter));
+}
+int32 SGitWorkspace::HiddenStagedCount() const
+{
+    int32 Count = 0;
+    for (const auto& File : Snapshot.Files) if (File.HasStaged() && !IsPathVisible(File.Path)) ++Count;
+    return Count;
 }
 TSharedRef<ITableRow> SGitWorkspace::MakeRow(TSharedPtr<FGitWorkspaceRow> Row, const TSharedRef<STableViewBase>& Owner)
 { return SNew(SFileRow, Owner).Item(Row).Locks(&Locks); }
@@ -328,6 +356,7 @@ FReply SGitWorkspace::ChangeIndex(bool bStage)
 FReply SGitWorkspace::Commit()
 {
     if (!IsIdle()) return FReply::Handled();
+    if (HiddenStagedCount()) { Feedback = TEXT("Staged files are hidden by this view. Choose Whole repo and clear the search to review all staged files before committing."); return FReply::Handled(); }
     if (HasDirtyPackages()) { Feedback = TEXT("Save dirty assets before committing here. Saving will not change the staged snapshot; review any later edits afterward."); return FReply::Handled(); }
     auto Repo = Repository; const auto Reviewed = Snapshot; const FString Description = Message->GetText().ToString();
     Start([Repo, Reviewed, Description]
@@ -362,7 +391,38 @@ FText SGitWorkspace::Inspector() const
         + (F.HasStaged() && F.HasUnstaged() ? TEXT("\nNew edits since staging; these will remain outside the commit.") : TEXT(""))
         + (TEXT("\n\nLock: ") + Locks.Label(F.Path, F.bLockable))
         + (Locks.Locks.Contains(F.Path) ? TEXT("\nLast known owner: ") + Locks.Locks[F.Path].Owner + TEXT("\nLock ID: ") + Locks.Locks[F.Path].Id + TEXT("\nAcquired: ") + Locks.Locks[F.Path].LockedAt : FString())
-        + (F.bSubmodule ? TEXT("\nSubmodule: changes must be handled in its own repository.") : TEXT("")));
+        + (F.bSubmodule ? TEXT("\nSubmodule: changes must be handled in its own repository.") : TEXT(""))
+        + (F.bLfs && F.bLockable ? TEXT("\n") + LockHint().ToString() : FString()));
+}
+
+bool SGitWorkspace::CanLockSelected() const
+{
+    if (!IsIdle() || !Selection || !Selection->Group.IsEmpty() || !List || List->GetSelectedItems().Num() != 1) return false;
+    const auto& File = Selection->File;
+    if (!File.bLfs || !File.bLockable || File.bSubmodule || File.bConflict || File.Index == 'D' || File.Working == 'D') return false;
+    const auto State = Locks.State(File.Path, true);
+    return State == GitWorkspace::ELockState::Unknown || State == GitWorkspace::ELockState::Stale || State == GitWorkspace::ELockState::Unlocked;
+}
+FText SGitWorkspace::LockHint() const
+{
+    if (!Selection || !Selection->Group.IsEmpty() || !List || List->GetSelectedItems().Num() != 1) return Text(TEXT("Select one saved asset to lock."));
+    const auto& File = Selection->File;
+    if (!File.bLfs || !File.bLockable) return Text(TEXT("This file is not configured for Git LFS locking."));
+    if (File.bSubmodule || File.bConflict || File.Index == 'D' || File.Working == 'D') return Text(TEXT("Resolve this file's state before acquiring a lock."));
+    const auto State = Locks.State(File.Path, true);
+    if (State == GitWorkspace::ELockState::Ours) return Text(TEXT("You own this lock. Push keeps it; Unlock is a separate handoff."));
+    if (State == GitWorkspace::ELockState::Theirs) return Text(TEXT("Another user owns this lock. Verify locks to refresh ownership."));
+    return Text(File.bUntracked
+        ? TEXT("New saved asset: Lock asset verifies the server and reserves this path. It does not stage, commit or push the asset. Automatic locking is not enabled.")
+        : TEXT("Lock asset verifies the server and requests a lock. Verify locks only checks ownership; it does not acquire a lock."));
+}
+
+FText SGitWorkspace::LockStatusText() const
+{
+    if (bCheckingLocks) return Text(TEXT("Checking locks on ") + LockRemote + TEXT("…"));
+    if (!Locks.Error.IsEmpty()) return Text(Locks.Error + TEXT("\nOwnership is not verified. Use Verify locks to retry when ready."));
+    if (!Locks.VerifiedAt.GetTicks()) return Text(TEXT("Lock ownership has not been verified. Verify to include clean tracked assets."));
+    return Text(Locks.Endpoint + TEXT("  |  ") + (Locks.IsFresh() ? TEXT("Verified at ") : TEXT("Stale — last verified at ")) + Locks.VerifiedAt.ToIso8601());
 }
 
 FReply SGitWorkspace::VerifyLocks()
@@ -370,6 +430,7 @@ FReply SGitWorkspace::VerifyLocks()
     if (!IsIdle()) return FReply::Handled();
     auto Repo = Repository; const FString SelectedLockRemote = LockRemote;
     Locks.bVerified = false;
+    bCheckingLocks = true;
     Start([Repo, SelectedLockRemote]
     {
         FGitWorkspaceTaskResult R; R.bLocks = true; R.Locks = Repo->VerifyLocks(SelectedLockRemote); R.Snapshot = Repo->Refresh();
@@ -383,13 +444,15 @@ FReply SGitWorkspace::ChangeLock(bool bUnlock)
     if (!IsIdle() || !Selection || !Selection->Group.IsEmpty()) return FReply::Handled();
     if (List->GetSelectedItems().Num() != 1) { Feedback = TEXT("Select one asset for a lock operation."); return FReply::Handled(); }
     if (bUnlock && HasDirtyPackages()) { Feedback = TEXT("Save dirty assets and review their Git state before unlocking."); return FReply::Handled(); }
-    auto Repo = Repository; const auto Reviewed = Locks; const FString Path = Selection->File.Path;
+    if (!bUnlock && !CanLockSelected()) { Feedback = LockHint().ToString(); return FReply::Handled(); }
+    auto Repo = Repository; const auto Reviewed = Locks; const FString Path = Selection->File.Path, SelectedRemote = LockRemote;
     if (bUnlock && FMessageDialog::Open(EAppMsgType::YesNo, Text(TEXT("Release the lock on ") + Path + TEXT("?\n\nBranch: ") + Snapshot.Branch + TEXT("\nCommit: ") + Snapshot.Head + TEXT("\n\nConfirm that your team handoff is complete and no other clone or worktree still needs this reservation. The plugin will check saved changes, stashes and the live upstream before unlocking."))) != EAppReturnType::Yes) return FReply::Handled();
     Locks.bVerified = false;
-    Start([Repo, Reviewed, Path, bUnlock]
+    Start([Repo, Reviewed, Path, SelectedRemote, bUnlock]
     {
-        const auto Op = Repo->ChangeLock(Reviewed, Path, bUnlock, bUnlock);
-        FGitWorkspaceTaskResult R; R.bLocks = true; R.Locks = Repo->VerifyLocks(Reviewed.Remote); R.Snapshot = Repo->Refresh();
+        const auto LockReview = !bUnlock && !Reviewed.IsFresh() ? Repo->VerifyLocks(SelectedRemote) : Reviewed;
+        const auto Op = Repo->ChangeLock(LockReview, Path, bUnlock, bUnlock);
+        FGitWorkspaceTaskResult R; R.bLocks = true; R.Locks = Repo->VerifyLocks(SelectedRemote); R.Snapshot = Repo->Refresh();
         R.Message = Op.Ok() ? (bUnlock ? TEXT("Lock released and server state verified.") : TEXT("Lock acquired and server ownership verified.")) : Op.Error;
         return R;
     });

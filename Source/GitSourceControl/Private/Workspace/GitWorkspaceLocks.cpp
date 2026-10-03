@@ -3,12 +3,16 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Misc/SecureHash.h"
+#if PLATFORM_MAC
+#include <sys/stat.h>
+#endif
 
 namespace GitWorkspace
 {
@@ -209,9 +213,8 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
     {
         const FLock* Old = Reviewed.Locks.Find(Path);
         if (!Lock || !Lock->bOurs || !Old || Old->Id != Lock->Id) return LockFailure(TEXT("Lock ownership or identity changed. Nothing unlocked."));
-        const auto* Acquired = AcquiredLocks.Find(Path);
-        if (!Acquired || Acquired->Id != Lock->Id || Acquired->Context != Current.Context)
-            return LockFailure(TEXT("This lock was not acquired in this panel session. Review other clones/worktrees before releasing it with an external client."));
+        FString RecordError;
+        if (!ReadLockRecord(Current, *Lock, RecordError)) return LockFailure(RecordError);
         if (!bHandoffConfirmed) return LockFailure(TEXT("Confirm the team handoff before releasing this lock."));
         const auto Status = RefreshInternal();
         if (!Status.bValid || Status.bOperationInProgress || Status.HasConflicts()) return LockFailure(TEXT("Resolve repository state before unlocking."));
@@ -238,13 +241,14 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
             if (File.Path == Path || File.OriginalPath == Path) return LockFailure(TEXT("Asset changed during handoff checks. Keep its lock."));
         const auto FinalStashes = Git({TEXT("stash"), TEXT("list"), TEXT("--format=%H")});
         if (!FinalStashes.Ok() || !FinalStashes.Out.IsEmpty()) return LockFailure(TEXT("Stash state changed during handoff checks. Keep the lock."));
+        if (!ReadLockRecord(Current, *Lock, RecordError)) return LockFailure(RecordError);
         // ID prevents releasing a replacement lock after a race; never use --force.
         auto Result = Lfs(Current.Remote, {TEXT("unlock"), TEXT("--json"), TEXT("--remote=") + Current.Remote, TEXT("--id=") + Lock->Id});
         if (!Result.Ok()) return LockFailure(TEXT("Unlock did not complete reliably. Verify before retrying. ") + Result.Error);
-        AcquiredLocks.Remove(Path);
         auto After = VerifyLocksInternal(Current.Remote);
         if (!After.IsFresh() || After.Context != Current.Context || After.Locks.Contains(Path))
             return LockFailure(TEXT("Unlock was sent, but the unlocked state could not be confirmed. Verify before retrying. ") + After.Error);
+        if (!RemoveLockRecord(Current, *Lock, RecordError)) return LockFailure(RecordError);
         return Result;
     }
     if (Reviewed.State(Path, true) != ELockState::Unlocked) return LockFailure(TEXT("Review a verified unlocked asset before acquiring a lock."));
@@ -256,8 +260,27 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
     if (!Status.bValid || Status.bOperationInProgress || Status.HasConflicts()) return LockFailure(TEXT("Resolve repository state before locking."));
     const auto Index = Git({TEXT("ls-files"), TEXT("--stage"), TEXT("-z"), TEXT("--"), Path});
     const auto Entries = NullRecords(Index);
-    if (!Index.Ok() || Entries.Num() != 1 || !Entries[0].StartsWith(TEXT("100")) || !IFileManager::Get().FileExists(*FPaths::Combine(Root, Path)))
-        return LockFailure(TEXT("Select an existing tracked regular asset. New, deleted and submodule paths need external handling in this slice."));
+    const bool bTracked = Entries.Num() == 1 && (Entries[0].StartsWith(TEXT("100644 ")) || Entries[0].StartsWith(TEXT("100755 ")));
+    // Only accept a new path that Git actually reported as an untracked file.
+    // Ignored files and paths inside nested repositories are not parent assets.
+    const bool bUntracked = Entries.IsEmpty() && Status.Files.ContainsByPredicate([&Path](const FFile& File) { return File.Path == Path && File.bUntracked; });
+    if (!Index.Ok() || (!bTracked && !bUntracked) || !IFileManager::Get().FileExists(*FPaths::Combine(Root, Path)))
+        return LockFailure(TEXT("Save the asset to a regular, non-ignored file in this repository before locking. Deleted and submodule paths require external handling."));
+    TArray<FString> Parts; Path.ParseIntoArray(Parts, TEXT("/")); FString Component = Root;
+    for (const auto& Part : Parts)
+    {
+        Component = FPaths::Combine(Component, Part);
+#if PLATFORM_MAC
+        // Apple's IPlatformFile::IsSymlink uses stat in UE 5.8, which follows
+        // links. lstat must inspect the path itself for this boundary check.
+        struct stat Info;
+        if (lstat(TCHAR_TO_UTF8(*Component), &Info) != 0 || S_ISLNK(Info.st_mode) ||
+            (Component == FPaths::Combine(Root, Path) ? !S_ISREG(Info.st_mode) : !S_ISDIR(Info.st_mode)))
+#else
+        if (FPlatformFileManager::Get().GetPlatformFile().IsSymlink(*Component) != ESymlinkResult::NonSymlink)
+#endif
+            return LockFailure(TEXT("Cannot lock through a symlink or a path whose type cannot be verified. Select a saved regular asset inside this repository."));
+    }
     FLockSnapshot BeforeLock;
     if (!LockContext(Current.Remote, BeforeLock) || BeforeLock.Context != Current.Context)
         return LockFailure(TEXT("Endpoint or branch changed before locking. Verify again."));
@@ -269,7 +292,9 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
     auto After = VerifyLocksInternal(Current.Remote); const auto* Acquired = After.Locks.Find(Path);
     if (!After.IsFresh() || After.Context != Current.Context || !Acquired || !Acquired->bOurs || Acquired->Id != Created[Path].Id)
         return LockFailure(TEXT("Lock was sent, but ownership could not be confirmed. Verify before retrying. ") + After.Error);
-    AcquiredLocks.Add(Path, {Acquired->Id, Current.Context, Current.Branch});
+    FString RecordError;
+    if (!WriteLockRecord(Current, *Acquired, RecordError))
+        return LockFailure(TEXT("Server lock acquired and verified, but local acquisition tracking failed. ") + RecordError);
     return Result;
 }
 }

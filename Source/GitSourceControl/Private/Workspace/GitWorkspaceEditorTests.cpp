@@ -229,7 +229,7 @@ bool FGitIncomingPackageReviewTest::RunTest(const FString&)
     TestEqual(TEXT("Review does not change repository HEAD"), Repo.Refresh().Head, Local.Head);
     auto PanelRepo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Root);
     auto Panel = SNew(SGitWorkspace).Repository(PanelRepo);
-    Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0);
+    while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); }
     Panel->Remote = Remote;
     Panel->RemoteAction(2);
     TestTrue(TEXT("Blocked Pull opens the native review without starting Git work"), Panel->IsIdle() && Panel->IncomingWindow.IsValid());
@@ -278,8 +278,23 @@ bool FGitWorkspaceSelectionTest::RunTest(const FString&)
     Write(TEXT("README.md"), TEXT("parent edit\n")); Write(TEXT("graphify-out/cache.txt"), TEXT("cache edit\n"));
     auto Repo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Root);
     auto Panel = SNew(SGitWorkspace).Repository(Repo);
-    auto Settle = [&]() { if (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
+    auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
     Settle();
+    TestTrue(TEXT("Content is the default view"), Panel->bContentOnly);
+    int32 DefaultFiles = 0;
+    for (const auto& Row : Panel->Rows) if (Row->Group.IsEmpty())
+    {
+        ++DefaultFiles;
+        TestTrue(TEXT("Default view contains only game content"), Row->File.Path.StartsWith(TEXT("Content/")));
+        Panel->List->SetItemSelection(Row, true);
+    }
+    TestEqual(TEXT("Default view exposes four new real assets"), DefaultFiles, 4);
+    Panel->List->ClearSelection(); Panel->List->SetItemSelection(Panel->Rows[1], true);
+    TestTrue(TEXT("Saved new asset offers Lock without a separate verification step"), Panel->CanLockSelected());
+    TestTrue(TEXT("New asset lock guidance explains no automatic locking or staging"), Panel->LockHint().ToString().Contains(TEXT("does not stage")) && Panel->LockHint().ToString().Contains(TEXT("Automatic locking")));
+    Panel->RebuildRows();
+    TestEqual(TEXT("Refresh preserves the selected asset"), Panel->SelectedIndexPaths(true).Num(), 1);
+    Panel->List->ClearSelection(); Panel->bContentOnly = false; Panel->RebuildRows();
     TestTrue(TEXT("Untracked assets sort before tracked documentation/cache"), Panel->Rows.Num() > 1 && Panel->Rows[1]->File.bUntracked && Panel->Rows[1]->File.Path.StartsWith(TEXT("Content/")));
     for (const auto& Row : Panel->Rows) if (Row->Group.IsEmpty() && Row->File.bSubmodule) Panel->List->SetItemSelection(Row, true);
     TestEqual(TEXT("Submodule-only selection has zero eligible paths"), Panel->SelectedIndexPaths(true).Num(), 0);
@@ -296,6 +311,14 @@ bool FGitWorkspaceSelectionTest::RunTest(const FString&)
     TestTrue(TEXT("Successful partial staging reports skip"), Panel->Feedback.Contains(TEXT("Staged 6")) && Panel->Feedback.Contains(TEXT("Skipped 1")));
     TestEqual(TEXT("Gitlink untouched"), F.Call({TEXT("ls-files"), TEXT("--stage"), TEXT("--"), TEXT("Plugins/Nested")}).Text(), Gitlink);
     TestTrue(TEXT("New actor stages an actual LFS pointer"), F.Call({TEXT("show"), TEXT(":") + F.Paths[0]}).Text().StartsWith(TEXT("version https://git-lfs.github.com/spec/v1")));
+    Panel->bContentOnly = true; Panel->RebuildRows();
+    TestEqual(TEXT("Content filter does not alter the index"), Panel->Snapshot.StagedCount(), 6);
+    TestEqual(TEXT("Outside-content staged files are disclosed"), Panel->HiddenStagedCount(), 2);
+    const FString BeforeHiddenCommit = F.Call({TEXT("rev-parse"), TEXT("HEAD")}).Text();
+    Panel->Commit();
+    TestTrue(TEXT("Hidden staged files require review before commit"), Panel->IsIdle() && Panel->Feedback.Contains(TEXT("hidden by this view")));
+    TestEqual(TEXT("Hidden-file guard preserves HEAD"), F.Call({TEXT("rev-parse"), TEXT("HEAD")}).Text(), BeforeHiddenCommit);
+    Panel->bContentOnly = false; Panel->RebuildRows();
     for (const auto& Row : Panel->Rows) if (Row->bStaged) Panel->List->SetItemSelection(Row, true);
     Panel->ChangeIndex(false); Settle();
     TestEqual(TEXT("Unstage returns new assets to untracked"), Panel->Snapshot.StagedCount(), 0);
@@ -307,6 +330,15 @@ bool FGitWorkspaceSelectionTest::RunTest(const FString&)
     TestEqual(TEXT("Filtered selection excludes hidden rows"), Panel->SelectedIndexPaths(true).Num(), 1);
     Panel->ChangeIndex(true); Settle();
     TestEqual(TEXT("Filtered staging stages only actor"), Panel->Snapshot.StagedCount(), 1);
+    Panel->FileFilter.Empty(); Panel->bContentOnly = true;
+    GitWorkspace::FFile Inside, Outside; Inside.Path = TEXT("Content/Clean.uasset"); Outside.Path = TEXT("Source/Outside.cpp");
+    Panel->Locks.Candidates = {Inside, Outside}; Panel->RebuildRows();
+    bool bInsideVisible = false, bOutsideVisible = false;
+    for (const auto& Row : Panel->Rows) { bInsideVisible |= Row->File.Path == Inside.Path; bOutsideVisible |= Row->File.Path == Outside.Path; }
+    TestTrue(TEXT("Scope applies to clean lock candidates"), bInsideVisible && !bOutsideVisible);
+    Panel->bContentOnly = false; Panel->RebuildRows(); bOutsideVisible = false;
+    for (const auto& Row : Panel->Rows) bOutsideVisible |= Row->File.Path == Outside.Path;
+    TestTrue(TEXT("Whole repo restores outside-content lock candidates"), bOutsideVisible);
     return true;
 }
 #endif

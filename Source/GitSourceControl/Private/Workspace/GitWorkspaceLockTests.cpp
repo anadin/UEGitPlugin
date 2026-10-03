@@ -1,6 +1,7 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #if WITH_DEV_AUTOMATION_TESTS
 #include "GitWorkspaceRepository.h"
+#include "SGitWorkspace.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -9,6 +10,9 @@
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Interfaces/IPluginManager.h"
+#if PLATFORM_MAC
+#include <unistd.h>
+#endif
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitLockParserTest, "GitWorkspace.Locks.StrictOwnership", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitLockParserTest::RunTest(const FString&)
@@ -156,6 +160,191 @@ bool FGitLockLifecycleTest::RunTest(const FString&)
     F.Mode(TEXT("")); S = Repo.VerifyLocks(TEXT("origin"));
     TestTrue(TEXT("Refresh discovers the acquired reservation"), S.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
     TestFalse(TEXT("Unconfirmed acquisition cannot be silently adopted"), Repo.ChangeLock(S, TEXT("asset.uasset"), true, true).Ok());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitLockRestartTest, "GitWorkspace.Locks.RestartAndWorktreeIsolation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitLockRestartTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    {
+        GitWorkspace::FRepository First(F.Git, F.Repo);
+        const auto Result = First.ChangeLock(First.VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), false);
+        if (!TestTrue(TEXT("Acquisition persisted: ") + Result.Error, Result.Ok())) return false;
+    }
+    const FString Journal = FPaths::Combine(F.Repo, TEXT(".git/uegit/lock-acquisitions-v1"));
+    TArray<FString> Records; IFileManager::Get().FindFiles(Records, *FPaths::Combine(Journal, TEXT("*.json")), true, false);
+    TestEqual(TEXT("One complete record survives service destruction"), Records.Num(), 1);
+    TestTrue(TEXT("Records do not dirty the project"), F.Call({TEXT("status"), TEXT("--porcelain")}).Out.IsEmpty());
+
+    const FString SiblingPath = FPaths::Combine(F.Root, TEXT("sibling"));
+    if (!TestTrue(TEXT("Create linked worktree"), F.Call({TEXT("worktree"), TEXT("add"), TEXT("-q"), TEXT("-b"), TEXT("sibling"), SiblingPath, TEXT("HEAD")}).Ok())) return false;
+    GitWorkspace::FRepository Sibling(F.Git, SiblingPath);
+    auto S = Sibling.VerifyLocks(TEXT("origin"));
+    TestTrue(TEXT("Same account sees own lock from sibling"), S.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    TestFalse(TEXT("Sibling cannot adopt the original worktree's record"), Sibling.ChangeLock(S, TEXT("asset.uasset"), true, true).Ok());
+
+    GitWorkspace::FRepository Restarted(F.Git, F.Repo);
+    F.Call({TEXT("checkout"), TEXT("-qb"), TEXT("other-branch")});
+    S = Restarted.VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Different branch cannot release original acquisition"), Restarted.ChangeLock(S, TEXT("asset.uasset"), true, true).Ok());
+    F.Call({TEXT("checkout"), TEXT("-q"), TEXT("main")});
+    F.Call({TEXT("config"), TEXT("user.name"), TEXT("changed identity")});
+    S = Restarted.VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Changed Git configuration cannot adopt old acquisition context"), Restarted.ChangeLock(S, TEXT("asset.uasset"), true, true).Ok());
+    F.Call({TEXT("config"), TEXT("user.name"), TEXT("UEGit lock fixture")});
+    S = Restarted.VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Restart still requires explicit handoff"), Restarted.ChangeLock(S, TEXT("asset.uasset"), true).Ok());
+    F.Write(TEXT("asset.uasset"), TEXT("later working edit\n"));
+    TestFalse(TEXT("Recovered acquisition does not bypass working changes"), Restarted.ChangeLock(S, TEXT("asset.uasset"), true, true).Ok());
+    F.Write(TEXT("asset.uasset"), TEXT("base A\n"));
+    const auto Result = Restarted.ChangeLock(S, TEXT("asset.uasset"), true, true);
+    TestTrue(TEXT("Restarted service releases verified clean published lock: ") + Result.Error, Result.Ok());
+    TestTrue(TEXT("Server confirms release"), Restarted.VerifyLocks(TEXT("origin")).State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Unlocked);
+    Records.Empty(); IFileManager::Get().FindFiles(Records, *FPaths::Combine(Journal, TEXT("*.json")), true, false);
+    TestTrue(TEXT("Confirmed release removes acquisition record"), Records.IsEmpty());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitLockRecordIntegrityTest, "GitWorkspace.Locks.RecordIntegrityAndReplacement", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitLockRecordIntegrityTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Initial acquisition"), Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), false).Ok())) return false;
+    const FString Journal = FPaths::Combine(F.Repo, TEXT(".git/uegit/lock-acquisitions-v1"));
+    TArray<FString> Records; IFileManager::Get().FindFiles(Records, *FPaths::Combine(Journal, TEXT("*.json")), true, false);
+    if (!TestEqual(TEXT("One record"), Records.Num(), 1)) return false;
+    const FString File = FPaths::Combine(Journal, Records[0]); FString Original;
+    if (!TestTrue(TEXT("Readable journal"), FFileHelper::LoadFileToString(Original, *File))) return false;
+    auto Save = [&](const FString& Value) { return FFileHelper::SaveStringToFile(Value, *File, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM); };
+    auto RefusesRelease = [&](const TCHAR* Label)
+    {
+        GitWorkspace::FRepository Reopened(F.Git, F.Repo);
+        TestFalse(Label, Reopened.ChangeLock(Reopened.VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), true, true).Ok());
+        TestTrue(TEXT("Server lock still held"), Reopened.VerifyLocks(TEXT("origin")).State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    };
+    Save(TEXT("{\"version\":1,")); RefusesRelease(TEXT("Truncated record does not authorize unlock"));
+    Save(TEXT("{\"version\":999}")); RefusesRelease(TEXT("Unsupported record version does not authorize unlock"));
+    Save(Original.Replace(*F.Repo, TEXT("/another-checkout"))); RefusesRelease(TEXT("Record copied from another root does not authorize unlock"));
+    Save(FString::ChrN(65537, 'x')); RefusesRelease(TEXT("Oversized record is rejected"));
+    IFileManager::Get().Delete(*File); RefusesRelease(TEXT("Missing record fails closed even in original process"));
+    Save(Original);
+    // Release/reacquire with an external client: same path and same account, but
+    // a new lock ID. The old local record must never authorize its release.
+    if (!TestTrue(TEXT("External release"), F.Call({TEXT("lfs"), TEXT("unlock"), TEXT("--json"), TEXT("asset.uasset")}).Ok())) return false;
+    if (!TestTrue(TEXT("External reacquisition"), F.Call({TEXT("lfs"), TEXT("lock"), TEXT("--json"), TEXT("asset.uasset")}).Ok())) return false;
+    RefusesRelease(TEXT("Replacement server lock is not silently adopted"));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitLockRecordWriteFailureTest, "GitWorkspace.Locks.RecordWriteFailure", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitLockRecordWriteFailureTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    // A regular file obstructs creation of the journal directory, regardless of
+    // the test process's permissions. The server success must not be hidden.
+    F.Write(TEXT(".git/uegit"), TEXT("fixture obstruction"));
+    GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    const auto R = Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), false);
+    TestFalse(TEXT("Journal failure is not reported as complete success"), R.Ok());
+    TestTrue(TEXT("Acquired server lock is explicitly reported"), R.Error.Contains(TEXT("Server lock acquired and verified")));
+    GitWorkspace::FRepository Reopened(F.Git, F.Repo);
+    const auto S = Reopened.VerifyLocks(TEXT("origin"));
+    TestTrue(TEXT("Reservation retained after journal failure"), S.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    TestFalse(TEXT("Unrecorded acquisition cannot unlock after restart"), Reopened.ChangeLock(S, TEXT("asset.uasset"), true, true).Ok());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitNewAssetLockTest, "GitWorkspace.Locks.NewUntrackedAssetThroughPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitNewAssetLockTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Asset = TEXT("Content/Lock [水] Tester.uasset");
+    IFileManager::Get().MakeDirectory(*FPaths::Combine(F.Repo, TEXT("Content")), true);
+    F.Write(Asset, TEXT("saved new asset bytes\n"));
+    const auto IndexBefore = F.Call({TEXT("ls-files"), TEXT("--stage"), TEXT("-z")}).Out;
+    const auto HeadBefore = F.Call({TEXT("rev-parse"), TEXT("HEAD")}).Text();
+    auto Repo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Repo);
+    auto Panel = SNew(SGitWorkspace).Repository(Repo);
+    auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
+    Settle();
+    for (const auto& Row : Panel->Rows) if (Row->Group.IsEmpty() && Row->File.Path == Asset) Panel->List->SetItemSelection(Row, true);
+    if (!TestTrue(TEXT("New saved asset can lock before manual verification"), Panel->CanLockSelected())) return false;
+    Panel->ChangeLock(false); Settle();
+    if (!TestTrue(TEXT("Panel verifies then acquires new asset lock: ") + Panel->Feedback, Panel->Locks.State(Asset, true) == GitWorkspace::ELockState::Ours)) return false;
+    TestTrue(TEXT("Successful lock leaves asset selected"), Panel->Selection && Panel->Selection->File.Path == Asset);
+    TestFalse(TEXT("An owned lock cannot be acquired again"), Panel->CanLockSelected());
+    TestTrue(TEXT("Lock does not stage the new asset"), F.Call({TEXT("ls-files"), TEXT("--stage"), TEXT("-z")}).Out == IndexBefore);
+    TestEqual(TEXT("Lock does not commit"), F.Call({TEXT("rev-parse"), TEXT("HEAD")}).Text(), HeadBefore);
+    FString Bytes; FFileHelper::LoadFileToString(Bytes, *FPaths::Combine(F.Repo, Asset));
+    TestEqual(TEXT("Lock preserves new asset bytes"), Bytes, FString(TEXT("saved new asset bytes\n")));
+    TestFalse(TEXT("Unpublished new asset cannot be unlocked"), Repo->ChangeLock(Panel->Locks, Asset, true, true).Ok());
+
+    F.Write(TEXT(".gitignore"), TEXT("Content/Ignored.uasset\n"));
+    F.Write(TEXT("Content/Ignored.uasset"), TEXT("ignored\n"));
+    auto S = Repo->VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Ignored new path cannot be locked"), Repo->ChangeLock(S, TEXT("Content/Ignored.uasset"), false).Ok());
+    TestFalse(TEXT("Unsaved/missing path cannot be locked"), Repo->ChangeLock(S, TEXT("Content/Missing.uasset"), false).Ok());
+    const FString LinkPath = FPaths::Combine(F.Repo, TEXT("Content/UntrackedLink.uasset"));
+    TestEqual(TEXT("Create untracked symlink fixture"), symlink(TCHAR_TO_UTF8(*FPaths::Combine(F.Repo, Asset)), TCHAR_TO_UTF8(*LinkPath)), 0);
+    S = Repo->VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Untracked symlink cannot reserve a different file"), Repo->ChangeLock(S, TEXT("Content/UntrackedLink.uasset"), false).Ok());
+    // A staged symlink is rejected even though it has effective LFS attributes.
+    F.Call({TEXT("update-index"), TEXT("--add"), TEXT("--cacheinfo"), TEXT("120000"), F.Call({TEXT("rev-parse"), TEXT("HEAD:asset.uasset")}).Text().TrimEnd(), TEXT("Content/Link.uasset")});
+    F.Write(TEXT("Content/Link.uasset"), TEXT("regular working file over indexed symlink\n"));
+    S = Repo->VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Indexed symlink cannot be locked"), Repo->ChangeLock(S, TEXT("Content/Link.uasset"), false).Ok());
+    TestTrue(TEXT("Invalid paths never reached the server"), Repo->VerifyLocks(TEXT("origin")).Locks.Num() == 1);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStartupLockVerificationTest, "GitWorkspace.Locks.VerifyOnWorkspaceOpen", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStartupLockVerificationTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    {
+        GitWorkspace::FRepository Acquirer(F.Git, F.Repo);
+        if (!TestTrue(TEXT("Existing lock acquired before opening workspace"), Acquirer.ChangeLock(Acquirer.VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), false).Ok())) return false;
+    }
+    const auto HeadBefore = F.Call({TEXT("rev-parse"), TEXT("HEAD")}).Text();
+    const auto IndexBefore = F.Call({TEXT("ls-files"), TEXT("--stage"), TEXT("-z")}).Out;
+    FString BytesBefore; FFileHelper::LoadFileToString(BytesBefore, *FPaths::Combine(F.Repo, TEXT("asset.uasset")));
+    auto Requests = [&]() { FString Text; FFileHelper::LoadFileToString(Text, *FPaths::Combine(F.Root, TEXT("requests"))); return Text; };
+    const FString RequestsBefore = Requests();
+    auto MakePanel = [&]() { return SNew(SGitWorkspace).Repository(MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Repo)); };
+    auto Settle = [](const TSharedRef<SGitWorkspace>& Panel) { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
+    auto Panel = MakePanel();
+    Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0);
+    TestTrue(TEXT("Local snapshot is available before network verification completes"), Panel->Snapshot.bValid);
+    TestTrue(TEXT("Startup schedules a visible ownership check"), Panel->bCheckingLocks && !Panel->IsIdle() && Panel->LockStatusText().ToString().Contains(TEXT("Checking locks")));
+    Settle(Panel);
+    TestFalse(TEXT("Checking indicator clears"), Panel->bCheckingLocks);
+    TestTrue(TEXT("Opening discovers existing ownership without a Verify click"), Panel->Locks.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    TestEqual(TEXT("Opening preserves HEAD"), F.Call({TEXT("rev-parse"), TEXT("HEAD")}).Text(), HeadBefore);
+    TestTrue(TEXT("Opening preserves index"), F.Call({TEXT("ls-files"), TEXT("--stage"), TEXT("-z")}).Out == IndexBefore);
+    FString BytesAfter; FFileHelper::LoadFileToString(BytesAfter, *FPaths::Combine(F.Repo, TEXT("asset.uasset")));
+    TestEqual(TEXT("Opening preserves asset bytes"), BytesAfter, BytesBefore);
+    const FString NewRequests = Requests().Mid(RequestsBefore.Len());
+    TestTrue(TEXT("Startup actually queried the server"), NewRequests.Contains(TEXT("/locks/verify")));
+    TestFalse(TEXT("Startup never acquires a lock"), NewRequests.Contains(TEXT("/lfs/locks\"")));
+    TestFalse(TEXT("Startup never releases a lock"), NewRequests.Contains(TEXT("/unlock")));
+
+    F.Mode(TEXT("auth")); auto Failed = MakePanel(); Settle(Failed);
+    TestTrue(TEXT("Failed check leaves usable local status"), Failed->IsIdle() && Failed->Snapshot.bValid && !Failed->bCheckingLocks);
+    TestFalse(TEXT("Failed startup never claims verified ownership"), Failed->Locks.IsFresh());
+    TestTrue(TEXT("Failure explains manual retry"), Failed->LockStatusText().ToString().Contains(TEXT("Use Verify locks to retry")));
+    const FString FailedRequests = Requests();
+    for (int32 I = 0; I < 5; ++I) Failed->Tick(FGeometry(), 600, 60);
+    Failed->Refresh(); Settle(Failed);
+    TestEqual(TEXT("Idle ticks and local Refresh do not retry a failed startup check"), Requests(), FailedRequests);
+    F.Mode(TEXT("")); Failed->VerifyLocks(); Settle(Failed);
+    TestTrue(TEXT("Manual retry recovers after server failure"), Failed->Locks.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
     return true;
 }
 #endif

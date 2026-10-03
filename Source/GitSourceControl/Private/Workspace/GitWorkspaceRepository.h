@@ -119,8 +119,10 @@ private:
     bool LockContext(const FString& Remote, FLockSnapshot& Out);
     bool LockCandidates(FLockSnapshot& Out);
     FResult Lfs(const FString& Remote, const TArray<FString>& Args, const FString& Storage = FString()) const;
-    struct FAcquiredLock { FString Id, Context, Branch; };
-    TMap<FString, FAcquiredLock> AcquiredLocks;
+    bool LockRecordPath(const FLockSnapshot& Context, const FLock& Lock, FString& File, FString& GitDir, FString& Error) const;
+    bool ReadLockRecord(const FLockSnapshot& Context, const FLock& Lock, FString& Error) const;
+    bool WriteLockRecord(const FLockSnapshot& Context, const FLock& Lock, FString& Error) const;
+    bool RemoveLockRecord(const FLockSnapshot& Context, const FLock& Lock, FString& Error) const;
     FResult Git(const TArray<FString>& Args) const;
     FResult ChangeIndex(const TArray<FString>& Paths, bool bStage);
     FString GitBinary;

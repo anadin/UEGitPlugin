@@ -41,6 +41,8 @@ private:
     friend class FGitWorkspaceEditorAssetsTest;
     friend class FGitIncomingPackageReviewTest;
     friend class FGitWorkspaceSelectionTest;
+    friend class FGitNewAssetLockTest;
+    friend class FGitStartupLockVerificationTest;
     bool IsIdle() const { return !Pending.IsValid(); }
     void Start(TFunction<FGitWorkspaceTaskResult()> Work);
     FReply Refresh();
@@ -51,6 +53,11 @@ private:
     FReply VerifyLocks();
     FReply RemoteAction(int32 Action);
     FText PushHint() const;
+    FText LockHint() const;
+    FText LockStatusText() const;
+    bool CanLockSelected() const;
+    bool IsPathVisible(const FString& Path) const;
+    int32 HiddenStagedCount() const;
     FReply ShowIncomingReview();
     FReply ChangeLock(bool bUnlock);
     bool HasDirtyPackages() const;
@@ -70,6 +77,9 @@ private:
     FString Feedback;
     FString DiffText;
     FString FileFilter;
+    bool bContentOnly = true;
+    bool bVerifyLocksOnOpen = true;
+    bool bCheckingLocks = false;
     TWeakPtr<SWindow> IncomingWindow;
 };
 
