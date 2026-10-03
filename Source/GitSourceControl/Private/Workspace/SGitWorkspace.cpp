@@ -85,7 +85,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
             })]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
-        [SNew(STextBlock).Text(Text(TEXT("Changes   ·   Local commits retain locks. Verify locks separately; push/pull and visual asset diffs are not yet available."))).AutoWrapText(true)]
+        [SNew(STextBlock).Text(Text(TEXT("Changes   ·   Commits and pushes retain locks. Fetch before Push/Pull. Asset visual diffs are not yet available."))).AutoWrapText(true)]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
         [
             SNew(SHorizontalBox)
@@ -108,6 +108,23 @@ void SGitWorkspace::Construct(const FArguments& Args)
             if (!Locks.VerifiedAt.GetTicks()) return Text(TEXT("Lock ownership has not been verified. Verify to include clean tracked assets."));
             return Text(Locks.Endpoint + TEXT("  |  ") + (Locks.IsFresh() ? TEXT("Verified at ") : TEXT("Stale — last verified at ")) + Locks.VerifiedAt.ToIso8601());
         })]
+        + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
+        [
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Fetch upstream"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked_Lambda([this] { return RemoteAction(0); })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Push…"))).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Ahead > 0 && Remote.Behind == 0; }).OnClicked_Lambda([this] { return RemoteAction(1); })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 12, 0)
+            [SNew(SButton).Text(Text(TEXT("Pull fast-forward…"))).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Behind > 0 && Remote.Ahead == 0; }).OnClicked_Lambda([this] { return RemoteAction(2); })]
+            + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+            [SNew(STextBlock).AutoWrapText(true).Text_Lambda([this]
+            {
+                if (!Remote.Error.IsEmpty()) return Text(Remote.Error);
+                if (!Remote.IsFresh()) return Text(TEXT("Fetch to review incoming/outgoing commits. Pull currently accepts documentation-only updates."));
+                return Text(Remote.Remote + TEXT(" / ") + Remote.RemoteRef + FString::Printf(TEXT("  |  %d outgoing · %d incoming  |  "), Remote.Ahead, Remote.Behind) + Remote.FetchedAt.ToIso8601());
+            })]
+        ]
         + SVerticalBox::Slot().FillHeight(1)
         [
             SNew(SSplitter)
@@ -177,6 +194,8 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
     {
         FGitWorkspaceTaskResult Result = Pending.Get();
         Pending = TFuture<FGitWorkspaceTaskResult>();
+        if (Result.bRemote) Remote = MoveTemp(Result.Remote);
+        else if (!Result.bDiff && (Remote.Head != Result.Snapshot.Head || Remote.Branch != Result.Snapshot.Branch)) Remote.bValid = false;
         if (Result.bLocks)
         {
             // Retain old ownership only as explicitly stale data for the same context.
@@ -308,11 +327,11 @@ FText SGitWorkspace::Inspector() const
 FReply SGitWorkspace::VerifyLocks()
 {
     if (!IsIdle()) return FReply::Handled();
-    auto Repo = Repository; const FString Remote = LockRemote;
+    auto Repo = Repository; const FString SelectedLockRemote = LockRemote;
     Locks.bVerified = false;
-    Start([Repo, Remote]
+    Start([Repo, SelectedLockRemote]
     {
-        FGitWorkspaceTaskResult R; R.bLocks = true; R.Locks = Repo->VerifyLocks(Remote); R.Snapshot = Repo->Refresh();
+        FGitWorkspaceTaskResult R; R.bLocks = true; R.Locks = Repo->VerifyLocks(SelectedLockRemote); R.Snapshot = Repo->Refresh();
         R.Message = R.Locks.IsFresh() ? TEXT("Server ownership verified. This snapshot expires after 60 seconds; every mutation verifies again.") : R.Locks.Error;
         return R;
     });
@@ -331,6 +350,36 @@ FReply SGitWorkspace::ChangeLock(bool bUnlock)
         const auto Op = Repo->ChangeLock(Reviewed, Path, bUnlock, bUnlock);
         FGitWorkspaceTaskResult R; R.bLocks = true; R.Locks = Repo->VerifyLocks(Reviewed.Remote); R.Snapshot = Repo->Refresh();
         R.Message = Op.Ok() ? (bUnlock ? TEXT("Lock released and server state verified.") : TEXT("Lock acquired and server ownership verified.")) : Op.Error;
+        return R;
+    });
+    return FReply::Handled();
+}
+
+FReply SGitWorkspace::RemoteAction(int32 Action)
+{
+    if (!IsIdle()) return FReply::Handled();
+    if (Action == 2 && HasDirtyPackages()) { Feedback = TEXT("Save dirty editor packages before Pull. No assets are saved or stashed automatically."); return FReply::Handled(); }
+    auto Repo = Repository; const auto Reviewed = Remote;
+    if (Action && !Reviewed.IsFresh()) { Feedback = TEXT("Fetch and review the upstream first."); return FReply::Handled(); }
+    if (Action)
+    {
+        FString Prompt = (Action == 1 ? TEXT("Push reviewed commit ") + Reviewed.Head : TEXT("Fast-forward to reviewed commit ") + Reviewed.RemoteHead)
+            + TEXT("\n") + Reviewed.Remote + TEXT(" / ") + Reviewed.RemoteRef;
+        Prompt += Action == 1 ? TEXT("\n\nOnly committed data is published. Staged, working and unsaved edits are excluded. Locks are retained.")
+            : TEXT("\n\nRequires a clean working tree and documentation-only changes. Asset, code and configuration updates require external integration with the editor closed.");
+        if (FMessageDialog::Open(EAppMsgType::YesNo, Text(Prompt)) != EAppReturnType::Yes) return FReply::Handled();
+    }
+    Remote.bValid = false;
+    Start([Repo, Reviewed, Action]
+    {
+        FGitWorkspaceTaskResult R; R.bRemote = true;
+        if (Action)
+        {
+            const auto Op = Action == 1 ? Repo->Push(Reviewed) : Repo->Pull(Reviewed);
+            R.Message = Op.Ok() ? (Action == 1 ? TEXT("Reviewed commit pushed and verified. Locks retained.") : TEXT("Reviewed documentation update fast-forwarded.")) : Op.Error;
+        }
+        R.Remote = Repo->Fetch(); R.Snapshot = Repo->Refresh();
+        if (!Action) R.Message = R.Remote.IsFresh() ? TEXT("Upstream fetched. Working files and index were not changed.") : R.Remote.Error;
         return R;
     });
     return FReply::Handled();

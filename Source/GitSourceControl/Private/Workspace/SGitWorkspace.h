@@ -18,6 +18,8 @@ struct FGitWorkspaceTaskResult
     GitWorkspace::FSnapshot Snapshot;
     FString Message;
     GitWorkspace::FLockSnapshot Locks;
+    GitWorkspace::FRemoteSnapshot Remote;
+    bool bRemote = false;
     bool bLocks = false;
     bool bDiff = false;
     bool bCommitSucceeded = false;
@@ -43,6 +45,7 @@ private:
     FReply Commit();
     FReply ShowDiff();
     FReply VerifyLocks();
+    FReply RemoteAction(int32 Action);
     FReply ChangeLock(bool bUnlock);
     bool HasDirtyPackages() const;
     FText Inspector() const;
@@ -51,6 +54,7 @@ private:
     TSharedPtr<GitWorkspace::FRepository, ESPMode::ThreadSafe> Repository;
     GitWorkspace::FSnapshot Snapshot;
     GitWorkspace::FLockSnapshot Locks;
+    GitWorkspace::FRemoteSnapshot Remote;
     FString LockRemote = TEXT("origin");
     TFuture<FGitWorkspaceTaskResult> Pending;
     TArray<TSharedPtr<FGitWorkspaceRow>> Rows;

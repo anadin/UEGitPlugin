@@ -74,6 +74,17 @@ struct FLockSnapshot
 // Strictly parse a complete, verified LFS response. Never infer ownership from user.name.
 bool ParseVerifiedLocks(const FString& Json, TMap<FString, FLock>& Locks, FString& Error);
 
+struct FRemoteSnapshot
+{
+    FString Root, Branch, Head, Remote, RemoteRef, RemoteHead, Context, Error;
+    TArray<FString> IncomingPaths;
+    int32 Ahead = 0, Behind = 0;
+    bool bValid = false;
+    FDateTime FetchedAt;
+    double FetchedSeconds = 0;
+    bool IsFresh() const;
+};
+
 class FRepository
 {
 public:
@@ -85,9 +96,15 @@ public:
     FResult Diff(const FString& Path, bool bStaged);
     FLockSnapshot VerifyLocks(const FString& Remote);
     FResult ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed = false);
+    FRemoteSnapshot Fetch();
+    FResult Push(const FRemoteSnapshot& Reviewed);
+    FResult Pull(const FRemoteSnapshot& Reviewed);
     const FString& Directory() const { return RequestedDirectory; }
 private:
     FSnapshot RefreshInternal();
+    bool RemoteContext(FRemoteSnapshot& Out);
+    bool ValidateRemoteReview(const FRemoteSnapshot& Reviewed, FSnapshot& Current, FString& Error);
+    FString FetchRef = TEXT("refs/uegit/fetched/") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
     FLockSnapshot VerifyLocksInternal(const FString& Remote);
     bool LockContext(const FString& Remote, FLockSnapshot& Out);
     bool LockCandidates(FLockSnapshot& Out);
