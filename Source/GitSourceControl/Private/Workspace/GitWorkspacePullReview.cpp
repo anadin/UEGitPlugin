@@ -54,6 +54,29 @@ bool ResolvePackage(const FString& Filename, const TArray<FMountAlias>& Aliases,
     if (BestLength && !bAmbiguous && FPackageName::IsValidLongPackageName(PackageName, true)) return true;
     PackageName.Empty(); return false;
 }
+FIncomingPackage ObservePackage(const FString& Root, const FIncomingChange& Change, const TArray<FMountAlias>& Aliases)
+{
+    FIncomingPackage Item; Item.Path = Change.Path;
+    const FString Filename = FPaths::ConvertRelativePathToFull(FPaths::Combine(Root, Change.Path));
+    Item.bMounted = ResolvePackage(Filename, Aliases, Item.PackageName);
+    Item.bMap = Change.Path.EndsWith(TEXT(".umap"));
+    Item.bExternal = Change.Path.Contains(TEXT("/__ExternalActors__/")) || Change.Path.Contains(TEXT("/__ExternalObjects__/"));
+    if (Item.bMounted)
+    {
+        if (const UPackage* Package = FindPackage(nullptr, *Item.PackageName))
+        {
+            Item.bLoaded = true; Item.bDirty = Package->IsDirty(); Item.bMap |= Package->ContainsMap();
+            const UObject* Asset = Package->FindAssetInPackage();
+            if (Change.Status == 'A') Item.ReloadBlocker = TEXT("An incoming asset already exists in editor memory: ") + Item.PackageName;
+            else if (!Asset || !(Asset->GetClass() == UBlueprint::StaticClass() || Asset->GetClass() == UMaterial::StaticClass() ||
+                Asset->GetClass() == UMaterialInstanceConstant::StaticClass() || Asset->GetClass() == UTexture2D::StaticClass()))
+                Item.ReloadBlocker = TEXT("This loaded asset type requires an editor-close workflow: ") + Item.PackageName;
+        }
+    }
+    if (!Item.bMounted || Item.bMap || Item.bExternal)
+        Item.ReloadBlocker = TEXT("Maps, external packages or unavailable mounts require an editor-close workflow: ") + Change.Path;
+    return Item;
+}
 FString DisplayPath(FString Path)
 {
     // Keep control characters in real Git paths from creating misleading rows.
@@ -63,6 +86,22 @@ FString ChangeName(TCHAR Status)
 {
     switch (Status) { case 'A': return TEXT("Add"); case 'D': return TEXT("Delete"); case 'M': return TEXT("Modify"); case 'T': return TEXT("Type change"); default: return TEXT("Unknown"); }
 }
+}
+FString ReviewPackageChanges(const FString& Root, const TArray<FIncomingChange>& Changes, TArray<FIncomingPackage>& Packages)
+{
+    check(IsInGameThread()); Packages.Empty();
+    if (GEditor && (GEditor->PlayWorld || GEditor->bIsSimulatingInEditor || GEditor->IsPlaySessionRequestQueued())) return TEXT("Stop Play or Simulate first.");
+    TArray<UPackage*> Dirty; FEditorFileUtils::GetDirtyWorldPackages(Dirty); FEditorFileUtils::GetDirtyContentPackages(Dirty);
+    if (!Dirty.IsEmpty()) return TEXT("Save or resolve all unsaved packages first. This operation never saves them automatically.");
+    const auto Aliases = MountAliases();
+    for (const auto& Change : Changes) if (Change.Kind == EPullPathKind::Package)
+    {
+        auto Item = ObservePackage(Root, Change, Aliases);
+        if (Item.bDirty) return TEXT("An affected package has unsaved changes: ") + Item.PackageName;
+        if (!Item.ReloadBlocker.IsEmpty()) return Item.ReloadBlocker;
+        Packages.Add(MoveTemp(Item));
+    }
+    return FString();
 }
 FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local)
 {
@@ -93,26 +132,9 @@ FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local
         case EPullPathKind::Documentation: Detail = TEXT("Documentation; eligible for in-editor integration after preflight checks."); break;
         case EPullPathKind::Package:
         {
-            FIncomingPackage Item; Item.Path = Change.Path;
-            const FString Filename = FPaths::ConvertRelativePathToFull(FPaths::Combine(Remote.Root, Change.Path));
-            Item.bMounted = ResolvePackage(Filename, Aliases, Item.PackageName);
-            Item.bMap = Change.Path.EndsWith(TEXT(".umap"));
-            Item.bExternal = Change.Path.Contains(TEXT("/__ExternalActors__/")) || Change.Path.Contains(TEXT("/__ExternalObjects__/"));
-            if (Item.bMounted)
-            {
-                if (const UPackage* Package = FindPackage(nullptr, *Item.PackageName))
-                {
-                    Item.bLoaded = true; Item.bDirty = Package->IsDirty(); Item.bMap |= Package->ContainsMap();
-                    if (Item.bDirty) DirtyNames.AddUnique(Item.PackageName);
-                    const UObject* Asset = Package->FindAssetInPackage();
-                    if (Change.Status == 'A') PackageBlocker = TEXT("An incoming asset already exists in editor memory: ") + Item.PackageName;
-                    else if (!Asset || !(Asset->GetClass() == UBlueprint::StaticClass() || Asset->GetClass() == UMaterial::StaticClass() ||
-                        Asset->GetClass() == UMaterialInstanceConstant::StaticClass() || Asset->GetClass() == UTexture2D::StaticClass()))
-                        PackageBlocker = TEXT("Use Pull and reopen for this loaded asset type: ") + Item.PackageName;
-                }
-            }
-            if (!Item.bMounted || Item.bMap || Item.bExternal)
-                PackageBlocker = TEXT("Use Pull and reopen for maps, external packages or unavailable mounts: ") + Change.Path;
+            FIncomingPackage Item = ObservePackage(Remote.Root, Change, Aliases);
+            if (Item.bDirty) DirtyNames.AddUnique(Item.PackageName);
+            if (!Item.ReloadBlocker.IsEmpty()) PackageBlocker = Item.ReloadBlocker;
             Detail = Item.bExternal ? TEXT("External actor/object package") : (Item.bMap ? TEXT("Map package") : TEXT("Asset package"));
             Detail += !Item.bMounted ? TEXT("; mount not available in this editor") : (Item.bDirty ? TEXT("; LOADED WITH UNSAVED CHANGES") : (Item.bLoaded ? TEXT("; loaded, saved") : TEXT("; not currently loaded")));
             if (Item.bMounted) Detail += TEXT("; ") + DisplayPath(Item.PackageName);

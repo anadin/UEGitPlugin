@@ -211,6 +211,8 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
     const FLock* Lock = Current.Locks.Find(Path);
     if (bUnlock)
     {
+        const FString DropRecovery = StashDropRecovery();
+        if (!DropRecovery.IsEmpty()) return LockFailure(DropRecovery);
         const FLock* Old = Reviewed.Locks.Find(Path);
         if (!Lock || !Lock->bOurs || !Old || Old->Id != Lock->Id) return LockFailure(TEXT("Lock ownership or identity changed. Nothing unlocked."));
         FString RecordError;
@@ -239,6 +241,8 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
             return LockFailure(TEXT("Repository changed during handoff checks. Nothing unlocked."));
         for (const auto& File : FinalStatus.Files)
             if (File.Path == Path || File.OriginalPath == Path) return LockFailure(TEXT("Asset changed during handoff checks. Keep its lock."));
+        const FString FinalDropRecovery = StashDropRecovery();
+        if (!FinalDropRecovery.IsEmpty()) return LockFailure(FinalDropRecovery);
         const auto FinalStashes = Git({TEXT("stash"), TEXT("list"), TEXT("--format=%H")});
         if (!FinalStashes.Ok() || !FinalStashes.Out.IsEmpty()) return LockFailure(TEXT("Stash state changed during handoff checks. Keep the lock."));
         if (!ReadLockRecord(Current, *Lock, RecordError)) return LockFailure(RecordError);

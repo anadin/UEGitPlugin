@@ -128,6 +128,8 @@ void SGitWorkspace::Construct(const FArguments& Args)
             [SNew(SButton).Text(Text(TEXT("Fetch upstream"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked_Lambda([this] { return RemoteAction(0); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
             [SNew(SButton).Text(Text(TEXT("Review incoming…"))).IsEnabled_Lambda([this] { return IsIdle() && Remote.bValid && Remote.Behind > 0; }).OnClicked(this, &SGitWorkspace::ShowIncomingReview)]
+            + SHorizontalBox::Slot().AutoWidth().Padding(8, 0, 0, 0)
+            [SNew(SButton).Text(Text(TEXT("Stashes…"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked(this, &SGitWorkspace::ShowStashes)]
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
             [SNew(SButton).Text(Text(TEXT("Push…"))).ToolTipText(this, &SGitWorkspace::PushHint).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Ahead > 0 && Remote.Behind == 0; }).OnClicked_Lambda([this] { return RemoteAction(1); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 12, 0)
@@ -212,7 +214,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
     ];
     Refresh();
 }
-SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); }
+SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); }
 void SGitWorkspace::WaitForWork() { if (Pending.IsValid()) { Pending.Wait(); Pending = TFuture<FGitWorkspaceTaskResult>(); } }
 void SGitWorkspace::Start(TFunction<FGitWorkspaceTaskResult()> Work)
 {
@@ -244,6 +246,13 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
         bCheckingLocks = false;
         bDownloadingLfs = false;
         bPreparingRestart = false;
+        if (Result.bStashes) { Stashes = MoveTemp(Result.Stashes); RebuildStashes(); }
+        if (Result.bStashReview)
+        {
+            StashReview = MoveTemp(Result.StashReview);
+            StashInspection = MoveTemp(Result.StashInspection);
+            if (StashReport) StashReport->SetText(StashReportText());
+        }
         if (Result.bRemote) { Remote = MoveTemp(Result.Remote); IncomingLfs = GitWorkspace::FIncomingLfsResult(); }
         else if (!Result.bDiff && (Remote.Head != Result.Snapshot.Head || Remote.Branch != Result.Snapshot.Branch)) Remote.bValid = false;
         if (Result.bIncomingLfs) IncomingLfs = MoveTemp(Result.IncomingLfs);

@@ -108,6 +108,28 @@ struct FIncomingLfsResult
     bool Matches(const FRemoteSnapshot& Remote) const;
 };
 
+struct FStashEntry { FString Oid, Selector, Label; };
+struct FStashList { TArray<FStashEntry> Entries; FString Error, Fingerprint; bool bValid = false; };
+struct FStashReview
+{
+    FSnapshot Local;
+    FString Oid, Base, IndexCommit, WorkingTree, IndexTree, ConfigurationHash, Fingerprint, Error, Text;
+    TArray<FIncomingChange> Changes;
+    double ReviewedSeconds = 0;
+    bool bCreate = false, bRestoreIndex = true, bValid = false;
+    bool IsFresh() const;
+};
+
+// Inspection is independent of whether this checkout can apply the stash.
+struct FStashInspection
+{
+    FStashEntry Entry;
+    FString Root, ListFingerprint, Text, Error, DropBlocker;
+    double ReviewedSeconds = 0;
+    bool bValid = false;
+    bool IsFresh() const;
+};
+
 class FRepository
 {
 public:
@@ -123,19 +145,32 @@ public:
     FResult Push(const FRemoteSnapshot& Reviewed);
     FResult Pull(const FRemoteSnapshot& Reviewed);
     FIncomingLfsResult PrepareIncomingLfs(const FRemoteSnapshot& Reviewed);
+    FStashList ListStashes();
+    FStashInspection InspectStash(const FString& Oid, const FString& Selector = FString());
+    FStashReview ReviewStash(const FString& Oid = FString(), bool bRestoreIndex = true);
 #if PLATFORM_MAC
     FResult PullAfterEditorExit(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease);
     // Requires quiesced package loaders on the game thread. Leaves recovery
     // active until that caller has verified package reload and registry refresh.
     FResult PullForReload(const FRemoteSnapshot& Reviewed, const FIncomingLfsResult& Prepared, const GitWorkspaceSession::FLease& Lease);
     FResult CompleteReloadPull(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease);
+    FResult DropStash(const FStashInspection& Reviewed, const GitWorkspaceSession::FLease& Lease);
+    FResult ExecuteStash(const FStashReview& Reviewed, const FString& Name, const GitWorkspaceSession::FLease& Lease);
+    FResult CompleteStash(const FStashReview& Reviewed, const GitWorkspaceSession::FLease& Lease);
 #endif
     const FString& GitExecutable() const { return GitBinary; }
     const FString& Directory() const { return RequestedDirectory; }
 private:
 #if PLATFORM_MAC
     FResult PullAssets(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bForReload);
+    FResult HydratedGit(const TArray<FString>& Args) const;
 #endif
+    FStashList ListStashesInternal();
+    FStashInspection InspectStashInternal(const FString& Oid, const FString& Selector);
+    FString StashDropRecovery(FString* ReportPath = nullptr) const;
+    FStashReview ReviewStashInternal(const FString& Oid, bool bRestoreIndex);
+    FResult CheckLocalLfs(const FString& Commit) const;
+    FResult VerifyStashResult(const FStashReview& Reviewed);
     FSnapshot RefreshInternal();
     bool RemoteContext(FRemoteSnapshot& Out);
     bool ValidateRemoteReview(const FRemoteSnapshot& Reviewed, FSnapshot& Current, FString& Error);

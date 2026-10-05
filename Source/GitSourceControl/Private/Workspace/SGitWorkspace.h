@@ -9,6 +9,8 @@
 
 class SMultiLineEditableTextBox;
 class SWindow;
+class SVerticalBox;
+class SEditableTextBox;
 struct FGitWorkspaceRow
 {
     GitWorkspace::FFile File;
@@ -23,6 +25,10 @@ struct FGitWorkspaceTaskResult
     GitWorkspace::FRemoteSnapshot Remote;
     GitWorkspace::FIncomingLfsResult IncomingLfs;
     GitWorkspace::FRestartJob Restart;
+    GitWorkspace::FStashList Stashes;
+    GitWorkspace::FStashReview StashReview;
+    GitWorkspace::FStashInspection StashInspection;
+    bool bStashes = false, bStashReview = false;
     bool bRestart = false;
     bool bReload = false;
     bool bIncomingLfs = false;
@@ -50,6 +56,7 @@ private:
     friend class FGitNewAssetLockTest;
     friend class FGitStartupLockVerificationTest;
     friend class FGitIncomingLfsPanelTest;
+    friend class FGitStashPanelTest;
     bool IsIdle() const { return !Pending.IsValid() && RestartFolder.IsEmpty() && !bReloading; }
     void Start(TFunction<FGitWorkspaceTaskResult()> Work);
     FReply Refresh();
@@ -71,6 +78,13 @@ private:
     FReply ReloadPull();
     FString FinishReloadPull();
     FReply CancelRestart();
+    FReply ShowStashes();
+    FReply RefreshStashes();
+    FReply PreviewStash(const FString& Oid, const FString& Selector = FString());
+    FReply DropSelectedStash();
+    FText StashReportText() const;
+    FReply RunStash();
+    void RebuildStashes();
     FText IncomingLfsStatus() const;
     FText IncomingReportText() const;
     FReply ChangeLock(bool bUnlock);
@@ -103,6 +117,14 @@ private:
     bool bDownloadingLfs = false;
     TWeakPtr<SWindow> IncomingWindow;
     TSharedPtr<SMultiLineEditableTextBox> IncomingReport;
+    GitWorkspace::FStashList Stashes;
+    GitWorkspace::FStashReview StashReview;
+    GitWorkspace::FStashInspection StashInspection;
+    TWeakPtr<SWindow> StashWindow;
+    TSharedPtr<SVerticalBox> StashRows;
+    TSharedPtr<SEditableTextBox> StashName;
+    TSharedPtr<SMultiLineEditableTextBox> StashReport;
+    bool bRestoreStashIndex = true;
 };
 
 namespace GitWorkspaceUI

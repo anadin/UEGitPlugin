@@ -510,3 +510,108 @@ bool FGitIncomingLfsPanelTest::RunTest(const FString&)
     return true;
 }
 #endif
+
+#if WITH_DEV_AUTOMATION_TESTS && PLATFORM_MAC
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashAssetReloadTest, "GitWorkspace.Editor.StashAndReloadRealAssets", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashAssetReloadTest::RunTest(const FString&)
+{
+    FEditorAssetFixture F; F.Create(); F.Edit(0);
+    if (!TestTrue(TEXT("Save stash baseline"), F.Save())) return false;
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("stash base")});
+    const auto BaselineMap = F.Bytes(F.Paths[3]);
+    auto SaveAssets = [&](int32 Version)
+    {
+        CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription = FString::Printf(TEXT("Fixture version %d"), Version);
+        CastChecked<UMaterial>(F.Assets[1].Get())->TwoSided = true;
+        CastChecked<UTexture2D>(F.Assets[2].Get())->SRGB = true;
+        bool bOk = true;
+        for (int32 I = 0; I < 3; ++I)
+        {
+            auto* Asset = F.Assets[I].Get(); Asset->MarkPackageDirty();
+            FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+            bOk &= UPackage::SavePackage(Asset->GetPackage(), Asset, *FPaths::Combine(F.Root, F.Paths[I]), Args);
+        }
+        UPackage::WaitForAsyncFileWrites(); return bOk;
+    };
+    if (!TestTrue(TEXT("Save staged assets"), SaveAssets(1))) return false;
+    F.Call({TEXT("add"), TEXT(".")});
+    GitWorkspace::FRepository Repo(F.Git, F.Root);
+    const auto Index = Repo.Refresh().IndexEntries;
+    if (!TestTrue(TEXT("Save separate working Blueprint"), SaveAssets(2))) return false;
+    TArray<TArray<uint8>> WorkingBytes;
+    for (int32 I = 0; I < 3; ++I) WorkingBytes.Add(F.Bytes(F.Paths[I]));
+    F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Stash fixture write lease"), Lease.Acquire(F.Root, true, Error))) return false;
+    const auto Review = Repo.ReviewStash();
+    if (!TestTrue(TEXT("Review real assets: ") + Review.Error, Review.bValid)) return false;
+    F.Assets[0]->MarkPackageDirty();
+    auto Result = GitWorkspace::StashAndReload(Repo, Review, TEXT("Asset iteration"), Lease);
+    TestFalse(TEXT("Unsaved memory blocks stash"), Result.bSuccess);
+    TestFalse(TEXT("No recovery needed for preflight refusal"), Result.bRecoveryRequired);
+    TestTrue(TEXT("Unsaved guard preserves index"), Repo.Refresh().IndexEntries == Index);
+    F.Assets[0]->GetPackage()->SetDirtyFlag(false);
+    const auto Delegate = FCoreUObjectDelegates::OnPackageReloaded.AddLambda([&](EPackageReloadPhase Phase, FPackageReloadedEvent* Event)
+    {
+        if (Phase == EPackageReloadPhase::OnPackageFixup && Event)
+            for (auto& Asset : F.Assets)
+                if (UObject* const* Replacement = Event->GetRepointedObjects().Find(Asset.Get())) Asset.Reset(*Replacement);
+    });
+    ON_SCOPE_EXIT { FCoreUObjectDelegates::OnPackageReloaded.Remove(Delegate); };
+    TWeakObjectPtr<UObject> OldBlueprint = F.Assets[0].Get();
+    Result = GitWorkspace::StashAndReload(Repo, Review, TEXT("Asset iteration"), Lease);
+    if (!TestTrue(TEXT("Create and reload: ") + Result.Message, Result.bSuccess)) return false;
+    TestEqual(TEXT("Three loaded assets reloaded on create"), Result.Reloaded, 3);
+    TestFalse(TEXT("Old loaded Blueprint purged"), OldBlueprint.IsValid());
+    TestEqual(TEXT("Blueprint reverts in memory"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 0")));
+    TestFalse(TEXT("Material reverts in memory"), !!CastChecked<UMaterial>(F.Assets[1].Get())->TwoSided);
+    TestFalse(TEXT("Texture reverts in memory"), !!CastChecked<UTexture2D>(F.Assets[2].Get())->SRGB);
+    TestTrue(TEXT("Clean after create"), Repo.Refresh().Files.IsEmpty());
+    Result = GitWorkspace::StashAndReload(Repo, Repo.ReviewStash(Review.Oid), FString(), Lease);
+    if (!TestTrue(TEXT("Apply and reload: ") + Result.Message, Result.bSuccess)) return false;
+    TestEqual(TEXT("Three loaded assets reloaded on apply"), Result.Reloaded, 3);
+    TestEqual(TEXT("Working Blueprint restored in memory"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 2")));
+    TestTrue(TEXT("Material restored in memory"), !!CastChecked<UMaterial>(F.Assets[1].Get())->TwoSided);
+    TestTrue(TEXT("Texture restored in memory"), !!CastChecked<UTexture2D>(F.Assets[2].Get())->SRGB);
+    for (int32 I = 0; I < 3; ++I) TestTrue(TEXT("Exact hydrated working payload restored"), F.Bytes(F.Paths[I]) == WorkingBytes[I]);
+    TestTrue(TEXT("Staging restored separately"), Repo.Refresh().IndexEntries == Index);
+    TestTrue(TEXT("Map bytes untouched"), F.Bytes(F.Paths[3]) == BaselineMap);
+    TestEqual(TEXT("Stash remains after apply"), Repo.ListStashes().Entries.Num(), 1);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashPanelTest, "GitWorkspace.Editor.StashPreviewThroughPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashPanelTest::RunTest(const FString&)
+{
+    FEditorAssetFixture F;
+    const FString Path = FPaths::Combine(F.Root, TEXT("README.md"));
+    FFileHelper::SaveStringToFile(TEXT("base"), *Path); F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("base")});
+    FFileHelper::SaveStringToFile(TEXT("working"), *Path);
+    auto Repo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Root);
+    auto Panel = SNew(SGitWorkspace).Repository(Repo);
+    auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
+    Settle(); const auto Before = Repo->Refresh();
+    Panel->ShowStashes(); Settle();
+    TestTrue(TEXT("Empty stash list visible"), Panel->Stashes.bValid && Panel->Stashes.Entries.IsEmpty());
+    Panel->PreviewStash(FString()); Settle();
+    TestTrue(TEXT("Panel offers reviewed creation: ") + Panel->Feedback, Panel->StashReview.IsFresh());
+    TestTrue(TEXT("Review labels whole repository scope"), Panel->StashReport->GetText().ToString().Contains(TEXT("WHOLE REPOSITORY")));
+    TestTrue(TEXT("Preview lists exact path"), Panel->StashReport->GetText().ToString().Contains(TEXT("README.md")));
+    TestEqual(TEXT("Preview preserves HEAD"), Repo->Refresh().Head, Before.Head);
+    TestTrue(TEXT("Preview preserves index"), Repo->Refresh().IndexEntries == Before.IndexEntries);
+    TestTrue(TEXT("Preview does not publish a stash"), Repo->ListStashes().Entries.IsEmpty());
+    Panel->RefreshStashes(); Settle();
+    TestFalse(TEXT("Refresh invalidates previous preview"), Panel->StashReview.IsFresh());
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("saved work")});
+    const FString Oid = F.Call({TEXT("rev-parse"), TEXT("refs/stash")}).Text().TrimEnd();
+    FFileHelper::SaveStringToFile(TEXT("new local work"), *Path);
+    Panel->RefreshStashes(); Settle(); Panel->PreviewStash(Oid, TEXT("stash@{0}")); Settle();
+    TestTrue(TEXT("Panel inspects stash with dirty checkout"), Panel->StashInspection.IsFresh());
+    TestFalse(TEXT("Panel Apply remains blocked"), Panel->StashReview.IsFresh());
+    TestTrue(TEXT("Drop available independently"), Panel->StashInspection.DropBlocker.IsEmpty());
+    const FString Report = Panel->StashReport->GetText().ToString();
+    TestTrue(TEXT("Panel explains saved paths and Apply blocker together"), Report.Contains(TEXT("SAVED WORKING CHANGES")) && Report.Contains(TEXT("README.md")) && Report.Contains(TEXT("APPLY BLOCKED")));
+    Panel->RefreshStashes(); Settle();
+    TestFalse(TEXT("List refresh invalidates Drop inspection"), Panel->StashInspection.IsFresh());
+    return true;
+}
+#endif

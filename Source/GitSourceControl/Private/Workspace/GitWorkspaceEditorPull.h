@@ -15,5 +15,6 @@ struct FEditorPullResult
 // files change. A recovery result MUST close the editor without saving.
 FEditorPullResult PullAndReload(FRepository& Repository, const FRemoteSnapshot& Reviewed,
     const FIncomingLfsResult& Prepared, const GitWorkspaceSession::FLease& Lease);
+FEditorPullResult StashAndReload(FRepository& Repository, const FStashReview& Reviewed, const FString& Name, const GitWorkspaceSession::FLease& Lease);
 #endif
 }
