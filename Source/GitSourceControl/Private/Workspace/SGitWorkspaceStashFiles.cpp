@@ -48,7 +48,9 @@ void SGitWorkspace::RebuildStashFiles()
         const auto* File = Snapshot.Files.FindByPredicate([&](const auto& F) { return F.Path == Path; });
         return !File || !CanSelectStashFile(*File);
     });
-    if (Before != StashSelectedPaths.Num() && StashReview.bValid) InvalidateStashSelection();
+    // The checklist belongs to Create. Pruning stale checks must not replace
+    // an Apply review with Create mode while publishing refreshed Git status.
+    if (Before != StashSelectedPaths.Num() && StashReview.bValid && StashReview.bCreate) InvalidateStashSelection();
     StashFileItems.Empty();
     for (const auto& File : Snapshot.Files)
         if ((!bStashContentOnly || File.Path.StartsWith(TEXT("Content/"))) &&

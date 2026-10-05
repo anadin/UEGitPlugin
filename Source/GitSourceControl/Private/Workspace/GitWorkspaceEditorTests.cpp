@@ -674,6 +674,7 @@ bool FGitStashPanelTest::RunTest(const FString&)
     F.Call({TEXT("restore"), TEXT("--"), TEXT("README.md")});
     Panel->RunStashAction(); Settle();
     TestTrue(TEXT("Resolve overlap and review the exact same stash"), Panel->StashReview.IsFresh() && Panel->StashReview.Oid == Oid);
+    TestTrue(TEXT("Pruning old Create checks preserves Apply mode and inspection"), Panel->StashSelectedPaths.IsEmpty() && !Panel->StashReview.bCreate && Panel->StashInspection.IsFresh());
     Panel->StashReview.ReviewedSeconds -= 301; Panel->StashInspection.ReviewedSeconds -= 301;
     TestTrue(TEXT("Expired Apply offers review again"), Panel->CanRunStashAction() && Panel->StashActionText().ToString().Contains(TEXT("Review again")));
     Panel->RunStashAction(); Settle();
