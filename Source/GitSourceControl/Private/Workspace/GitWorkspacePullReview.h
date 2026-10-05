@@ -11,9 +11,9 @@ struct FIncomingPackage
 };
 struct FPullReview
 {
-    FString Text, Blocker;
+    FString Text, Blocker, RestartBlocker, ReloadBlocker;
     TArray<FIncomingPackage> Packages;
-    bool bCanPull = false;
+    bool bCanPull = false, bCanRestart = false, bCanReload = false;
 };
 // Game thread only. Observes package state without loading, saving or unloading.
 FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local);

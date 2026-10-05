@@ -1,6 +1,13 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "SGitWorkspace.h"
 #include "GitWorkspacePullReview.h"
+#include "GitWorkspaceEditorPull.h"
+#include "Misc/ScopedSlowTask.h"
+#if PLATFORM_MAC
+#include "GitWorkspaceSession.h"
+#endif
+#include "Interfaces/IMainFrameModule.h"
+#include "Modules/ModuleManager.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
 #include "HAL/PlatformApplicationMisc.h"
@@ -77,6 +84,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
     Repository = Args._Repository;
     if (!Repository)
         Repository = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(GitWorkspace::FindGitExecutable(FGitSourceControlModule::Get().AccessSettings().GetBinaryPath()), FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
+    RestartMessage = GitWorkspace::LastRestartResult(Repository->Directory());
     ChildSlot
     [
         SNew(SVerticalBox)
@@ -133,7 +141,11 @@ void SGitWorkspace::Construct(const FArguments& Args)
                 return Text(Remote.Remote + TEXT(" / ") + Remote.RemoteRef + FString::Printf(TEXT("  |  %d outgoing · %d incoming  |  "), Remote.Ahead, Remote.Behind) + Remote.FetchedAt.ToIso8601() + TEXT("\n") + PushHint().ToString());
             })]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 10)
-        [SNew(STextBlock).Text_Lambda([this] { return Text(IsIdle() ? Feedback : bCheckingLocks ? TEXT("Checking locks…") : TEXT("Git operation running…")); }).AutoWrapText(true)]
+        [SNew(STextBlock).Text_Lambda([this] { return Text(!RestartFolder.IsEmpty() ? RestartMessage : IsIdle() ? Feedback : bPreparingRestart ? TEXT("Preparing safe restart Pull… The editor will stay open until preparation succeeds.") : bCheckingLocks ? TEXT("Checking locks…") : bDownloadingLfs ? TEXT("Downloading and verifying incoming LFS assets…") : TEXT("Git operation running…")); }).AutoWrapText(true)]
+        + SVerticalBox::Slot().AutoHeight().Padding(10, 0)
+        [SNew(STextBlock).Text_Lambda([this] { return Text(RestartFolder.IsEmpty() ? RestartMessage : FString()); }).AutoWrapText(true)]
+        + SVerticalBox::Slot().AutoHeight().Padding(10, 0)
+        [SNew(SButton).Text(Text(TEXT("Cancel restart Pull"))).Visibility_Lambda([this] { return RestartFolder.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible; }).OnClicked(this, &SGitWorkspace::CancelRestart)]
         + SVerticalBox::Slot().FillHeight(1)
         [
             SNew(SSplitter)
@@ -208,13 +220,45 @@ void SGitWorkspace::Start(TFunction<FGitWorkspaceTaskResult()> Work)
 }
 void SGitWorkspace::Tick(const FGeometry&, double, float)
 {
+    if (!RestartFolder.IsEmpty() && FPlatformTime::Seconds() >= NextRestartPoll)
+    {
+        NextRestartPoll = FPlatformTime::Seconds() + 0.5;
+        FString State; RestartMessage = GitWorkspace::RestartJobStatus(RestartFolder, State);
+        auto Helper = FPlatformProcess::OpenProcess(RestartHelperPid);
+        const bool bRunning = Helper.IsValid() && FPlatformProcess::IsProcRunning(Helper);
+        FPlatformProcess::CloseProc(Helper);
+        if (State == TEXT("failed") || !bRunning)
+        {
+            if (State != TEXT("failed"))
+            {
+                GitWorkspace::CancelRestartPull(RestartFolder);
+                RestartMessage = TEXT("Restart helper stopped while this editor remained open. No integration was permitted. Fetch and review before retrying.");
+            }
+            RestartFolder.Empty(); Feedback = RestartMessage;
+        }
+    }
     if (Pending.IsValid() && Pending.IsReady())
     {
         FGitWorkspaceTaskResult Result = Pending.Get();
         Pending = TFuture<FGitWorkspaceTaskResult>();
         bCheckingLocks = false;
-        if (Result.bRemote) Remote = MoveTemp(Result.Remote);
+        bDownloadingLfs = false;
+        bPreparingRestart = false;
+        if (Result.bRemote) { Remote = MoveTemp(Result.Remote); IncomingLfs = GitWorkspace::FIncomingLfsResult(); }
         else if (!Result.bDiff && (Remote.Head != Result.Snapshot.Head || Remote.Branch != Result.Snapshot.Branch)) Remote.bValid = false;
+        if (Result.bIncomingLfs) IncomingLfs = MoveTemp(Result.IncomingLfs);
+        if (Result.bReload && IncomingLfs.Matches(Remote))
+        {
+            Result.Message = FinishReloadPull();
+            Result.Snapshot = Repository->Refresh();
+            if (Result.Snapshot.Head == Remote.RemoteHead)
+            {
+                RestartMessage = Result.Message;
+                Locks.bVerified = false; bVerifyLocksOnOpen = true;
+            }
+            if (Result.Snapshot.Head != Remote.Head) Remote.bValid = false;
+        }
+        else if (Result.bReload && Result.Message.IsEmpty()) Result.Message = TEXT("The review changed or expired during preparation. Fetch and review again.");
         if (Result.bLocks)
         {
             // Retain old ownership only as explicitly stale data for the same context.
@@ -234,6 +278,25 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
             if (Result.bCommitSucceeded) Message->SetText(FText::GetEmpty());
             RebuildRows();
         }
+        if (Result.bRestart && Result.Restart.bReady)
+        {
+            const auto Review = GitWorkspace::ReviewIncoming(Remote, Snapshot);
+            FString Error;
+            if (!Review.bCanRestart || !GitWorkspace::ApproveRestartClose(Result.Restart.Folder, Error))
+            {
+                GitWorkspace::CancelRestartPull(Result.Restart.Folder);
+                Feedback = Review.bCanRestart ? Error : Review.RestartBlocker;
+            }
+            else
+            {
+                RestartFolder = Result.Restart.Folder;
+                RestartHelperPid = Result.Restart.HelperPid;
+                RestartMessage = TEXT("Waiting for normal editor shutdown. If you cancel shutdown, use Cancel restart Pull; the helper times out after three minutes without changing files.");
+                if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow();
+                FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame")).RequestCloseEditor();
+            }
+        }
+        if (IncomingWindow.IsValid() && IncomingReport) IncomingReport->SetText(IncomingReportText());
         // Publish local status before starting the network query. Opening a tab
         // schedules one read-only check; failure must not cause a retry loop.
         if (bVerifyLocksOnOpen)
@@ -462,22 +525,40 @@ FReply SGitWorkspace::ChangeLock(bool bUnlock)
 FReply SGitWorkspace::ShowIncomingReview()
 {
     if (!IsIdle()) return FReply::Handled();
-    const auto Review = GitWorkspace::ReviewIncoming(Remote, Snapshot);
     if (auto Old = IncomingWindow.Pin()) Old->RequestDestroyWindow();
     const auto Window = SNew(SWindow).Title(Text(TEXT("Review incoming changes"))).ClientSize(FVector2D(840, 640)).SupportsMinimize(false);
     IncomingWindow = Window;
     TWeakPtr<SWindow> WeakWindow = Window;
-    const FString Report = Review.Text;
+    TWeakPtr<SGitWorkspace> WeakThis = SharedThis(this);
     Window->SetContent(SNew(SBorder).Padding(12)
     [
         SNew(SVerticalBox)
         + SVerticalBox::Slot().FillHeight(1)
-        [SNew(SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(Text(Report)).Font(FAppStyle::GetFontStyle("MonoFont"))]
+        [SAssignNew(IncomingReport, SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(IncomingReportText()).Font(FAppStyle::GetFontStyle("MonoFont"))]
         + SVerticalBox::Slot().AutoHeight().Padding(0, 12, 0, 0)
         [
             SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
-            [SNew(SButton).Text(Text(TEXT("Copy review"))).OnClicked_Lambda([Report] { FPlatformApplicationMisc::ClipboardCopy(*Report); return FReply::Handled(); })]
+            [SNew(SButton).Text(Text(TEXT("Copy review"))).OnClicked_Lambda([WeakThis]
+            {
+                if (auto Panel = WeakThis.Pin()) if (Panel->IncomingReport) FPlatformApplicationMisc::ClipboardCopy(*Panel->IncomingReport->GetText().ToString());
+                return FReply::Handled();
+            })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Download LFS assets")))
+                .ToolTipText(Text(TEXT("Download and verify all LFS objects in the fetched commit, including files outside the Content view. Saves objects to the local cache without replacing working files, saving packages or changing locks. Pull still requires its own safety checks.")))
+                .IsEnabled_Lambda([WeakThis] { auto Panel = WeakThis.Pin(); return Panel && Panel->IsIdle() && Panel->Remote.IsFresh() && Panel->Remote.Behind > 0 && Panel->Remote.Ahead == 0; })
+                .OnClicked_Lambda([WeakThis] { if (auto Panel = WeakThis.Pin()) return Panel->DownloadIncomingLfs(); return FReply::Handled(); })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Pull…")))
+                .ToolTipText_Lambda([WeakThis] { auto Panel = WeakThis.Pin(); if (!Panel) return FText::GetEmpty(); const auto Review = GitWorkspace::ReviewIncoming(Panel->Remote, Panel->Snapshot); return Text(Review.bCanReload ? TEXT("Pull and refresh assets while this editor stays open. Locks retained.") : Review.ReloadBlocker); })
+                .IsEnabled_Lambda([WeakThis] { auto Panel = WeakThis.Pin(); return Panel && Panel->IsIdle() && GitWorkspace::ReviewIncoming(Panel->Remote, Panel->Snapshot).bCanReload; })
+                .OnClicked_Lambda([WeakThis] { if (auto Panel = WeakThis.Pin()) return Panel->ReloadPull(); return FReply::Handled(); })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Pull and reopen…")))
+                .ToolTipText_Lambda([WeakThis] { auto Panel = WeakThis.Pin(); if (!Panel) return FText::GetEmpty(); const auto Review = GitWorkspace::ReviewIncoming(Panel->Remote, Panel->Snapshot); return Text(Review.bCanRestart ? TEXT("Verify LFS, close this editor, fast-forward the reviewed assets and reopen. Locks retained.") : Review.RestartBlocker); })
+                .IsEnabled_Lambda([WeakThis] { auto Panel = WeakThis.Pin(); return Panel && Panel->IsIdle() && GitWorkspace::ReviewIncoming(Panel->Remote, Panel->Snapshot).bCanRestart; })
+                .OnClicked_Lambda([WeakThis] { if (auto Panel = WeakThis.Pin()) return Panel->RestartPull(); return FReply::Handled(); })]
             + SHorizontalBox::Slot().AutoWidth()
             [SNew(SButton).Text(Text(TEXT("Close"))).OnClicked_Lambda([WeakWindow] { if (auto W = WeakWindow.Pin()) W->RequestDestroyWindow(); return FReply::Handled(); })]
         ]
@@ -486,12 +567,107 @@ FReply SGitWorkspace::ShowIncomingReview()
     return FReply::Handled();
 }
 
+FText SGitWorkspace::IncomingLfsStatus() const
+{
+    if (bDownloadingLfs) return Text(TEXT("Downloading and verifying incoming LFS assets… Working files remain in place."));
+    if (!IncomingLfs.Error.IsEmpty()) return Text(TEXT("LFS DOWNLOAD / VERIFICATION FAILED\n") + IncomingLfs.Error);
+    if (IncomingLfs.Matches(Remote)) return Text(TEXT("LFS cache verified for commit ") + IncomingLfs.Commit + TEXT(" at ") + IncomingLfs.VerifiedAt.ToIso8601()
+        + TEXT(".\nWorking files have not been updated. Pull repeats safety checks before replacing files. External cache changes can invalidate this result."));
+    return Text(TEXT("LFS cache has not been verified for this review. Download LFS assets checks the complete fetched commit, independent of the Content view. Fetch again if the review has expired."));
+}
+
+FText SGitWorkspace::IncomingReportText() const
+{
+    return Text(TEXT("INCOMING LFS ASSETS\n") + IncomingLfsStatus().ToString() + TEXT("\n\n") + GitWorkspace::ReviewIncoming(Remote, Snapshot).Text);
+}
+
+FReply SGitWorkspace::DownloadIncomingLfs()
+{
+    if (!IsIdle()) return FReply::Handled();
+    if (!Remote.IsFresh() || Remote.Behind <= 0 || Remote.Ahead != 0)
+    { Feedback = TEXT("Fetch and review an incoming fast-forward before downloading LFS assets."); return FReply::Handled(); }
+    IncomingLfs = GitWorkspace::FIncomingLfsResult(); bDownloadingLfs = true;
+    if (IncomingReport) IncomingReport->SetText(IncomingReportText());
+    auto Repo = Repository; const auto Reviewed = Remote;
+    Start([Repo, Reviewed]
+    {
+        FGitWorkspaceTaskResult R; R.bIncomingLfs = true;
+        R.IncomingLfs = Repo->PrepareIncomingLfs(Reviewed); R.Snapshot = Repo->Refresh();
+        R.Message = R.IncomingLfs.bVerified ? TEXT("Incoming LFS cache verified. Working files were not replaced; locks retained. Review incoming for integration requirements.") : R.IncomingLfs.Error;
+        return R;
+    });
+    return FReply::Handled();
+}
+
+FReply SGitWorkspace::RestartPull()
+{
+    if (!IsIdle()) return FReply::Handled();
+    const auto Review = GitWorkspace::ReviewIncoming(Remote, Snapshot);
+    if (!Review.bCanRestart) { Feedback = Review.RestartBlocker; return FReply::Handled(); }
+    const FString Prompt = TEXT("Pull reviewed commit ") + Remote.RemoteHead + TEXT("\n") + Remote.Remote + TEXT(" / ") + Remote.RemoteRef
+        + TEXT("\n\nDownload and verify LFS, close the editor normally, fast-forward these assets/documents, then reopen this project. Locks remain held.\n\nAll packages must be saved and the entire Git working tree clean. No automatic stash or discard. Close other Unreal editors first. If integration fails after files change, the editor stays closed with recovery instructions.");
+    if (FMessageDialog::Open(EAppMsgType::YesNo, Text(Prompt)) != EAppReturnType::Yes) return FReply::Handled();
+    if (HasDirtyPackages()) { Feedback = TEXT("Save or resolve unsaved packages before restart Pull."); return FReply::Handled(); }
+    auto Repo = Repository; const auto Reviewed = Remote; const FString Project = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
+    bPreparingRestart = true;
+    Start([Repo, Reviewed, Project]
+    {
+        FGitWorkspaceTaskResult R; R.bRestart = true; R.Restart = GitWorkspace::StartRestartPull(*Repo, Reviewed, Project);
+        R.Snapshot = Repo->Refresh(); R.Message = R.Restart.Error; return R;
+    });
+    return FReply::Handled();
+}
+FReply SGitWorkspace::ReloadPull()
+{
+    if (!IsIdle()) return FReply::Handled();
+    const auto Review = GitWorkspace::ReviewIncoming(Remote, Snapshot);
+    if (!Review.bCanReload) { Feedback = Review.ReloadBlocker; return ShowIncomingReview(); }
+    const FString Prompt = TEXT("Pull reviewed commit ") + Remote.RemoteHead + TEXT("\n") + Remote.Remote + TEXT(" / ") + Remote.RemoteRef
+        + TEXT("\n\nDownload and verify LFS, then refresh incoming assets while this editor stays open. Loaded assets will reload. Undo history and selection may reset; locks remain held.\n\nAll packages must be saved and the entire working tree clean. Close other Unreal editors first. No automatic save, stash or discard. If files change but hydration or reload fails, this editor will close without saving and show recovery instructions.");
+    if (FMessageDialog::Open(EAppMsgType::YesNo, Text(Prompt)) != EAppReturnType::Yes) return FReply::Handled();
+    const auto Checked = GitWorkspace::ReviewIncoming(Remote, Snapshot);
+    if (!Checked.bCanReload) { Feedback = Checked.ReloadBlocker; return FReply::Handled(); }
+    auto Repo = Repository; const auto Reviewed = Remote;
+    bDownloadingLfs = true;
+    Start([Repo, Reviewed]
+    {
+        FGitWorkspaceTaskResult R; R.bIncomingLfs = true; R.bReload = true;
+        R.IncomingLfs = Repo->PrepareIncomingLfs(Reviewed); R.Snapshot = Repo->Refresh(); R.Message = R.IncomingLfs.Error; return R;
+    });
+    return FReply::Handled();
+}
+FString SGitWorkspace::FinishReloadPull()
+{
+#if PLATFORM_MAC
+    TGuardValue<bool> Busy(bReloading, true);
+    FScopedSlowTask Task(1.f, Text(TEXT("Pulling and refreshing assets…")));
+    Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
+    GitWorkspaceSession::FEditorWriteScope Access; FString Error;
+    if (!Access.Acquire(Remote.Root, Error)) return Error;
+    const auto Result = GitWorkspace::PullAndReload(*Repository, Remote, IncomingLfs, Access.Lease());
+    if (Result.bRecoveryRequired)
+    {
+        FString Root, GitDir; GitWorkspaceSession::FindRepository(Remote.Root, Root, GitDir);
+        GitWorkspaceSession::StopForRecovery(Result.Message + TEXT("\n\nThe editor will close without saving to protect the updated files. Recovery instructions: ") + GitWorkspaceSession::RecoveryFile(GitDir));
+    }
+    return Result.Message;
+#else
+    return TEXT("Asset reload Pull is currently available on Mac only.");
+#endif
+}
+FReply SGitWorkspace::CancelRestart()
+{
+    GitWorkspace::CancelRestartPull(RestartFolder);
+    RestartMessage = TEXT("Cancellation requested. Waiting for the helper to stop; working files remain unchanged while this editor is open.");
+    return FReply::Handled();
+}
+
 FText SGitWorkspace::PushHint() const
 {
     if (!IsIdle()) return Text(TEXT("Push unavailable while a Git operation is running."));
     if (!Remote.IsFresh()) return Text(TEXT("Fetch upstream to enable Push. A new commit or an expired review requires another Fetch."));
     if (Remote.Ahead > 0 && Remote.Behind > 0) return Text(TEXT("Push blocked: branches have diverged. Reconcile incoming changes externally, then Fetch again."));
-    if (Remote.Behind > 0) return Text(TEXT("Push unavailable: incoming commits need review. Pull currently accepts documentation-only updates."));
+    if (Remote.Behind > 0) return Text(TEXT("Push unavailable: incoming commits need review. Use Review incoming to choose a safe Pull option."));
     if (Remote.Ahead == 0) return Text(TEXT("Nothing to push: no outgoing commits."));
     return Text(TEXT("Push is ready for review. LFS upload and lock ownership are checked before publishing; locks are not released."));
 }
@@ -502,6 +678,7 @@ FReply SGitWorkspace::RemoteAction(int32 Action)
     if (Action == 2)
     {
         const auto Review = GitWorkspace::ReviewIncoming(Remote, Snapshot);
+        if (Review.bCanReload) return ReloadPull();
         if (!Review.bCanPull) { Feedback = Review.Blocker; return ShowIncomingReview(); }
     }
     auto Repo = Repository; const auto Reviewed = Remote;

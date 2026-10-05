@@ -15,6 +15,14 @@
 	"Installed": false,
 	"Modules": [
 		{
+			"Name": "GitWorkspaceSession",
+			"Type": "Editor",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [
+				"Mac"
+			]
+		},
+		{
 			"Name": "GitSourceControl",
 			"Type": "UncookedOnly",
 			"LoadingPhase": "Default"

@@ -5,6 +5,11 @@
 #include "Misc/Paths.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
+#include "Editor.h"
+#include "Engine/Blueprint.h"
+#include "Engine/Texture2D.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInstanceConstant.h"
 #if PLATFORM_MAC
 #include <limits.h>
 #include <stdlib.h>
@@ -63,6 +68,9 @@ FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local
 {
     check(IsInGameThread()); FPullReview Review;
     TArray<FString> Blockers, Lines;
+    FString PackageBlocker;
+    if (GEditor && (GEditor->PlayWorld || GEditor->bIsSimulatingInEditor || GEditor->IsPlaySessionRequestQueued()))
+        Blockers.Add(TEXT("Stop Play or Simulate before pulling changes."));
     if (!Remote.IsFresh()) Blockers.Add(TEXT("Fetch again: the remote review is unavailable or expired."));
     if (!Local.bValid || Remote.Root != Local.Root || Remote.Head != Local.Head || Remote.Branch != Local.Branch)
         Blockers.Add(TEXT("Refresh and Fetch again: the repository or branch no longer matches this review."));
@@ -96,12 +104,19 @@ FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local
                 {
                     Item.bLoaded = true; Item.bDirty = Package->IsDirty(); Item.bMap |= Package->ContainsMap();
                     if (Item.bDirty) DirtyNames.AddUnique(Item.PackageName);
+                    const UObject* Asset = Package->FindAssetInPackage();
+                    if (Change.Status == 'A') PackageBlocker = TEXT("An incoming asset already exists in editor memory: ") + Item.PackageName;
+                    else if (!Asset || !(Asset->GetClass() == UBlueprint::StaticClass() || Asset->GetClass() == UMaterial::StaticClass() ||
+                        Asset->GetClass() == UMaterialInstanceConstant::StaticClass() || Asset->GetClass() == UTexture2D::StaticClass()))
+                        PackageBlocker = TEXT("Use Pull and reopen for this loaded asset type: ") + Item.PackageName;
                 }
             }
+            if (!Item.bMounted || Item.bMap || Item.bExternal)
+                PackageBlocker = TEXT("Use Pull and reopen for maps, external packages or unavailable mounts: ") + Change.Path;
             Detail = Item.bExternal ? TEXT("External actor/object package") : (Item.bMap ? TEXT("Map package") : TEXT("Asset package"));
             Detail += !Item.bMounted ? TEXT("; mount not available in this editor") : (Item.bDirty ? TEXT("; LOADED WITH UNSAVED CHANGES") : (Item.bLoaded ? TEXT("; loaded, saved") : TEXT("; not currently loaded")));
             if (Item.bMounted) Detail += TEXT("; ") + DisplayPath(Item.PackageName);
-            Detail += TEXT(". Close the editor before integrating; package reload is not yet coordinated.");
+            Detail += TEXT(". Pull refreshes eligible assets; Pull and reopen is the fallback.");
             Review.Packages.Add(MoveTemp(Item)); bNeedsHandoff = true;
             break;
         }
@@ -113,7 +128,12 @@ FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local
         Lines.Add(ChangeName(Change.Status) + TEXT("  ") + DisplayPath(Change.Path) + TEXT("\n    ") + Detail);
     }
     if (DirtyNames.Num()) Blockers.Insert(TEXT("Unsaved editor packages must be saved or deliberately resolved before Pull. Review does not save them."), 0);
-    if (bNeedsHandoff) Blockers.Add(TEXT("Incoming files require an editor-close handoff. Automatic asset reload/restart is not enabled."));
+    Review.RestartBlocker = Blockers.Num() ? Blockers[0] : RestartPullPathBlocker(Remote);
+    Review.bCanRestart = Review.RestartBlocker.IsEmpty();
+    Review.ReloadBlocker = Blockers.Num() ? Blockers[0] : EditorPullPathBlocker(Remote);
+    if (Review.ReloadBlocker.IsEmpty()) Review.ReloadBlocker = PackageBlocker;
+    Review.bCanReload = Review.ReloadBlocker.IsEmpty() && !Review.Packages.IsEmpty();
+    if (bNeedsHandoff) Blockers.Add(Review.bCanRestart ? TEXT("Use Pull and reopen to integrate these assets with the editor closed.") : TEXT("Incoming files require an editor-close handoff. ") + Review.RestartBlocker);
     Review.bCanPull = Blockers.IsEmpty();
     Review.Blocker = Blockers.Num() ? Blockers[0] : FString();
     Review.Text = TEXT("INCOMING CHANGE REVIEW\n\nRepository: ") + DisplayPath(Remote.Root) + TEXT("\nBranch: ") + DisplayPath(Remote.Branch)
@@ -123,7 +143,8 @@ FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local
         + FString::Printf(TEXT("\n%d outgoing, %d incoming commits; %d changed paths.\n"), Remote.Ahead, Remote.Behind, Remote.IncomingChanges.Num());
     Review.Text += TEXT("\nThis is a snapshot. Reopen the review after editing, saving, changing loaded packages or refreshing Git. Pull repeats repository checks.\n");
     if (Remote.Ahead && Remote.Behind) Review.Text += TEXT("\nThe path list is a comparison of the two tips, not a predicted merge result.\n");
-    Review.Text += Review.bCanPull ? TEXT("\nDocumentation update is eligible for fast-forward Pull after confirmation.\n") : TEXT("\nPULL BLOCKED\n") + FString::Join(Blockers, TEXT("\n")) + TEXT("\n");
+    Review.Text += Review.bCanReload ? TEXT("\nPULL AVAILABLE\nPull can update these assets while the editor stays open. Loaded Blueprints, materials and textures will reload; other unloaded assets will be refreshed in the Content Browser. Undo history and selection may reset. Locks remain held.\n") :
+        Review.bCanPull ? TEXT("\nDocumentation update is eligible for fast-forward Pull after confirmation.\n") : TEXT("\nPULL BLOCKED\n") + Review.ReloadBlocker + TEXT("\n");
     DirtyNames.Sort();
     if (DirtyNames.Num())
     {
@@ -131,7 +152,8 @@ FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local
         for (const auto& Name : DirtyNames) Review.Text += DisplayPath(Name) + TEXT("\n");
     }
     Review.Text += TEXT("\nAFFECTED FILES (renames appear as delete + add)\n") + (Lines.Num() ? FString::Join(Lines, TEXT("\n\n")) : TEXT("No tree changes."));
-    if (bNeedsHandoff) Review.Text += TEXT("\n\nEDITOR-CLOSE HANDOFF\n1. Save or resolve unsaved packages, then preserve local Git changes explicitly.\n2. Close this project's editor instances.\n3. In an external Git client, fetch and review the upstream again; this snapshot may have expired.\n4. Integrate with fast-forward only. If diverged, stop and choose a reconciliation policy.\n5. Confirm LFS objects are hydrated before reopening. Rebuild first if source or plugins changed.\n6. Reopen the project and Refresh Git Workspace. Locks remain held until an explicit handoff/unlock.\n\nThis review does not execute the handoff, close the editor or replace package files.");
+    if (Review.bCanRestart && bNeedsHandoff) Review.Text += TEXT("\n\nPULL AND REOPEN AVAILABLE\nThe helper verifies LFS, waits for normal editor shutdown, repeats the review checks, fast-forwards to this exact commit and verifies working asset bytes before reopening. Locks remain held. No automatic save, stash or discard. Requires a single Unreal editor on this Mac.\n");
+    else if (bNeedsHandoff) Review.Text += TEXT("\n\nEDITOR-CLOSE HANDOFF\n1. Save or resolve unsaved packages, then preserve local Git changes explicitly.\n2. Close this project's editor instances.\n3. In an external Git client, fetch and review the upstream again; this snapshot may have expired.\n4. Integrate with fast-forward only. If diverged, stop and choose a reconciliation policy.\n5. Confirm LFS objects are hydrated before reopening. Rebuild first if source or plugins changed.\n6. Reopen the project and Refresh Git Workspace. Locks remain held until an explicit handoff/unlock.\n\nThis review does not execute the handoff, close the editor or replace package files.");
     return Review;
 }
 }

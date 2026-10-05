@@ -3,6 +3,7 @@
 
 #include "CoreMinimal.h"
 #include "HAL/CriticalSection.h"
+namespace GitWorkspaceSession { class FLease; }
 
 namespace GitWorkspace
 {
@@ -94,6 +95,18 @@ struct FRemoteSnapshot
     double FetchedSeconds = 0;
     bool IsFresh() const;
 };
+FString RestartPullPathBlocker(const FRemoteSnapshot& Reviewed);
+FString EditorPullPathBlocker(const FRemoteSnapshot& Reviewed);
+
+// Historical cache verification for one reviewed commit, not permission to
+// replace packages or a guarantee against later external cache changes.
+struct FIncomingLfsResult
+{
+    FString Root, Head, Commit, Context, Error;
+    FDateTime VerifiedAt;
+    bool bVerified = false;
+    bool Matches(const FRemoteSnapshot& Remote) const;
+};
 
 class FRepository
 {
@@ -109,8 +122,20 @@ public:
     FRemoteSnapshot Fetch();
     FResult Push(const FRemoteSnapshot& Reviewed);
     FResult Pull(const FRemoteSnapshot& Reviewed);
+    FIncomingLfsResult PrepareIncomingLfs(const FRemoteSnapshot& Reviewed);
+#if PLATFORM_MAC
+    FResult PullAfterEditorExit(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease);
+    // Requires quiesced package loaders on the game thread. Leaves recovery
+    // active until that caller has verified package reload and registry refresh.
+    FResult PullForReload(const FRemoteSnapshot& Reviewed, const FIncomingLfsResult& Prepared, const GitWorkspaceSession::FLease& Lease);
+    FResult CompleteReloadPull(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease);
+#endif
+    const FString& GitExecutable() const { return GitBinary; }
     const FString& Directory() const { return RequestedDirectory; }
 private:
+#if PLATFORM_MAC
+    FResult PullAssets(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bForReload);
+#endif
     FSnapshot RefreshInternal();
     bool RemoteContext(FRemoteSnapshot& Out);
     bool ValidateRemoteReview(const FRemoteSnapshot& Reviewed, FSnapshot& Current, FString& Error);
@@ -124,6 +149,7 @@ private:
     bool WriteLockRecord(const FLockSnapshot& Context, const FLock& Lock, FString& Error) const;
     bool RemoveLockRecord(const FLockSnapshot& Context, const FLock& Lock, FString& Error) const;
     FResult Git(const TArray<FString>& Args) const;
+    FResult VerifyWorkingLfs(const FString& Commit) const;
     FResult ChangeIndex(const TArray<FString>& Paths, bool bStage);
     FString GitBinary;
     FString RequestedDirectory;

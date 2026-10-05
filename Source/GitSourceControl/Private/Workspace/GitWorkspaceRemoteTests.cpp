@@ -8,6 +8,7 @@
 #include "HAL/PlatformProcess.h"
 #if PLATFORM_MAC
 #include <sys/stat.h>
+#include "GitWorkspaceSession.h"
 #endif
 namespace
 {
@@ -39,12 +40,20 @@ struct FRemoteFixture
     }
     void Write(const FString& Dir, const FString& Path, const FString& Text)
     {
-        const FString Full = FPaths::Combine(Dir, Path); IFileManager::Get().MakeDirectory(*FPaths::GetPath(Full), true);
+        const FString Full = FPaths::IsRelative(Path) ? FPaths::Combine(Dir, Path) : Path; IFileManager::Get().MakeDirectory(*FPaths::GetPath(Full), true);
         FFileHelper::SaveStringToFile(Text, *Full, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
     }
-    FString Read(const FString& Dir, const FString& Path) { FString S; FFileHelper::LoadFileToString(S, *FPaths::Combine(Dir, Path)); return S; }
+    FString Read(const FString& Dir, const FString& Path) { FString S; FFileHelper::LoadFileToString(S, *(FPaths::IsRelative(Path) ? FPaths::Combine(Dir, Path) : Path)); return S; }
     void Commit(const FString& Dir) { At(Dir, {TEXT("add"), TEXT("-A")}); At(Dir, {TEXT("commit"), TEXT("-qm"), TEXT("fixture update")}); }
     FString Tip() { return At(Remote, {TEXT("rev-parse"), TEXT("refs/heads/main")}).Text().TrimEnd(); }
+    FString Oid(const FString& Dir, const FString& Path)
+    {
+        const FString Pointer = At(Dir, {TEXT("show"), TEXT("HEAD:") + Path}).Text();
+        const int32 Start = Pointer.Find(TEXT("oid sha256:"));
+        return Start == INDEX_NONE ? FString() : Pointer.Mid(Start + 11, 64);
+    }
+    FString Object(const FString& Dir, const FString& Oid)
+    { return FPaths::Combine(Dir, TEXT(".git/lfs/objects"), Oid.Left(2), Oid.Mid(2, 2), Oid); }
 };
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRemoteFetchPullTest, "GitWorkspace.Remote.FetchAndGuardedPull", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -213,4 +222,240 @@ bool FGitIncomingTreeTest::RunTest(const FString&)
     TestFalse(TEXT("Truncated raw diff rejected"), GitWorkspace::ParseIncomingChanges(Raw.Out, Parsed, Error));
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitIncomingLfsPreservationTest, "GitWorkspace.Remote.IncomingLfsPreservesLocalWork", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitIncomingLfsPreservationTest::RunTest(const FString&)
+{
+    FRemoteFixture F; GitWorkspace::FRepository Repo(F.Git, F.A);
+    F.Write(F.B, TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text\n"));
+    F.Write(F.B, TEXT("Content/Probe.uasset"), TEXT("previous object\n")); F.Commit(F.B);
+    const FString OldOid = F.Oid(F.B, TEXT("Content/Probe.uasset"));
+    const FString OddPath = TEXT("Art/Texture [one]\n雪.uasset");
+    F.Write(F.B, TEXT("Content/Probe.uasset"), TEXT("incoming object\n"));
+    F.Write(F.B, OddPath, TEXT("outside Content\n")); F.Commit(F.B);
+    if (!TestTrue(TEXT("Publish fixture LFS objects"), F.At(F.B, {TEXT("lfs"), TEXT("push"), TEXT("origin"), TEXT("main")}).Ok()) ||
+        !TestTrue(TEXT("Publish fixture commit"), F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")}).Ok())) return false;
+    const FString Oid = F.Oid(F.B, TEXT("Content/Probe.uasset")), OutsideOid = F.Oid(F.B, OddPath);
+    F.At(F.A, {TEXT("config"), TEXT("lfs.fetchinclude"), TEXT("Nothing/**")});
+    F.At(F.A, {TEXT("config"), TEXT("lfs.fetchexclude"), TEXT("*")});
+    F.At(F.A, {TEXT("config"), TEXT("lfs.fetchrecentalways"), TEXT("true")});
+    F.At(F.A, {TEXT("config"), TEXT("lfs.fetchrecentcommitsdays"), TEXT("7")});
+    F.Write(F.A, TEXT("README.md"), TEXT("staged local A\n")); Repo.Stage({TEXT("README.md")});
+    F.Write(F.A, TEXT("README.md"), TEXT("working local B\n"));
+    F.Write(F.A, TEXT("Content/Probe.uasset"), TEXT("untracked local asset\n"));
+    F.Write(F.A, TEXT(".git/test-hooks/pre-push"), TEXT("user hook sentinel\n"));
+    const auto Review = Repo.Fetch(); const auto Before = Repo.Refresh();
+    TArray<uint8> IndexBefore, IndexAfter;
+    FFileHelper::LoadFileToArray(IndexBefore, *FPaths::Combine(F.A, TEXT(".git/index")));
+    const auto RefsBefore = F.At(F.A, {TEXT("show-ref")}).Out;
+    const auto Result = Repo.PrepareIncomingLfs(Review);
+    if (!TestTrue(TEXT("Incoming objects downloaded and verified: ") + Result.Error, Result.Matches(Review))) return false;
+    TestEqual(TEXT("Content object cached"), F.Read(F.A, F.Object(F.A, Oid)), FString(TEXT("incoming object\n")));
+    TestEqual(TEXT("Outside-content literal path object cached"), F.Read(F.A, F.Object(F.A, OutsideOid)), FString(TEXT("outside Content\n")));
+    TestFalse(TEXT("Recent history not implicitly downloaded"), IFileManager::Get().FileExists(*F.Object(F.A, OldOid)));
+    TestEqual(TEXT("HEAD preserved"), Repo.Refresh().Head, Before.Head);
+    TestTrue(TEXT("Staged snapshot preserved"), Repo.Refresh().IndexEntries == Before.IndexEntries);
+    FFileHelper::LoadFileToArray(IndexAfter, *FPaths::Combine(F.A, TEXT(".git/index")));
+    TestTrue(TEXT("Index bytes preserved"), IndexBefore == IndexAfter);
+    TestTrue(TEXT("Refs preserved"), F.At(F.A, {TEXT("show-ref")}).Out == RefsBefore);
+    TestEqual(TEXT("Working edit preserved"), F.Read(F.A, TEXT("README.md")), FString(TEXT("working local B\n")));
+    TestEqual(TEXT("Untracked collision preserved"), F.Read(F.A, TEXT("Content/Probe.uasset")), FString(TEXT("untracked local asset\n")));
+    TestFalse(TEXT("Other incoming working file not created"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, OddPath)));
+    TestEqual(TEXT("Existing hook preserved"), F.Read(F.A, TEXT(".git/test-hooks/pre-push")), FString(TEXT("user hook sentinel\n")));
+    TestFalse(TEXT("LFS checker did not install checkout hook"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, TEXT(".git/test-hooks/post-checkout"))));
+    TestEqual(TEXT("Fetch exclusions not persisted"), F.At(F.A, {TEXT("config"), TEXT("lfs.fetchexclude")}).Text().TrimEnd(), FString(TEXT("*")));
+    auto Stale = Review; Stale.FetchedSeconds -= 301;
+    TestFalse(TEXT("Verification not current after review expires"), Result.Matches(Stale));
+    auto Changed = Review; Changed.RemoteHead = Before.Head;
+    TestFalse(TEXT("Verification cannot certify another commit"), Result.Matches(Changed));
+    TestFalse(TEXT("Verified downloads do not bypass asset Pull guard"), Repo.Pull(Review).Ok());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitIncomingLfsFailureTest, "GitWorkspace.Remote.IncomingLfsFailuresAndRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitIncomingLfsFailureTest::RunTest(const FString&)
+{
+    FRemoteFixture F; GitWorkspace::FRepository Repo(F.Git, F.A);
+    F.Write(F.B, TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text\n"));
+    const FString Payload = TEXT("valid incoming payload\n");
+    F.Write(F.B, TEXT("Probe.uasset"), Payload); F.Commit(F.B);
+    // The clean filter may install hooks during fixture staging. Explicitly
+    // bypass only this disposable publisher's hooks to leave the object missing.
+    if (!TestTrue(TEXT("Publish fixture pointer without LFS hook"), F.At(F.B, {TEXT("-c"), TEXT("core.hooksPath=.git/missing-fixture-hooks"), TEXT("push"), TEXT("origin"), TEXT("main")}).Ok())) return false;
+    const FString Oid = F.Oid(F.B, TEXT("Probe.uasset")); const auto Review = Repo.Fetch();
+    const auto Before = Repo.Refresh();
+    auto Result = Repo.PrepareIncomingLfs(Review);
+    TestFalse(TEXT("Missing remote object cannot be verified"), Result.bVerified);
+    TestTrue(TEXT("Download failure visible"), Result.Error.Contains(TEXT("download did not complete")));
+    TestEqual(TEXT("Failed download preserves HEAD"), Repo.Refresh().Head, Before.Head);
+    TestFalse(TEXT("Failed download creates no working asset"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, TEXT("Probe.uasset"))));
+    if (!TestTrue(TEXT("Repair fixture remote object"), F.At(F.B, {TEXT("lfs"), TEXT("push"), TEXT("--all"), TEXT("origin"), TEXT("main")}).Ok())) return false;
+    Result = Repo.PrepareIncomingLfs(Review);
+    if (!TestTrue(TEXT("Explicit retry recovers after remote repair: ") + Result.Error, Result.bVerified)) return false;
+    const FString Object = F.Object(F.A, Oid), Corrupt = FString::ChrN(Payload.Len(), 'x');
+    F.Write(F.A, Object, Corrupt);
+    Result = Repo.PrepareIncomingLfs(Review);
+    TestFalse(TEXT("Same-size cached corruption fails hash verification"), Result.bVerified);
+    TestTrue(TEXT("Integrity failure visible"), Result.Error.Contains(TEXT("integrity verification")));
+    TestEqual(TEXT("Dry-run verification preserves corrupt object for review"), F.Read(F.A, Object), Corrupt);
+    TestFalse(TEXT("No quarantine mutation"), IFileManager::Get().DirectoryExists(*FPaths::Combine(F.A, TEXT(".git/lfs/bad"))));
+    F.Write(F.A, Object, Payload);
+    TestTrue(TEXT("Explicit retry recovers after cache repair"), Repo.PrepareIncomingLfs(Review).bVerified);
+    // Insert a raw blob without the clean filter, simulating a malformed publisher.
+    F.Write(F.B, TEXT(".git/not-a-pointer"), TEXT("broken LFS pointer fixture\n"));
+    const auto Blob = F.At(F.B, {TEXT("hash-object"), TEXT("-w"), TEXT(".git/not-a-pointer")});
+    TestTrue(TEXT("Stage malformed fixture blob"), F.At(F.B, {TEXT("update-index"), TEXT("--add"), TEXT("--cacheinfo"), TEXT("100644"), Blob.Text().TrimEnd(), TEXT("Broken.uasset")}).Ok());
+    TestTrue(TEXT("Commit malformed fixture pointer"), F.At(F.B, {TEXT("commit"), TEXT("-qm"), TEXT("broken pointer fixture")}).Ok());
+    TestTrue(TEXT("Publish malformed fixture pointer"), F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")}).Ok());
+    Result = Repo.PrepareIncomingLfs(Repo.Fetch());
+    TestFalse(TEXT("Raw blob under LFS attributes is not accepted"), Result.bVerified);
+    TestTrue(TEXT("Pointer error names the problem"), Result.Error.Contains(TEXT("pointers failed verification")) && Result.Error.Contains(TEXT("Broken.uasset")));
+    TestEqual(TEXT("All failed checks preserve HEAD"), Repo.Refresh().Head, Before.Head);
+    TestTrue(TEXT("All failed checks preserve index"), Repo.Refresh().IndexEntries == Before.IndexEntries);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitIncomingLfsGuardsTest, "GitWorkspace.Remote.IncomingLfsReviewGuards", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitIncomingLfsGuardsTest::RunTest(const FString&)
+{
+    FRemoteFixture F; GitWorkspace::FRepository Repo(F.Git, F.A);
+    TestFalse(TEXT("No incoming commit is not a download review"), Repo.PrepareIncomingLfs(Repo.Fetch()).bVerified);
+    F.Write(F.B, TEXT("README.md"), TEXT("incoming\n")); F.Commit(F.B); F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")});
+    auto Review = Repo.Fetch(), Stale = Review; Stale.FetchedSeconds -= 301;
+    TestFalse(TEXT("Expired review rejected before download"), Repo.PrepareIncomingLfs(Stale).bVerified);
+    F.At(F.A, {TEXT("config"), TEXT("uegit.fixture"), TEXT("changed")});
+    TestTrue(TEXT("Changed configuration invalidates review"), Repo.PrepareIncomingLfs(Review).Error.Contains(TEXT("configuration changed")));
+    Review = Repo.Fetch();
+    F.Write(F.B, TEXT("README.md"), TEXT("remote moved\n")); F.Commit(F.B); F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")});
+    TestTrue(TEXT("Changed remote invalidates review"), Repo.PrepareIncomingLfs(Review).Error.Contains(TEXT("Remote branch changed")));
+    Review = Repo.Fetch(); F.Write(F.A, TEXT(".lfsconfig"), TEXT("[lfs]\nfetchinclude = Content/**\n"));
+    TestTrue(TEXT("Untracked LFS config rejected"), Repo.PrepareIncomingLfs(Review).Error.Contains(TEXT("Commit or restore .lfsconfig")));
+    IFileManager::Get().Delete(*FPaths::Combine(F.A, TEXT(".lfsconfig")));
+    F.Write(F.B, TEXT(".lfsconfig"), TEXT("[lfs]\nfetchinclude = Content/**\n")); F.Commit(F.B); F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")});
+    TestTrue(TEXT("Incoming endpoint config requires explicit external review"), Repo.PrepareIncomingLfs(Repo.Fetch()).Error.Contains(TEXT("Incoming .lfsconfig changes")));
+    return true;
+}
+
+#if PLATFORM_MAC
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRestartLeaseTest, "GitWorkspace.Restart.CheckoutLease", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitRestartLeaseTest::RunTest(const FString&)
+{
+    FRemoteFixture F; FString Error;
+    GitWorkspaceSession::FLease Editor, OtherEditor, Helper;
+    TestTrue(TEXT("Editor holds shared checkout lease"), Editor.Acquire(F.A, false, Error));
+    TestTrue(TEXT("A second editor can share an idle checkout"), OtherEditor.Acquire(F.A, false, Error));
+    TestFalse(TEXT("Pull cannot acquire a checkout while editors hold it"), Helper.Acquire(F.A, true, Error));
+    TestFalse(TEXT("Promotion refused while another editor is open"), Editor.Promote(Error));
+    OtherEditor.Release();
+    TestFalse(TEXT("Failed promotion retained the original shared lease"), Helper.Acquire(F.A, true, Error));
+    TestTrue(TEXT("Sole editor can promote without losing coordination"), Editor.Promote(Error));
+    TestTrue(TEXT("Promoted editor owns exclusive checkout"), Editor.IsExclusiveFor(F.A));
+    TestFalse(TEXT("Promoted editor blocks another startup"), OtherEditor.Acquire(F.A, false, Error));
+    Editor.Demote();
+    TestTrue(TEXT("Shared access restored after in-editor Pull"), OtherEditor.Acquire(F.A, false, Error));
+    Editor.Release();
+    TestFalse(TEXT("Closing only one editor is insufficient"), Helper.Acquire(F.A, true, Error));
+    OtherEditor.Release();
+    TestTrue(TEXT("Closed checkout can be acquired exclusively"), Helper.Acquire(F.A, true, Error));
+    TestTrue(TEXT("Canonical checkout identity matches"), Helper.IsExclusiveFor(F.A));
+    TestFalse(TEXT("A lease never authorizes a different checkout"), Helper.IsExclusiveFor(F.B));
+    TestFalse(TEXT("New editor blocked while integration owns checkout"), Editor.Acquire(F.A, false, Error));
+    Helper.Release(); TestTrue(TEXT("Editor can reopen after integration releases checkout"), Editor.Acquire(F.A, false, Error));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRestartHydrationTest, "GitWorkspace.Restart.VerifiedHydration", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitRestartHydrationTest::RunTest(const FString&)
+{
+    FRemoteFixture F;
+    F.Write(F.A, TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text\n")); F.Commit(F.A);
+    TestTrue(TEXT("Publish base attributes"), F.At(F.A, {TEXT("push"), TEXT("origin"), TEXT("main")}).Ok());
+    TestTrue(TEXT("Publisher receives attributes"), F.At(F.B, {TEXT("pull"), TEXT("--ff-only")}).Ok());
+    const FString Payload = TEXT("hydrated incoming bytes, not an LFS pointer\n");
+    F.Write(F.B, TEXT("Content/Probe.uasset"), Payload); F.Commit(F.B);
+    TestTrue(TEXT("Upload incoming objects"), F.At(F.B, {TEXT("lfs"), TEXT("push"), TEXT("origin"), TEXT("main")}).Ok());
+    TestTrue(TEXT("Publish incoming commit"), F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")}).Ok());
+    F.At(F.A, {TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
+    F.Write(F.A, TEXT(".git/uegit/locks/fixture.json"), TEXT("retained lock receipt\n"));
+    GitWorkspace::FRepository Repo(F.Git, F.A); const auto Review = Repo.Fetch();
+    GitWorkspaceSession::FLease Lease; FString Error;
+    TestTrue(TEXT("Acquire exclusive checkout"), Lease.Acquire(F.A, true, Error));
+    const auto Result = Repo.PullAfterEditorExit(Review, Lease);
+    if (!TestTrue(TEXT("Closed-editor Pull succeeds: ") + Result.Error, Result.Ok())) return false;
+    TestEqual(TEXT("Reviewed commit integrated exactly"), Repo.Refresh().Head, Review.RemoteHead);
+    TestEqual(TEXT("Actual bytes hydrated despite skip-smudge"), F.Read(F.A, TEXT("Content/Probe.uasset")), Payload);
+    TestTrue(TEXT("Index and working tree clean"), Repo.Refresh().Files.IsEmpty());
+    TestEqual(TEXT("Lock receipt retained"), F.Read(F.A, TEXT(".git/uegit/locks/fixture.json")), FString(TEXT("retained lock receipt\n")));
+    TestFalse(TEXT("Successful verification clears recovery marker"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, TEXT(".git/uegit/restart-pull/recovery-required.txt"))));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRestartGuardsTest, "GitWorkspace.Restart.PreflightGuards", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitRestartGuardsTest::RunTest(const FString&)
+{
+    FRemoteFixture F; GitWorkspace::FRepository Repo(F.Git, F.A); const FString Original = Repo.Refresh().Head;
+    F.Write(F.B, TEXT("Content/Probe.uasset"), TEXT("incoming package\n")); F.Commit(F.B); F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")});
+    auto Review = Repo.Fetch(); GitWorkspaceSession::FLease Lease; FString Error;
+    TestFalse(TEXT("No lease means no integration"), Repo.PullAfterEditorExit(Review, Lease).Ok());
+    Lease.Acquire(F.B, true, Error); TestFalse(TEXT("Other checkout lease rejected"), Repo.PullAfterEditorExit(Review, Lease).Ok());
+    Lease.Acquire(F.A, true, Error);
+    auto Stale = Review; Stale.FetchedSeconds -= 301; TestFalse(TEXT("Expired review rejected"), Repo.PullAfterEditorExit(Stale, Lease).Ok());
+    F.Write(F.A, TEXT("local.txt"), TEXT("keep me\n")); TestFalse(TEXT("Untracked work blocks closed-editor Pull"), Repo.PullAfterEditorExit(Review, Lease).Ok());
+    IFileManager::Get().Delete(*FPaths::Combine(F.A, TEXT("local.txt")));
+    F.Write(F.A, TEXT(".git/info/exclude"), TEXT("Content/Probe.uasset\n")); Review = Repo.Fetch();
+    F.Write(F.A, TEXT("Content/Probe.uasset"), TEXT("ignored artist work\n"));
+    TestTrue(TEXT("Collision is ignored by ordinary status"), Repo.Refresh().Files.IsEmpty());
+    TestFalse(TEXT("Ignored file is protected"), Repo.PullAfterEditorExit(Review, Lease).Ok());
+    TestEqual(TEXT("Ignored bytes preserved"), F.Read(F.A, TEXT("Content/Probe.uasset")), FString(TEXT("ignored artist work\n")));
+    IFileManager::Get().Delete(*FPaths::Combine(F.A, TEXT("Content/Probe.uasset")));
+    F.Write(F.B, TEXT("Source/Probe.cpp"), TEXT("// rebuild required\n")); F.Commit(F.B); F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")});
+    TestFalse(TEXT("Remote advance invalidates old review"), Repo.PullAfterEditorExit(Review, Lease).Ok());
+    auto Forged = Repo.Fetch(); Forged.IncomingChanges.Empty();
+    TestFalse(TEXT("Backend recomputes unsupported code paths"), Repo.PullAfterEditorExit(Forged, Lease).Ok());
+    TestEqual(TEXT("All preflight failures preserve HEAD"), Repo.Refresh().Head, Original);
+    TestFalse(TEXT("Preflight failures need no recovery marker"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, TEXT(".git/uegit/restart-pull/recovery-required.txt"))));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitReloadTransactionTest, "GitWorkspace.Remote.ReloadTransactionRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitReloadTransactionTest::RunTest(const FString&)
+{
+    FRemoteFixture F; GitWorkspace::FRepository Repo(F.Git, F.A);
+    F.Write(F.B, TEXT("Content/Probe.uasset"), TEXT("backend-only fixture payload\n")); F.Commit(F.B); F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")});
+    const auto Review = Repo.Fetch(); const auto Prepared = Repo.PrepareIncomingLfs(Review);
+    if (!TestTrue(TEXT("Prepare reload transaction: ") + Prepared.Error, Prepared.bVerified)) return false;
+    GitWorkspaceSession::FLease Lease; FString Error; Lease.Acquire(F.A, true, Error);
+    auto Forged = Review; Forged.IncomingChanges.Empty();
+    TestFalse(TEXT("Missing package review cannot skip linker preparation"), Repo.PullForReload(Forged, Prepared, Lease).Ok());
+    TestEqual(TEXT("Rejected path list preserves HEAD"), Repo.Refresh().Head, Review.Head);
+    F.Write(F.A, TEXT(".git/uegit/locks/receipt.json"), TEXT("keep lock ownership\n"));
+    const auto Integrated = Repo.PullForReload(Review, Prepared, Lease);
+    if (!TestTrue(TEXT("Integrate backend transaction: ") + Integrated.Error, Integrated.Ok())) return false;
+    const FString Marker = TEXT(".git/uegit/restart-pull/recovery-required.txt");
+    TestTrue(TEXT("Disk success alone does not clear recovery"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, Marker)));
+    F.Write(F.A, TEXT("README.md"), TEXT("unexpected reload-time change\n"));
+    TestFalse(TEXT("Reload-time repository mutation prevents success"), Repo.CompleteReloadPull(Review, Lease).Ok());
+    TestTrue(TEXT("Uncertain reload retains recovery"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, Marker)));
+    TestEqual(TEXT("Unexpected work retained"), F.Read(F.A, TEXT("README.md")), FString(TEXT("unexpected reload-time change\n")));
+    F.Write(F.A, TEXT("README.md"), TEXT("base\n"));
+    TestTrue(TEXT("Confirmed completion clears marker"), Repo.CompleteReloadPull(Review, Lease).Ok());
+    TestFalse(TEXT("Recovery cleared after confirmed completion"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, Marker)));
+    TestEqual(TEXT("Lock receipt unchanged"), F.Read(F.A, TEXT(".git/uegit/locks/receipt.json")), FString(TEXT("keep lock ownership\n")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRestartRecoveryTest, "GitWorkspace.Restart.FailedPostflightRequiresRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitRestartRecoveryTest::RunTest(const FString&)
+{
+    FRemoteFixture F; GitWorkspace::FRepository Repo(F.Git, F.A);
+    F.Write(F.A, TEXT(".git/test-hooks/post-merge"), TEXT("#!/bin/sh\nprintf 'hook-created local work\\n' > README.md\n"));
+    chmod(TCHAR_TO_UTF8(*FPaths::Combine(F.A, TEXT(".git/test-hooks/post-merge"))), 0755);
+    F.Write(F.B, TEXT("Content/Probe.uasset"), TEXT("incoming package\n")); F.Commit(F.B); F.At(F.B, {TEXT("push"), TEXT("origin"), TEXT("main")});
+    const auto Review = Repo.Fetch(); GitWorkspaceSession::FLease Lease; FString Error; Lease.Acquire(F.A, true, Error);
+    const auto Result = Repo.PullAfterEditorExit(Review, Lease);
+    TestFalse(TEXT("Hook-created work fails postflight: ") + Result.Error, Result.Ok());
+    TestEqual(TEXT("No destructive rollback of an integrated commit"), Repo.Refresh().Head, Review.RemoteHead);
+    TestEqual(TEXT("Unexpected local work preserved for recovery"), F.Read(F.A, TEXT("README.md")), FString(TEXT("hook-created local work\n")));
+    TestTrue(TEXT("Recovery marker retained"), IFileManager::Get().FileExists(*FPaths::Combine(F.A, TEXT(".git/uegit/restart-pull/recovery-required.txt"))));
+    const FString Marker = F.Read(F.A, TEXT(".git/uegit/restart-pull/recovery-required.txt"));
+    TestTrue(TEXT("Recovery records both commit identities"), Marker.Contains(Review.Head) && Marker.Contains(Review.RemoteHead));
+    TestFalse(TEXT("Another attempt cannot bypass unresolved recovery"), Repo.PullAfterEditorExit(Review, Lease).Ok());
+    return true;
+}
+#endif
 #endif

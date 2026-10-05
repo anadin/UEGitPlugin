@@ -2,12 +2,21 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "SGitWorkspace.h"
 #include "GitWorkspacePullReview.h"
+#include "GitWorkspaceEditorPull.h"
+#if PLATFORM_MAC
+#include "GitWorkspaceSession.h"
+#endif
+#include "PackageTools.h"
+#include "UObject/Linker.h"
+#include "UObject/PackageReload.h"
+#include "Misc/ScopeExit.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformFileManager.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
 #include "UObject/StrongObjectPtr.h"
@@ -18,6 +27,7 @@
 #include "GameFramework/WorldSettings.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 
@@ -101,6 +111,91 @@ struct FEditorAssetFixture
     }
 };
 }
+
+#if PLATFORM_MAC
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitEditorReloadPullTest, "GitWorkspace.Editor.PullAndReloadRealAssets", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitEditorReloadPullTest::RunTest(const FString&)
+{
+    FEditorAssetFixture F; F.Create(); F.Edit(0);
+    auto* Instance = NewObject<UMaterialInstanceConstant>(F.Package(TEXT("MI_Probe")), TEXT("MI_Probe"), RF_Public | RF_Standalone);
+    Instance->SetParentEditorOnly(CastChecked<UMaterial>(F.Assets[1].Get()));
+    Instance->BasePropertyOverrides.bOverride_TwoSided = true;
+    Instance->BasePropertyOverrides.TwoSided = false;
+    F.Assets.Emplace(Instance); F.Paths.Add(TEXT("Content/MI_Probe.uasset"));
+    if (!TestTrue(TEXT("Save reload baseline"), F.Save())) return false;
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("base")});
+    const FString Base = F.Call({TEXT("rev-parse"), TEXT("HEAD")}).Text().TrimEnd();
+    const FString Branch = F.Call({TEXT("branch"), TEXT("--show-current")}).Text().TrimEnd();
+    F.Edit(1); Instance->BasePropertyOverrides.TwoSided = true;
+    if (!TestTrue(TEXT("Save incoming versions"), F.Save())) return false;
+    F.Call({TEXT("add"), TEXT("--"), F.Paths[0], F.Paths[1], F.Paths[2], F.Paths[4]});
+    // Add one valid, unloaded asset so Content Browser discovery is exercised.
+    UPackage* AddedPackage = F.Package(TEXT("M_Added"));
+    UMaterial* Added = NewObject<UMaterial>(AddedPackage, TEXT("M_Added"), RF_Public | RF_Standalone);
+    FSavePackageArgs SaveArgs; SaveArgs.TopLevelFlags = RF_Public | RF_Standalone; SaveArgs.SaveFlags = SAVE_NoError;
+    TestTrue(TEXT("Save incoming new asset"), UPackage::SavePackage(AddedPackage, Added, *FPaths::Combine(F.Root, TEXT("Content/M_Added.uasset")), SaveArgs));
+    UPackage::WaitForAsyncFileWrites();
+    F.Call({TEXT("add"), TEXT("--"), TEXT("Content/M_Added.uasset")});
+    F.Call({TEXT("commit"), TEXT("-qm"), TEXT("incoming assets")});
+    TArray<TArray<uint8>> ExpectedBytes;
+    for (int32 I = 0; I < 3; ++I) ExpectedBytes.Add(F.Bytes(F.Paths[I]));
+    const FString RemotePath = FPaths::Combine(F.Root, TEXT(".git/fixture-remote.git"));
+    F.Call({TEXT("init"), TEXT("--bare"), RemotePath});
+    F.Call({TEXT("remote"), TEXT("add"), TEXT("origin"), RemotePath});
+    if (!TestTrue(TEXT("Upload real LFS payloads"), F.Call({TEXT("lfs"), TEXT("push"), TEXT("origin"), Branch}).Ok())) return false;
+    if (!TestTrue(TEXT("Publish incoming asset commit"), F.Call({TEXT("push"), TEXT("-u"), TEXT("origin"), Branch}).Ok())) return false;
+    FText UnloadError; TestTrue(TEXT("Unload newly added asset"), UPackageTools::UnloadPackages({AddedPackage}, UnloadError));
+    AddedPackage = nullptr; Added = nullptr;
+    for (auto& Asset : F.Assets) ResetLoaders(Asset->GetPackage());
+    F.Call({TEXT("reset"), TEXT("--hard"), Base}); // Only this disposable fixture.
+    F.Edit(0); for (auto& Asset : F.Assets) Asset->GetPackage()->SetDirtyFlag(false);
+    Instance->BasePropertyOverrides.TwoSided = false;
+    F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
+    GitWorkspace::FRepository Repo(F.Git, F.Root);
+    const auto Reviewed = Repo.Fetch();
+    if (!TestTrue(TEXT("Fetch actual asset update: ") + Reviewed.Error, Reviewed.IsFresh())) return false;
+    const auto Prepared = Repo.PrepareIncomingLfs(Reviewed);
+    if (!TestTrue(TEXT("LFS prepared: ") + Prepared.Error, Prepared.bVerified)) return false;
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Fixture write lease"), Lease.Acquire(F.Root, true, Error))) return false;
+    F.Assets[0]->MarkPackageDirty();
+    auto Result = GitWorkspace::PullAndReload(Repo, Reviewed, Prepared, Lease);
+    TestFalse(TEXT("Unsaved work blocks after LFS preparation"), Result.bSuccess);
+    TestFalse(TEXT("Preflight block needs no recovery"), Result.bRecoveryRequired);
+    TestEqual(TEXT("Preflight leaves HEAD unchanged"), Repo.Refresh().Head, Base);
+    F.Assets[0]->GetPackage()->SetDirtyFlag(false);
+    auto Stale = Prepared; Stale.Commit = FString::ChrN(40, 'a');
+    TestFalse(TEXT("Wrong cache preparation refused"), GitWorkspace::PullAndReload(Repo, Reviewed, Stale, Lease).bSuccess);
+    const auto Delegate = FCoreUObjectDelegates::OnPackageReloaded.AddLambda([&](EPackageReloadPhase Phase, FPackageReloadedEvent* Event)
+    {
+        if (Phase == EPackageReloadPhase::OnPackageFixup && Event)
+            for (auto& Asset : F.Assets)
+                if (UObject* const* Replacement = Event->GetRepointedObjects().Find(Asset.Get())) Asset.Reset(*Replacement);
+    });
+    ON_SCOPE_EXIT { FCoreUObjectDelegates::OnPackageReloaded.Remove(Delegate); };
+    TWeakObjectPtr<UObject> OldBlueprint = F.Assets[0].Get();
+    Result = GitWorkspace::PullAndReload(Repo, Reviewed, Prepared, Lease);
+    if (!TestTrue(TEXT("Pull and reload completed: ") + Result.Message, Result.bSuccess)) return false;
+    TestFalse(TEXT("Recovery cleared only after reload"), Result.bRecoveryRequired);
+    TestEqual(TEXT("Four loaded packages reloaded"), Result.Reloaded, 4);
+    TestEqual(TEXT("Five packages refreshed"), Result.Refreshed, 5);
+    TestFalse(TEXT("Old Blueprint was purged"), OldBlueprint.IsValid());
+    TestEqual(TEXT("Blueprint memory now has incoming value"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 1")));
+    TestTrue(TEXT("Material memory now has incoming value"), !!CastChecked<UMaterial>(F.Assets[1].Get())->TwoSided);
+    TestTrue(TEXT("Texture memory now has incoming value"), !!CastChecked<UTexture2D>(F.Assets[2].Get())->SRGB);
+    Instance = CastChecked<UMaterialInstanceConstant>(F.Assets[4].Get());
+    TestTrue(TEXT("Material instance has incoming override"), !!Instance->BasePropertyOverrides.TwoSided);
+    TestTrue(TEXT("Dependency reference points at the reloaded material"), Instance->Parent.Get() == F.Assets[1].Get());
+    TestEqual(TEXT("Unchanged map remains loaded"), F.World->GetWorldSettings()->KillZ, -1000.f);
+    TestEqual(TEXT("Exact reviewed commit integrated"), Repo.Refresh().Head, Reviewed.RemoteHead);
+    TestTrue(TEXT("No generated working edits"), Repo.Refresh().Files.IsEmpty());
+    for (int32 I = 0; I < 3; ++I) TestTrue(TEXT("Incoming LFS payload hydrated exactly"), F.Bytes(F.Paths[I]) == ExpectedBytes[I]);
+    TestNull(TEXT("Added asset discovered without loading it"), FindPackage(nullptr, *(F.Mount + TEXT("M_Added"))));
+    // Do not leave temporary registry entries after the mount is removed.
+    if (UObject* Cleanup = LoadObject<UObject>(nullptr, *(F.Mount + TEXT("M_Added.M_Added")))) F.Assets.Emplace(Cleanup);
+    return true;
+}
+#endif
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWorkspaceEditorAssetsTest, "GitWorkspace.Editor.RealAssetsThroughPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitWorkspaceEditorAssetsTest::RunTest(const FString&)
@@ -211,7 +306,21 @@ bool FGitIncomingPackageReviewTest::RunTest(const FString&)
     TArray<TArray<uint8>> Before;
     for (const auto& Path : F.Paths) Before.Add(F.Bytes(Path));
     auto Review = GitWorkspace::ReviewIncoming(Remote, Local);
+    TestFalse(TEXT("Maps/external actors require restart"), Review.bCanReload);
+    const auto CompleteList = Remote.IncomingChanges;
+    Remote.IncomingChanges.SetNum(3);
+    #if PLATFORM_MAC
+    TestTrue(TEXT("Saved Blueprints, materials and textures can reload"), GitWorkspace::ReviewIncoming(Remote, Local).bCanReload);
+    #endif
+    Remote.IncomingChanges[0].Status = 'D';
+    TestFalse(TEXT("Deletion requires restart"), GitWorkspace::ReviewIncoming(Remote, Local).bCanReload);
+    Remote.IncomingChanges[0].Status = 'A';
+    TestFalse(TEXT("In-memory add collision blocks reload"), GitWorkspace::ReviewIncoming(Remote, Local).bCanReload);
+    Remote.IncomingChanges = CompleteList;
     TestFalse(TEXT("Package changes require editor-close handoff"), Review.bCanPull);
+    #if PLATFORM_MAC
+    TestTrue(TEXT("Saved Content packages eligible for coordinated restart"), Review.bCanRestart);
+    #endif
     TestEqual(TEXT("All affected packages represented"), Review.Packages.Num(), 6);
     for (int32 I = 0; I < 4; ++I)
         TestTrue(TEXT("Saved loaded package identified"), Review.Packages[I].bMounted && Review.Packages[I].bLoaded && !Review.Packages[I].bDirty);
@@ -219,6 +328,7 @@ bool FGitIncomingPackageReviewTest::RunTest(const FString&)
     TestFalse(TEXT("Review does not load absent package"), Review.Packages[4].bLoaded);
     TestTrue(TEXT("External actor package identified"), Review.Packages[5].bExternal);
     F.Edit(2); Review = GitWorkspace::ReviewIncoming(Remote, Local);
+    TestFalse(TEXT("Unsaved packages also block coordinated restart"), Review.bCanRestart);
     TestTrue(TEXT("Unsaved package blocks at highest priority"), Review.Blocker.Contains(TEXT("Unsaved")));
     for (int32 I = 0; I < 4; ++I)
     {
@@ -339,6 +449,64 @@ bool FGitWorkspaceSelectionTest::RunTest(const FString&)
     Panel->bContentOnly = false; Panel->RebuildRows(); bOutsideVisible = false;
     for (const auto& Row : Panel->Rows) bOutsideVisible |= Row->File.Path == Outside.Path;
     TestTrue(TEXT("Whole repo restores outside-content lock candidates"), bOutsideVisible);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitIncomingLfsPanelTest, "GitWorkspace.Editor.IncomingLfsThroughPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitIncomingLfsPanelTest::RunTest(const FString&)
+{
+    FEditorAssetFixture F; F.Create(); F.Edit(0);
+    if (!TestTrue(TEXT("Save real download fixture packages"), F.Save())) return false;
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("download baseline")});
+    F.Call({TEXT("branch"), TEXT("-M"), TEXT("main")});
+    const FString Bare = FPaths::Combine(F.Root, TEXT(".git/incoming-remote.git"));
+    const FString Other = FPaths::Combine(F.Root, TEXT(".git/incoming-clone"));
+    F.Call({TEXT("init"), TEXT("--bare"), Bare}); F.Call({TEXT("remote"), TEXT("add"), TEXT("origin"), Bare});
+    if (!TestTrue(TEXT("Upload baseline objects"), F.Call({TEXT("lfs"), TEXT("push"), TEXT("origin"), TEXT("main")}).Ok()) ||
+        !TestTrue(TEXT("Publish baseline"), F.Call({TEXT("push"), TEXT("-u"), TEXT("origin"), TEXT("main")}).Ok()) ||
+        !TestTrue(TEXT("Clone baseline packages"), F.Call({TEXT("clone"), TEXT("--branch"), TEXT("main"), Bare, Other}).Ok())) return false;
+    auto InOther = [&](const TArray<FString>& Args) { return GitWorkspace::Run(F.Git, Other, Args); };
+    InOther({TEXT("config"), TEXT("user.name"), TEXT("fixture")}); InOther({TEXT("config"), TEXT("user.email"), TEXT("fixture@example.invalid")});
+    InOther({TEXT("config"), TEXT("commit.gpgsign"), TEXT("false")}); InOther({TEXT("config"), TEXT("core.hooksPath"), TEXT(".git/test-hooks")});
+    TArray<TArray<uint8>> BeforeBytes;
+    for (const auto& Path : F.Paths) BeforeBytes.Add(F.Bytes(Path));
+    F.Edit(1); if (!TestTrue(TEXT("Save incoming package revision"), F.Save())) return false;
+    const FString IncomingFile = FPaths::Combine(Other, F.Paths[0]);
+    FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*IncomingFile, false);
+    if (!TestTrue(TEXT("Copy real incoming Blueprint to publisher clone"), FFileHelper::SaveArrayToFile(F.Bytes(F.Paths[0]), *IncomingFile))) return false;
+    InOther({TEXT("add"), TEXT("--"), F.Paths[0]}); InOther({TEXT("commit"), TEXT("-qm"), TEXT("incoming Blueprint")});
+    if (!TestTrue(TEXT("Upload incoming Blueprint"), InOther({TEXT("lfs"), TEXT("push"), TEXT("origin"), TEXT("main")}).Ok()) ||
+        !TestTrue(TEXT("Publish incoming Blueprint"), InOther({TEXT("push"), TEXT("origin"), TEXT("main")}).Ok())) return false;
+    // Only these disposable fixture files are restored. Leave a newer unsaved
+    // version loaded to prove preparation never saves or reloads editor packages.
+    for (int32 I = 0; I < F.Paths.Num(); ++I)
+        if (!TestTrue(TEXT("Restore fixture baseline bytes"), FFileHelper::SaveArrayToFile(BeforeBytes[I], *FPaths::Combine(F.Root, F.Paths[I])))) return false;
+    F.Edit(2);
+    auto Repo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Root);
+    auto Panel = SNew(SGitWorkspace).Repository(Repo);
+    auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
+    Settle(); Panel->RemoteAction(0); Settle();
+    if (!TestTrue(TEXT("Panel fetches incoming package"), Panel->Remote.IsFresh() && Panel->Remote.Behind == 1)) return false;
+    const auto Before = Repo->Refresh();
+    Panel->ShowIncomingReview();
+    TestTrue(TEXT("Review discloses unsaved packages"), Panel->IncomingReport->GetText().ToString().Contains(TEXT("UNSAVED PACKAGES")));
+    Panel->DownloadIncomingLfs();
+    TestTrue(TEXT("Download progress visible"), Panel->bDownloadingLfs && Panel->IncomingReport->GetText().ToString().Contains(TEXT("Downloading and verifying")));
+    Settle();
+    TestTrue(TEXT("Native action verifies cache: ") + Panel->Feedback, Panel->IncomingLfs.Matches(Panel->Remote));
+    TestTrue(TEXT("Open review updates after download"), Panel->IncomingReport->GetText().ToString().Contains(TEXT("LFS cache verified for commit")));
+    TestTrue(TEXT("Review keeps Pull blocker separate"), Panel->IncomingReport->GetText().ToString().Contains(TEXT("PULL BLOCKED")));
+    TestEqual(TEXT("Panel download preserves HEAD"), Repo->Refresh().Head, Before.Head);
+    TestTrue(TEXT("Panel download preserves index"), Repo->Refresh().IndexEntries == Before.IndexEntries);
+    for (int32 I = 0; I < F.Paths.Num(); ++I)
+    {
+        TestTrue(TEXT("Panel download preserves saved package bytes"), F.Bytes(F.Paths[I]) == BeforeBytes[I]);
+        TestTrue(TEXT("Unsaved package remains dirty"), F.Assets[I]->GetOutermost()->IsDirty());
+    }
+    TestEqual(TEXT("Unsaved Blueprint remains loaded"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 2")));
+    TestEqual(TEXT("Unsaved map remains loaded"), F.World->GetWorldSettings()->KillZ, -3000.f);
+    Panel->RemoteAction(0); Settle();
+    TestFalse(TEXT("New fetch clears previous cache certification"), Panel->IncomingLfs.bVerified);
+    TestTrue(TEXT("Open review clears previous success"), Panel->IncomingReport->GetText().ToString().Contains(TEXT("has not been verified")));
     return true;
 }
 #endif

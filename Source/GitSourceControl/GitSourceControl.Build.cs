@@ -25,7 +25,8 @@ public class GitSourceControl : ModuleRules
 				"UnrealEd",
 				"SourceControl",
 				"SourceControlWindows",
-				"Projects"
+				"Projects",
+                "MainFrame"
 			}
 		);
 
@@ -40,7 +41,8 @@ public class GitSourceControl : ModuleRules
 		}
 		else if (Target.Platform == UnrealTargetPlatform.Mac)
 		{
-			RuntimeDependencies.Add("$(PluginDir)/git-lfs-mac-amd64");
+			PrivateDependencyModuleNames.Add("GitWorkspaceSession");
+            RuntimeDependencies.Add("$(PluginDir)/git-lfs-mac-amd64");
 			RuntimeDependencies.Add("$(PluginDir)/git-lfs-mac-arm64");			
 		}
 		else if (Target.Platform == UnrealTargetPlatform.Linux)

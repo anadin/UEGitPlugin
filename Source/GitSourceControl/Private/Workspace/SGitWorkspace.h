@@ -5,6 +5,7 @@
 #include "Widgets/Views/SListView.h"
 #include "Async/Future.h"
 #include "GitWorkspaceRepository.h"
+#include "GitWorkspaceRestart.h"
 
 class SMultiLineEditableTextBox;
 class SWindow;
@@ -20,6 +21,11 @@ struct FGitWorkspaceTaskResult
     FString Message;
     GitWorkspace::FLockSnapshot Locks;
     GitWorkspace::FRemoteSnapshot Remote;
+    GitWorkspace::FIncomingLfsResult IncomingLfs;
+    GitWorkspace::FRestartJob Restart;
+    bool bRestart = false;
+    bool bReload = false;
+    bool bIncomingLfs = false;
     bool bRemote = false;
     bool bLocks = false;
     bool bDiff = false;
@@ -43,7 +49,8 @@ private:
     friend class FGitWorkspaceSelectionTest;
     friend class FGitNewAssetLockTest;
     friend class FGitStartupLockVerificationTest;
-    bool IsIdle() const { return !Pending.IsValid(); }
+    friend class FGitIncomingLfsPanelTest;
+    bool IsIdle() const { return !Pending.IsValid() && RestartFolder.IsEmpty() && !bReloading; }
     void Start(TFunction<FGitWorkspaceTaskResult()> Work);
     FReply Refresh();
     FReply ChangeIndex(bool bStage);
@@ -59,6 +66,13 @@ private:
     bool IsPathVisible(const FString& Path) const;
     int32 HiddenStagedCount() const;
     FReply ShowIncomingReview();
+    FReply DownloadIncomingLfs();
+    FReply RestartPull();
+    FReply ReloadPull();
+    FString FinishReloadPull();
+    FReply CancelRestart();
+    FText IncomingLfsStatus() const;
+    FText IncomingReportText() const;
     FReply ChangeLock(bool bUnlock);
     bool HasDirtyPackages() const;
     FText Inspector() const;
@@ -68,6 +82,7 @@ private:
     GitWorkspace::FSnapshot Snapshot;
     GitWorkspace::FLockSnapshot Locks;
     GitWorkspace::FRemoteSnapshot Remote;
+    GitWorkspace::FIncomingLfsResult IncomingLfs;
     FString LockRemote = TEXT("origin");
     TFuture<FGitWorkspaceTaskResult> Pending;
     TArray<TSharedPtr<FGitWorkspaceRow>> Rows;
@@ -75,12 +90,19 @@ private:
     TSharedPtr<FGitWorkspaceRow> Selection;
     TSharedPtr<SMultiLineEditableTextBox> Message;
     FString Feedback;
+    FString RestartFolder, RestartMessage;
+    double NextRestartPoll = 0;
+    uint32 RestartHelperPid = 0;
+    bool bPreparingRestart = false;
+    bool bReloading = false;
     FString DiffText;
     FString FileFilter;
     bool bContentOnly = true;
     bool bVerifyLocksOnOpen = true;
     bool bCheckingLocks = false;
+    bool bDownloadingLfs = false;
     TWeakPtr<SWindow> IncomingWindow;
+    TSharedPtr<SMultiLineEditableTextBox> IncomingReport;
 };
 
 namespace GitWorkspaceUI
