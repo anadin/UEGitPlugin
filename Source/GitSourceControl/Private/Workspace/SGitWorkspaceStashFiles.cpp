@@ -20,7 +20,7 @@ bool SGitWorkspace::CanSelectStashFile(const GitWorkspace::FFile& File) const
 }
 void SGitWorkspace::InvalidateStashSelection()
 {
-    StashReview = GitWorkspace::FStashReview(); StashReview.bCreate = true;
+    StashReview = GitWorkspace::FStashReview(); StashReview.bCreate = true; StashReview.bSelected = true;
     StashInspection = GitWorkspace::FStashInspection();
     StashReview.Error = TEXT("File selection changed. Review the checked files before creating a stash.");
     if (StashReport) StashReport->SetText(PickerText(StashReview.Error));

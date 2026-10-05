@@ -83,6 +83,10 @@ private:
     FReply PreviewStash(const FString& Oid, const FString& Selector = FString(), bool bSelected = false);
     FReply DropSelectedStash();
     FText StashReportText() const;
+    FText StashActionText() const;
+    FText StashActionHint() const;
+    bool CanRunStashAction() const;
+    FReply RunStashAction();
     FReply RunStash();
     void RebuildStashes();
     TSharedRef<SWidget> MakeStashFilePicker();

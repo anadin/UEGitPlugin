@@ -29,6 +29,7 @@ FReply SGitWorkspace::ShowStashes()
         if (Row->Group.IsEmpty() && CanSelectStashFile(Row->File)) StashSelectedPaths.AddUnique(Row->File.Path);
     StashSelectedPaths.Sort();
     StashReview = GitWorkspace::FStashReview(); StashInspection = GitWorkspace::FStashInspection();
+    StashReview.bCreate = true; StashReview.bSelected = true;
     const auto Window = SNew(SWindow).Title(StashText(TEXT("Git stashes"))).ClientSize(FVector2D(1150, 760)).SupportsMinimize(false);
     StashWindow = Window;
     TWeakPtr<SGitWorkspace> Weak = SharedThis(this);
@@ -56,12 +57,14 @@ FReply SGitWorkspace::ShowStashes()
             + SVerticalBox::Slot().AutoHeight().Padding(0, 4)[SNew(STextBlock).Text(StashText(TEXT("Review")))]
             + SVerticalBox::Slot().FillHeight(0.75)
             [SAssignNew(StashReport, SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(StashText(TEXT("Tick files on the left and review them to create a stash, or select a saved stash above to inspect and apply it.")))]
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 8, 0, 0)
+            [SNew(STextBlock).AutoWrapText(true).Text_Lambda([Weak] { auto P = Weak.Pin(); return P ? P->StashActionHint() : FText(); })]
             + SVerticalBox::Slot().AutoHeight().Padding(0, 10, 0, 0)
             [SNew(SHorizontalBox)
                 + SHorizontalBox::Slot().AutoWidth()
-                [SNew(SButton).Text_Lambda([Weak] { auto P = Weak.Pin(); return StashText(P && P->StashReview.bCreate ? TEXT("Create stash…") : TEXT("Apply stash…")); })
-                    .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->IsIdle() && P->StashReview.IsFresh() && (P->StashReview.bCreate || P->StashInspection.IsFresh()); })
-                    .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RunStash(); return FReply::Handled(); })]
+                [SNew(SButton).Text_Lambda([Weak] { auto P = Weak.Pin(); return P ? P->StashActionText() : FText(); })
+                    .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->CanRunStashAction(); })
+                    .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RunStashAction(); return FReply::Handled(); })]
                 + SHorizontalBox::Slot().AutoWidth().Padding(12, 0)
                 [SNew(SButton).Text(StashText(TEXT("Drop selected stash…")))
                     .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->IsIdle() && P->StashInspection.IsFresh() && P->StashInspection.DropBlocker.IsEmpty(); })
@@ -114,9 +117,49 @@ FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector, 
     });
     return FReply::Handled();
 }
+bool SGitWorkspace::CanRunStashAction() const
+{
+    if (!IsIdle()) return false;
+    if (StashReview.bCreate)
+        return StashReview.bSelected ? !StashSelectedPaths.IsEmpty() : StashReview.bValid || !StashReview.Oid.IsEmpty();
+    return !StashInspection.Entry.Oid.IsEmpty();
+}
+FText SGitWorkspace::StashActionText() const
+{
+    if (StashReview.bCreate)
+        return StashText(StashReview.IsFresh() ? TEXT("Create stash…") : StashReview.bSelected ? TEXT("Review selected to create…") : TEXT("Review again to create…"));
+    return StashText(StashReview.IsFresh() && StashInspection.IsFresh() ? TEXT("Apply stash…") : TEXT("Review again to apply…"));
+}
+FText SGitWorkspace::StashActionHint() const
+{
+    if (!IsIdle()) return StashText(TEXT("Stash operation running. Please wait for the result."));
+    if (StashReview.bCreate)
+    {
+        if (StashReview.IsFresh()) return StashText(TEXT("Create stash opens a Yes/No confirmation. Files change only after Yes."));
+        if (StashReview.bValid) return StashText(TEXT("Review expired after five minutes. Review again below before creating the stash."));
+        if (StashReview.bSelected && StashSelectedPaths.IsEmpty()) return StashText(TEXT("Tick files on the left. New files require Include untracked files."));
+        return StashText(TEXT("Review required before Create. Use the review action below; checking a file does not stash it."));
+    }
+    if (StashInspection.Entry.Oid.IsEmpty()) return StashText(TEXT("Select a saved stash above to restore its files."));
+    if (StashReview.IsFresh() && StashInspection.IsFresh()) return StashText(TEXT("Apply restores the saved files after confirmation and keeps the stash."));
+    if (StashReview.bValid || (StashInspection.bValid && !StashInspection.IsFresh()))
+        return StashText(TEXT("Review expired or changed. Review again below before applying the stash."));
+    return StashText(TEXT("Apply is not ready. Read the blocker above, resolve it, then review again."));
+}
+FReply SGitWorkspace::RunStashAction()
+{
+    if (!CanRunStashAction()) return FReply::Handled();
+    // Refreshing a stale or changed review never mutates files or opens a
+    // confirmation. The user sees the new review before choosing Create/Apply.
+    if (!StashReview.IsFresh() || (!StashReview.bCreate && !StashInspection.IsFresh()))
+        return StashReview.bCreate ? PreviewStash(FString(), FString(), StashReview.bSelected) :
+            PreviewStash(StashInspection.Entry.Oid, StashInspection.Entry.Selector);
+    return RunStash();
+}
 FReply SGitWorkspace::RunStash()
 {
-    if (!IsIdle() || !StashReview.IsFresh() || (!StashReview.bCreate && !StashInspection.IsFresh())) return FReply::Handled();
+    if (!IsIdle()) return FReply::Handled();
+    if (!StashReview.IsFresh() || (!StashReview.bCreate && !StashInspection.IsFresh())) return RunStashAction();
 #if PLATFORM_MAC
     const auto Reviewed = StashReview; const FString Name = StashName ? StashName->GetText().ToString() : FString();
     TArray<GitWorkspace::FIncomingPackage> Packages;
