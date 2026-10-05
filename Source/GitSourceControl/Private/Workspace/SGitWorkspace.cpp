@@ -117,7 +117,8 @@ void SGitWorkspace::Construct(const FArguments& Args)
             + SHorizontalBox::Slot().AutoWidth().Padding(8, 0)
             [SNew(SButton).Text(Text(TEXT("Lock asset"))).ToolTipText(this, &SGitWorkspace::LockHint).IsEnabled(this, &SGitWorkspace::CanLockSelected).OnClicked_Lambda([this] { return ChangeLock(false); })]
             + SHorizontalBox::Slot().AutoWidth()
-            [SNew(SButton).Text(Text(TEXT("Unlock…"))).IsEnabled_Lambda([this] { return IsIdle() && Selection && Selection->Group.IsEmpty() && Locks.State(Selection->File.Path, Selection->File.bLockable) == GitWorkspace::ELockState::Ours; }).OnClicked_Lambda([this] { return ChangeLock(true); })]
+            [SNew(SButton).Text(Text(TEXT("Unlock…"))).ToolTipText(Text(TEXT("Review ownership, saved changes, stashes and publication before releasing this asset's lock.")))
+                .IsEnabled_Lambda([this] { return IsIdle() && Selection && Selection->Group.IsEmpty() && List->GetSelectedItems().Num() == 1 && (Selection->File.bLockable || Locks.Locks.Contains(Selection->File.Path)); }).OnClicked_Lambda([this] { return ChangeLock(true); })]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
         [SNew(STextBlock).AutoWrapText(true).Text(this, &SGitWorkspace::LockStatusText)]
@@ -214,7 +215,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
     ];
     Refresh();
 }
-SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); }
+SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = UnlockWindow.Pin()) Window->RequestDestroyWindow(); }
 void SGitWorkspace::WaitForWork() { if (Pending.IsValid()) { Pending.Wait(); Pending = TFuture<FGitWorkspaceTaskResult>(); } }
 void SGitWorkspace::Start(TFunction<FGitWorkspaceTaskResult()> Work)
 {
@@ -307,6 +308,11 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
             }
         }
         if (IncomingWindow.IsValid() && IncomingReport) IncomingReport->SetText(IncomingReportText());
+        if (auto Window = Result.UnlockReviewWindow.Pin(); Result.bUnlockReview && Window && Window == UnlockWindow.Pin() && Window->IsVisible())
+        {
+            UnlockReview = MoveTemp(Result.UnlockReview);
+            if (UnlockReport) UnlockReport->SetText(Text(UnlockReview.Text()));
+        }
         // Create/Apply prepare their reviews asynchronously, then present the exact
         // paths for confirmation in the same window that requested the action.
         if (auto Window = Result.StashConfirmationWindow.Pin(); Window && Window == StashWindow.Pin() && Window->IsVisible() && StashReview.IsFresh() && (StashReview.bCreate || StashInspection.IsFresh()))
@@ -521,12 +527,11 @@ FReply SGitWorkspace::VerifyLocks()
 }
 FReply SGitWorkspace::ChangeLock(bool bUnlock)
 {
+    if (bUnlock) return ShowUnlockReview();
     if (!IsIdle() || !Selection || !Selection->Group.IsEmpty()) return FReply::Handled();
     if (List->GetSelectedItems().Num() != 1) { Feedback = TEXT("Select one asset for a lock operation."); return FReply::Handled(); }
-    if (bUnlock && HasDirtyPackages()) { Feedback = TEXT("Save dirty assets and review their Git state before unlocking."); return FReply::Handled(); }
     if (!bUnlock && !CanLockSelected()) { Feedback = LockHint().ToString(); return FReply::Handled(); }
     auto Repo = Repository; const auto Reviewed = Locks; const FString Path = Selection->File.Path, SelectedRemote = LockRemote;
-    if (bUnlock && FMessageDialog::Open(EAppMsgType::YesNo, Text(TEXT("Release the lock on ") + Path + TEXT("?\n\nBranch: ") + Snapshot.Branch + TEXT("\nCommit: ") + Snapshot.Head + TEXT("\n\nConfirm that your team handoff is complete and no other clone or worktree still needs this reservation. The plugin will check saved changes, stashes and the live upstream before unlocking."))) != EAppReturnType::Yes) return FReply::Handled();
     Locks.bVerified = false;
     Start([Repo, Reviewed, Path, SelectedRemote, bUnlock]
     {

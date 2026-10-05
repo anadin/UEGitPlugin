@@ -10,7 +10,10 @@
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Interfaces/IPluginManager.h"
+#include "Widgets/Input/SMultiLineEditableTextBox.h"
+#include "Misc/App.h"
 #if PLATFORM_MAC
+#include "GitWorkspaceSession.h"
 #include <unistd.h>
 #endif
 
@@ -160,6 +163,148 @@ bool FGitLockLifecycleTest::RunTest(const FString&)
     F.Mode(TEXT("")); S = Repo.VerifyLocks(TEXT("origin"));
     TestTrue(TEXT("Refresh discovers the acquired reservation"), S.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
     TestFalse(TEXT("Unconfirmed acquisition cannot be silently adopted"), Repo.ChangeLock(S, TEXT("asset.uasset"), true, true).Ok());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitUnlockStashScopeTest, "GitWorkspace.Locks.StashScopedHandoff", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitUnlockStashScopeTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    F.Write(TEXT("texture.uasset"), TEXT("texture base\n"));
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("texture")});
+    F.Call({TEXT("push"), TEXT("--no-verify"), TEXT("origin"), TEXT("main")});
+    GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    for (const FString Path : {FString(TEXT("asset.uasset")), FString(TEXT("texture.uasset"))})
+        if (!TestTrue(TEXT("Acquire fixture lock"), Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), Path, false).Ok())) return false;
+    F.Write(TEXT("asset.uasset"), TEXT("unfinished Blueprint\n"));
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("Blueprint work")});
+    const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes();
+    const auto Blocked = Repo.ReviewUnlock(TEXT("origin"), TEXT("asset.uasset"));
+    TestTrue(TEXT("Review names the stash that needs this lock"), !Blocked.IsFresh() && Blocked.BlockingStashes.Num() == 1 && Blocked.Text().Contains(TEXT("Blueprint work")));
+    TestFalse(TEXT("Stashed asset cannot be released"), Repo.ChangeLock(Blocked.Locks, Blocked.Path, true, true).Ok());
+    const auto Ready = Repo.ReviewUnlock(TEXT("origin"), TEXT("texture.uasset"));
+    if (!TestTrue(TEXT("Unrelated stash permits texture handoff: ") + Ready.Error, Ready.IsFresh())) return false;
+    TestEqual(TEXT("Review inspects every stash"), Ready.StashesChecked, 1);
+    TestTrue(TEXT("Review keeps index unchanged"), Repo.Refresh().IndexEntries == Before.IndexEntries);
+    TestEqual(TEXT("Review keeps HEAD unchanged"), Repo.Refresh().Head, Before.Head);
+    const auto Released = Repo.ChangeLock(Ready.Locks, Ready.Path, true, true, Ready.Head);
+    TestTrue(TEXT("Release only the reviewed texture: ") + Released.Error, Released.Ok());
+    const auto After = Repo.VerifyLocks(TEXT("origin"));
+    TestTrue(TEXT("Blueprint lock remains held"), After.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    TestTrue(TEXT("Texture lock released"), After.State(TEXT("texture.uasset"), true) == GitWorkspace::ELockState::Unlocked);
+    TestEqual(TEXT("Stash list retained exactly"), Repo.ListStashes().Fingerprint, Stashes.Fingerprint);
+    TestTrue(TEXT("Release preserves index"), Repo.Refresh().IndexEntries == Before.IndexEntries);
+    TestTrue(TEXT("Release leaves working files clean"), Repo.Refresh().Files.IsEmpty());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitUnlockStashTreesTest, "GitWorkspace.Locks.StashTreesAndLiteralPaths", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitUnlockStashTreesTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Acquire asset lock"), Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), false).Ok())) return false;
+    F.Write(TEXT("asset.uasset"), TEXT("index only version\n")); F.Call({TEXT("add"), TEXT("asset.uasset")});
+    F.Call({TEXT("restore"), TEXT("--source=HEAD"), TEXT("--worktree"), TEXT("--"), TEXT("asset.uasset")});
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("index only")});
+    auto Review = Repo.ReviewUnlock(TEXT("origin"), TEXT("asset.uasset"));
+    TestTrue(TEXT("Saved staging blocks even when saved working tree equals base"), !Review.IsFresh() && Review.BlockingStashes.Num() == 1 && Review.Text().Contains(TEXT("index only")));
+    F.Call({TEXT("stash"), TEXT("drop")});
+    F.Call({TEXT("mv"), TEXT("asset.uasset"), TEXT("renamed.uasset")});
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("rename")});
+    Review = Repo.ReviewUnlock(TEXT("origin"), TEXT("asset.uasset"));
+    TestTrue(TEXT("Rename source keeps original reservation"), !Review.IsFresh() && Review.BlockingStashes.Num() == 1);
+    F.Call({TEXT("stash"), TEXT("drop")});
+    // The path was untracked in an older stash, and is tracked/published now.
+    // Literal newline/Unicode names must not evade overlap.
+    const FString Literal = TEXT("Lock [水]\nTester.uasset");
+    F.Write(Literal, TEXT("saved untracked version\n"));
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-u"), TEXT("-m"), TEXT("new asset")});
+    F.Write(Literal, TEXT("published version\n")); F.Call({TEXT("add"), TEXT("--"), Literal});
+    F.Call({TEXT("commit"), TEXT("-qm"), TEXT("publish new asset")}); F.Call({TEXT("push"), TEXT("--no-verify"), TEXT("origin"), TEXT("main")});
+    if (!TestTrue(TEXT("Acquire literal path"), Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), Literal, false).Ok())) return false;
+    Review = Repo.ReviewUnlock(TEXT("origin"), Literal);
+    TestTrue(TEXT("Older untracked third parent blocks exact literal path"), !Review.IsFresh() && Review.BlockingStashes.Num() == 1);
+    TestTrue(TEXT("Report escapes the newline"), Review.Text().Contains(TEXT("Lock [水]\\nTester.uasset")));
+    const FString SavedOid = Repo.ListStashes().Entries[0].Oid;
+    // A malformed entry must block even an otherwise unrelated asset.
+    F.Call({TEXT("update-ref"), TEXT("-m"), TEXT("malformed"), TEXT("refs/stash"), TEXT("HEAD")});
+    Review = Repo.ReviewUnlock(TEXT("origin"), TEXT("asset.uasset"));
+    TestTrue(TEXT("Unreadable stash shape fails closed"), !Review.IsFresh() && Review.Error.Contains(TEXT("Cannot inspect")));
+    TestFalse(TEXT("Malformed stash never permits release"), Repo.ChangeLock(Review.Locks, Review.Path, true, true).Ok());
+    TestTrue(TEXT("Original stash object retained"), F.Call({TEXT("cat-file"), TEXT("-e"), SavedOid}).Ok());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitUnlockRaceTest, "GitWorkspace.Locks.UnlockReviewRacesAndRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitUnlockRaceTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Acquire race fixture lock"), Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), false).Ok())) return false;
+    F.Write(TEXT("asset.uasset"), TEXT("stashed pending work\n"));
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("pending work")});
+    const FString Oid = Repo.ListStashes().Entries[0].Oid;
+    F.Call({TEXT("stash"), TEXT("drop")});
+    const auto Reviewed = Repo.ReviewUnlock(TEXT("origin"), TEXT("asset.uasset"));
+    if (!TestTrue(TEXT("Initial review ready"), Reviewed.IsFresh())) return false;
+    const FString Wrapper = FPaths::Combine(F.Repo, TEXT(".git/racing-git"));
+    const FString Script = TEXT("#!/bin/sh\ncase \" $* \" in *' ls-remote '*) '") + F.Git + TEXT("' stash store -m concurrent ") + Oid + TEXT(" || exit 1 ;; esac\nexec '") + F.Git + TEXT("' \"$@\"\n");
+    FFileHelper::SaveStringToFile(Script, *Wrapper, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+    GitWorkspace::Run(TEXT("/bin/chmod"), F.Repo, {TEXT("700"), Wrapper});
+    GitWorkspace::FRepository Racing(Wrapper, F.Repo);
+    const auto Race = Racing.ChangeLock(Reviewed.Locks, Reviewed.Path, true, true, Reviewed.Head);
+    TestTrue(TEXT("Stash created during live remote query blocks unlock"), !Race.Ok() && Race.Error.Contains(TEXT("Stash state changed")));
+    F.Call({TEXT("stash"), TEXT("drop")});
+    F.Write(TEXT("README.md"), TEXT("another published commit\n")); F.Call({TEXT("add"), TEXT("README.md")});
+    F.Call({TEXT("commit"), TEXT("-qm"), TEXT("new head")}); F.Call({TEXT("push"), TEXT("--no-verify"), TEXT("origin"), TEXT("main")});
+    const auto Changed = Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), Reviewed.Path, true, true, Reviewed.Head);
+    TestTrue(TEXT("Confirmation is bound to reviewed commit"), !Changed.Ok() && Changed.Error.Contains(TEXT("Commit changed")));
+    FString CanonicalRoot, GitDir; GitWorkspaceSession::FindRepository(F.Repo, CanonicalRoot, GitDir);
+    const FString Marker = GitWorkspaceSession::RecoveryFile(GitDir);
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Marker), true);
+    FFileHelper::SaveStringToFile(TEXT("pending asset recovery"), *Marker);
+    const auto Recovery = Repo.ReviewUnlock(TEXT("origin"), Reviewed.Path);
+    TestTrue(TEXT("Pending asset recovery retains lock"), !Recovery.IsFresh() && Recovery.Error.Contains(TEXT("recovery")));
+    TestFalse(TEXT("Execution also respects recovery"), Repo.ChangeLock(Recovery.Locks, Recovery.Path, true, true).Ok());
+    FString Requests; FFileHelper::LoadFileToString(Requests, *FPaths::Combine(F.Root, TEXT("requests")));
+    TestFalse(TEXT("No rejected release reached server"), Requests.Contains(TEXT("/unlock")));
+    TestTrue(TEXT("Lock remains owned"), Repo.VerifyLocks(TEXT("origin")).State(Reviewed.Path, true) == GitWorkspace::ELockState::Ours);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitUnlockReviewPanelTest, "GitWorkspace.Locks.UnlockReviewThroughPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitUnlockReviewPanelTest::RunTest(const FString&)
+{
+    FLockFixture F;
+    if (!TestFalse(TEXT("Loopback server started"), F.Endpoint.IsEmpty())) return false;
+    auto Repo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Acquire panel fixture lock"), Repo->ChangeLock(Repo->VerifyLocks(TEXT("origin")), TEXT("asset.uasset"), false).Ok())) return false;
+    auto Panel = SNew(SGitWorkspace).Repository(Repo);
+    auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
+    Settle(); Panel->bContentOnly = false; Panel->RebuildRows();
+    for (const auto& Row : Panel->Rows) if (Row->Group.IsEmpty() && Row->File.Path == TEXT("asset.uasset")) Panel->List->SetItemSelection(Row, true);
+    Panel->Locks.VerifiedSeconds -= 61;
+    Panel->ChangeLock(true); Settle();
+    TestTrue(TEXT("Unlock opens fresh read-only handoff review from stale ownership"), Panel->UnlockReview.IsFresh());
+    if (!TestTrue(TEXT("Review report exists"), Panel->UnlockReport.IsValid())) return false;
+    TestTrue(TEXT("Review shows ready and exact asset"), Panel->UnlockReport->GetText().ToString().Contains(TEXT("READY FOR HANDOFF")) && Panel->UnlockReview.Path == TEXT("asset.uasset"));
+    {
+        TGuardValue<bool> Unattended(GIsRunningUnattendedScript, true);
+        Panel->RunUnlock();
+    }
+    TestEqual(TEXT("Declining confirmation preserves lock"), Panel->Feedback, FString(TEXT("Unlock cancelled. Lock retained.")));
+    F.Write(TEXT("asset.uasset"), TEXT("pending Blueprint work\n"));
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("panel blocked work")});
+    Panel->RefreshUnlockReview(); Settle();
+    TestFalse(TEXT("Stashed work disables release"), Panel->UnlockReview.IsFresh());
+    TestTrue(TEXT("Panel names the blocking stash"), Panel->UnlockReport->GetText().ToString().Contains(TEXT("panel blocked work")));
+    FString Requests; FFileHelper::LoadFileToString(Requests, *FPaths::Combine(F.Root, TEXT("requests")));
+    TestFalse(TEXT("Preview, refresh and cancellation never release"), Requests.Contains(TEXT("/unlock")));
+    TestTrue(TEXT("Panel operations retain server lock"), Repo->VerifyLocks(TEXT("origin")).State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
     return true;
 }
 

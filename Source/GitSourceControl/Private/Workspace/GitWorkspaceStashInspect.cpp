@@ -33,6 +33,43 @@ FString FRepository::StashDropRecovery(FString* ReportPath) const
     if (ReportPath) *ReportPath = Report;
     return IFileManager::Get().FileExists(*Report) ? TEXT("A stash-list operation needs recovery. Inspect the preserved references and report before modifying stashes or releasing locks: ") + Report : FString();
 }
+FResult FRepository::ReadStashPaths(const FStashEntry& Entry, TArray<FString>& Paths, FString* Details) const
+{
+    Paths.Empty(); FString Text; TSet<FString> Seen;
+    const auto Parents = Git({TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), Entry.Oid, TEXT("--")});
+    TArray<FString> Parts; Parents.Text().TrimEnd().ParseIntoArray(Parts, TEXT(" "));
+    if (!Parents.Ok() || (Parts.Num() != 3 && Parts.Num() != 4) || Parts[0] != Entry.Oid) return StashInspectFailure(TEXT("Cannot inspect this stash's complete saved trees. Review it externally."));
+    const auto IndexParents = Git({TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), Parts[2], TEXT("--")});
+    if (!IndexParents.Ok() || IndexParents.Text().TrimEnd() != Parts[2] + TEXT(" ") + Parts[1]) return StashInspectFailure(TEXT("The saved index is not a valid stash index commit."));
+    if (Parts.Num() == 4)
+    {
+        const auto UntrackedParents = Git({TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), Parts[3], TEXT("--")});
+        if (!UntrackedParents.Ok() || UntrackedParents.Text().TrimEnd() != Parts[3]) return StashInspectFailure(TEXT("The saved untracked tree is not a valid stash root commit."));
+    }
+    if (Details) Text = TEXT("STASH INSPECTION\n\n") + StashDisplay(Entry.Selector) + TEXT("  ") + StashDisplay(Entry.Label) +
+        TEXT("\nSnapshot: ") + Entry.Oid + TEXT("\nBase: ") + Parts[1] + TEXT("\n\n");
+    const TCHAR* Headings[] = {TEXT("SAVED WORKING CHANGES"), TEXT("SAVED STAGING"), TEXT("SAVED UNTRACKED FILES")};
+    const TArray<FString> Trees {Entry.Oid, Parts[2], Parts.Num() == 4 ? Parts[3] : FString()};
+    for (int32 I = 0; I < Trees.Num(); ++I)
+    {
+        if (Trees[I].IsEmpty()) continue;
+        TArray<FString> Args;
+        if (I == 2) Args = {TEXT("diff-tree"), TEXT("--root"), TEXT("--no-commit-id"), TEXT("-r"), TEXT("--raw"), TEXT("--no-ext-diff"), TEXT("--no-textconv"), TEXT("--no-abbrev"), TEXT("--no-renames"), TEXT("-z"), Trees[I], TEXT("--")};
+        else Args = {TEXT("diff"), TEXT("--raw"), TEXT("--no-ext-diff"), TEXT("--no-textconv"), TEXT("--no-abbrev"), TEXT("--no-renames"), TEXT("-z"), Parts[1], Trees[I], TEXT("--")};
+        const auto Diff = Git(Args); TArray<FIncomingChange> Changes; FString Error;
+        if (!Diff.Ok() || !ParseIncomingChanges(Diff.Out, Changes, Error)) return StashInspectFailure(TEXT("Cannot inspect the complete stash paths. ") + Error + Diff.Error);
+        if (Details) Text += FString(Headings[I]) + TEXT("\n");
+        if (Details && Changes.IsEmpty()) Text += TEXT("(none)\n");
+        for (const auto& Change : Changes)
+        {
+            if (!Seen.Contains(Change.Path)) { Seen.Add(Change.Path); Paths.Add(Change.Path); }
+            if (Details) Text += FString::Chr(Change.Status) + TEXT("  ") + StashDisplay(Change.Path) + TEXT("\n");
+        }
+        if (Details) Text += TEXT("\n");
+    }
+    if (Details) *Details = MoveTemp(Text);
+    FResult Result; Result.Code = 0; return Result;
+}
 FStashInspection FRepository::InspectStash(const FString& Oid, const FString& Selector)
 { FScopeLock Guard(&Mutex); return InspectStashInternal(Oid, Selector); }
 FStashInspection FRepository::InspectStashInternal(const FString& Oid, const FString& Selector)
@@ -47,33 +84,9 @@ FStashInspection FRepository::InspectStashInternal(const FString& Oid, const FSt
     for (const auto& Entry : List.Entries) if (Entry.Oid == Oid && (Selector.IsEmpty() || Entry.Selector == Selector)) { R.Entry = Entry; ++Found; }
     if (Found != 1) return Fail(TEXT("Select one exact stash entry from the refreshed list; it may have moved or been removed."));
     R.ListFingerprint = List.Fingerprint;
-    const auto Parents = Git({TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), R.Entry.Oid, TEXT("--")});
-    TArray<FString> Parts; Parents.Text().TrimEnd().ParseIntoArray(Parts, TEXT(" "));
-    if (!Parents.Ok() || (Parts.Num() != 3 && Parts.Num() != 4) || Parts[0] != R.Entry.Oid) return Fail(TEXT("Cannot inspect this stash's complete saved trees. Review it externally."));
-    const auto IndexParents = Git({TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), Parts[2], TEXT("--")});
-    if (!IndexParents.Ok() || IndexParents.Text().TrimEnd() != Parts[2] + TEXT(" ") + Parts[1]) return Fail(TEXT("The saved index is not a valid stash index commit."));
-    if (Parts.Num() == 4)
-    {
-        const auto UntrackedParents = Git({TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), Parts[3], TEXT("--")});
-        if (!UntrackedParents.Ok() || UntrackedParents.Text().TrimEnd() != Parts[3]) return Fail(TEXT("The saved untracked tree is not a valid stash root commit."));
-    }
-    R.Text = TEXT("STASH INSPECTION\n\n") + StashDisplay(R.Entry.Selector) + TEXT("  ") + StashDisplay(R.Entry.Label) +
-        TEXT("\nSnapshot: ") + R.Entry.Oid + TEXT("\nBase: ") + Parts[1] + TEXT("\n\n");
-    const TCHAR* Headings[] = {TEXT("SAVED WORKING CHANGES"), TEXT("SAVED STAGING"), TEXT("SAVED UNTRACKED FILES")};
-    const TArray<FString> Trees {R.Entry.Oid, Parts[2], Parts.Num() == 4 ? Parts[3] : FString()};
-    for (int32 I = 0; I < Trees.Num(); ++I)
-    {
-        if (Trees[I].IsEmpty()) continue;
-        TArray<FString> Args;
-        if (I == 2) Args = {TEXT("diff-tree"), TEXT("--root"), TEXT("--no-commit-id"), TEXT("-r"), TEXT("--raw"), TEXT("--no-ext-diff"), TEXT("--no-textconv"), TEXT("--no-abbrev"), TEXT("--no-renames"), TEXT("-z"), Trees[I], TEXT("--")};
-        else Args = {TEXT("diff"), TEXT("--raw"), TEXT("--no-ext-diff"), TEXT("--no-textconv"), TEXT("--no-abbrev"), TEXT("--no-renames"), TEXT("-z"), Parts[1], Trees[I], TEXT("--")};
-        const auto Diff = Git(Args); TArray<FIncomingChange> Changes; FString Error;
-        if (!Diff.Ok() || !ParseIncomingChanges(Diff.Out, Changes, Error)) return Fail(TEXT("Cannot inspect the complete stash paths. ") + Error + Diff.Error);
-        R.Text += FString(Headings[I]) + TEXT("\n");
-        if (Changes.IsEmpty()) R.Text += TEXT("(none)\n");
-        for (const auto& Change : Changes) R.Text += FString::Chr(Change.Status) + TEXT("  ") + StashDisplay(Change.Path) + TEXT("\n");
-        R.Text += TEXT("\n");
-    }
+    TArray<FString> Paths;
+    const auto Read = ReadStashPaths(R.Entry, Paths, &R.Text);
+    if (!Read.Ok()) return Fail(Read.Error);
     R.Text += TEXT("Apply and keep restores files and retains this stash. Apply and delete removes this entry only after a verified restore. Drop removes the entry without applying it. Locks stay held.\n");
     const auto After = ListStashesInternal();
     if (!After.bValid || After.Fingerprint != R.ListFingerprint) return Fail(TEXT("Stash list changed during inspection. Refresh and select it again."));

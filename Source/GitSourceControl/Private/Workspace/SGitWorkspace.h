@@ -31,6 +31,9 @@ struct FGitWorkspaceTaskResult
     bool bStashes = false, bStashReview = false;
     TWeakPtr<SWindow> StashConfirmationWindow;
     bool bDeleteStashAfterApply = false;
+    GitWorkspace::FUnlockReview UnlockReview;
+    TWeakPtr<SWindow> UnlockReviewWindow;
+    bool bUnlockReview = false;
     bool bRestart = false;
     bool bReload = false;
     bool bIncomingLfs = false;
@@ -59,6 +62,7 @@ private:
     friend class FGitStartupLockVerificationTest;
     friend class FGitIncomingLfsPanelTest;
     friend class FGitStashPanelTest;
+    friend class FGitUnlockReviewPanelTest;
     bool IsIdle() const { return !Pending.IsValid() && RestartFolder.IsEmpty() && !bReloading; }
     void Start(TFunction<FGitWorkspaceTaskResult()> Work);
     FReply Refresh();
@@ -101,6 +105,9 @@ private:
     FText IncomingLfsStatus() const;
     FText IncomingReportText() const;
     FReply ChangeLock(bool bUnlock);
+    FReply ShowUnlockReview();
+    FReply RefreshUnlockReview();
+    FReply RunUnlock();
     bool HasDirtyPackages() const;
     FText Inspector() const;
     void RebuildRows();
@@ -111,6 +118,9 @@ private:
     GitWorkspace::FRemoteSnapshot Remote;
     GitWorkspace::FIncomingLfsResult IncomingLfs;
     FString LockRemote = TEXT("origin");
+    GitWorkspace::FUnlockReview UnlockReview;
+    TWeakPtr<SWindow> UnlockWindow;
+    TSharedPtr<SMultiLineEditableTextBox> UnlockReport;
     TFuture<FGitWorkspaceTaskResult> Pending;
     TArray<TSharedPtr<FGitWorkspaceRow>> Rows;
     TSharedPtr<SListView<TSharedPtr<FGitWorkspaceRow>>> List;

@@ -201,7 +201,7 @@ FLockSnapshot FRepository::VerifyLocksInternal(const FString& Remote)
     { Out.Error = TEXT("Repository or endpoint changed during verification. Verify again."); Out.Locks.Empty(); return Out; }
     Out.bVerified = true; Out.VerifiedAt = FDateTime::UtcNow(); Out.VerifiedSeconds = FPlatformTime::Seconds(); return Out;
 }
-FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed)
+FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead)
 {
     FScopeLock Guard(&Mutex);
     if (!Reviewed.IsFresh() || !SafePath(Path)) return LockFailure(TEXT("Verify locks and review the selected path before continuing."));
@@ -211,41 +211,12 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
     const FLock* Lock = Current.Locks.Find(Path);
     if (bUnlock)
     {
-        const FString DropRecovery = StashDropRecovery();
-        if (!DropRecovery.IsEmpty()) return LockFailure(DropRecovery);
         const FLock* Old = Reviewed.Locks.Find(Path);
         if (!Lock || !Lock->bOurs || !Old || Old->Id != Lock->Id) return LockFailure(TEXT("Lock ownership or identity changed. Nothing unlocked."));
-        FString RecordError;
-        if (!ReadLockRecord(Current, *Lock, RecordError)) return LockFailure(RecordError);
         if (!bHandoffConfirmed) return LockFailure(TEXT("Confirm the team handoff before releasing this lock."));
-        const auto Status = RefreshInternal();
-        if (!Status.bValid || Status.bOperationInProgress || Status.HasConflicts()) return LockFailure(TEXT("Resolve repository state before unlocking."));
-        for (const auto& File : Status.Files)
-            if (File.Path == Path || File.OriginalPath == Path) return LockFailure(TEXT("Selected asset has working or staged changes. Keep its lock."));
-        const auto Stashes = Git({TEXT("stash"), TEXT("list"), TEXT("--format=%H")});
-        if (!Stashes.Ok() || !Stashes.Out.IsEmpty()) return LockFailure(TEXT("Stashes exist or cannot be checked. Review them externally before releasing locks."));
-        const auto UpstreamRemote = Git({TEXT("config"), TEXT("--get"), TEXT("branch.") + Status.Branch + TEXT(".remote")});
-        const auto Merge = Git({TEXT("config"), TEXT("--get"), TEXT("branch.") + Status.Branch + TEXT(".merge")});
-        const auto Upstream = Git({TEXT("rev-parse"), TEXT("--verify"), TEXT("@{upstream}")});
-        if (!UpstreamRemote.Ok() || UpstreamRemote.Text().TrimEnd() != Current.Remote || !Merge.Ok() || !Upstream.Ok() || Upstream.Text().TrimEnd() != Status.Head)
-            return LockFailure(TEXT("Unlock requires HEAD to match an upstream on the selected remote. Publish/reconcile your work first; no push is automatic."));
-        const FString Ref = Merge.Text().TrimEnd();
-        if (!Ref.StartsWith(TEXT("refs/heads/"))) return LockFailure(TEXT("Cannot identify an upstream branch for handoff."));
-        const auto RemoteHead = Git({TEXT("ls-remote"), TEXT("--exit-code"), TEXT("--refs"), TEXT("--"), Current.Remote, Ref});
-        if (!RemoteHead.Ok() || RemoteHead.Text().TrimEnd() != Status.Head + TEXT("\t") + Ref)
-            return LockFailure(TEXT("The live upstream does not match HEAD or cannot be verified. Keep the lock and refresh your branch externally."));
-        // Network checks may have taken time: recheck local state and endpoint before mutation.
-        const auto FinalStatus = RefreshInternal(); FLockSnapshot FinalContext;
-        if (!FinalStatus.bValid || FinalStatus.Head != Status.Head || FinalStatus.IndexEntries != Status.IndexEntries ||
-            FinalStatus.bOperationInProgress || !LockContext(Current.Remote, FinalContext) || FinalContext.Context != Current.Context)
-            return LockFailure(TEXT("Repository changed during handoff checks. Nothing unlocked."));
-        for (const auto& File : FinalStatus.Files)
-            if (File.Path == Path || File.OriginalPath == Path) return LockFailure(TEXT("Asset changed during handoff checks. Keep its lock."));
-        const FString FinalDropRecovery = StashDropRecovery();
-        if (!FinalDropRecovery.IsEmpty()) return LockFailure(FinalDropRecovery);
-        const auto FinalStashes = Git({TEXT("stash"), TEXT("list"), TEXT("--format=%H")});
-        if (!FinalStashes.Ok() || !FinalStashes.Out.IsEmpty()) return LockFailure(TEXT("Stash state changed during handoff checks. Keep the lock."));
-        if (!ReadLockRecord(Current, *Lock, RecordError)) return LockFailure(RecordError);
+        const auto Release = ReviewUnlockInternal(Current, Path, ReviewedHead);
+        if (!Release.IsFresh()) return LockFailure(Release.Error.IsEmpty() ? TEXT("Unlock review expired. Review again.") : Release.Error);
+        FString RecordError;
         // ID prevents releasing a replacement lock after a race; never use --force.
         auto Result = Lfs(Current.Remote, {TEXT("unlock"), TEXT("--json"), TEXT("--remote=") + Current.Remote, TEXT("--id=") + Lock->Id});
         if (!Result.Ok()) return LockFailure(TEXT("Unlock did not complete reliably. Verify before retrying. ") + Result.Error);

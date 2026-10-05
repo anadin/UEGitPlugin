@@ -110,6 +110,17 @@ struct FIncomingLfsResult
 
 struct FStashEntry { FString Oid, Selector, Label; };
 struct FStashList { TArray<FStashEntry> Entries; FString Error, Fingerprint; bool bValid = false; };
+struct FUnlockReview
+{
+    FLockSnapshot Locks;
+    FString Path, Head, StashFingerprint, Error;
+    TArray<FString> Checks;
+    TArray<FStashEntry> BlockingStashes;
+    int32 StashesChecked = 0;
+    bool bReady = false;
+    bool IsFresh() const { return bReady && Error.IsEmpty() && Locks.IsFresh(); }
+    FString Text() const;
+};
 struct FStashReview
 {
     FSnapshot Local;
@@ -145,7 +156,8 @@ public:
     FResult Commit(const FSnapshot& Reviewed, const FString& Message);
     FResult Diff(const FString& Path, bool bStaged);
     FLockSnapshot VerifyLocks(const FString& Remote);
-    FResult ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed = false);
+    FUnlockReview ReviewUnlock(const FString& Remote, const FString& Path);
+    FResult ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed = false, const FString& ReviewedHead = FString());
     FRemoteSnapshot Fetch();
     FResult Push(const FRemoteSnapshot& Reviewed);
     FResult Pull(const FRemoteSnapshot& Reviewed);
@@ -173,6 +185,8 @@ private:
 #endif
     FStashList ListStashesInternal();
     FStashInspection InspectStashInternal(const FString& Oid, const FString& Selector);
+    FResult ReadStashPaths(const FStashEntry& Entry, TArray<FString>& Paths, FString* Details = nullptr) const;
+    FUnlockReview ReviewUnlockInternal(const FLockSnapshot& Current, const FString& Path, const FString& ReviewedHead = FString());
     FString StashDropRecovery(FString* ReportPath = nullptr) const;
     FStashReview ReviewStashInternal(const FString& Oid, bool bRestoreIndex, bool bSelected = false, const TArray<FString>& Paths = {}, bool bIncludeUntracked = false);
     FResult CaptureUntrackedTree(const TArray<FString>& Paths) const;
