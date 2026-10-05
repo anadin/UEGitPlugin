@@ -568,7 +568,7 @@ bool FGitStashAssetReloadTest::RunTest(const FString&)
     TestFalse(TEXT("Material reverts in memory"), !!CastChecked<UMaterial>(F.Assets[1].Get())->TwoSided);
     TestFalse(TEXT("Texture reverts in memory"), !!CastChecked<UTexture2D>(F.Assets[2].Get())->SRGB);
     TestTrue(TEXT("Clean after create"), Repo.Refresh().Files.IsEmpty());
-    Result = GitWorkspace::StashAndReload(Repo, Repo.ReviewStash(Review.Oid), FString(), Lease);
+    Result = GitWorkspace::StashAndReload(Repo, Repo.ReviewStash(Repo.ListStashes().Entries[0].Oid), FString(), Lease);
     if (!TestTrue(TEXT("Apply and reload: ") + Result.Message, Result.bSuccess)) return false;
     TestEqual(TEXT("Three loaded assets reloaded on apply"), Result.Reloaded, 3);
     TestEqual(TEXT("Working Blueprint restored in memory"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 2")));
@@ -587,7 +587,7 @@ bool FGitStashAssetReloadTest::RunTest(const FString&)
     TestTrue(TEXT("Excluded material object retained"), ExcludedMaterial.IsValid() && ExcludedMaterial.Get() == F.Assets[1].Get());
     TestTrue(TEXT("Excluded texture object retained"), ExcludedTexture.IsValid() && ExcludedTexture.Get() == F.Assets[2].Get());
     for (int32 I = 1; I < 3; ++I) TestTrue(TEXT("Excluded loaded payload unchanged"), F.Bytes(F.Paths[I]) == WorkingBytes[I]);
-    const auto DisjointApply = Repo.ReviewStash(Selected.Oid);
+    const auto DisjointApply = Repo.ReviewStash(Repo.ListStashes().Entries[0].Oid);
     Result = GitWorkspace::StashAndReload(Repo, DisjointApply, FString(), Lease);
     if (!TestTrue(TEXT("Apply while unrelated assets remain changed: ") + Result.Message, Result.bSuccess)) return false;
     TestEqual(TEXT("Only applied Blueprint reloads"), Result.Reloaded, 1);
@@ -748,7 +748,7 @@ bool FGitStashNewAssetTest::RunTest(const FString&)
     TestFalse(TEXT("Saved file removed only after unload"), IFileManager::Get().FileExists(*Path));
     TArray<FAssetData> Entries; Registry.GetAssetsByPackageName(*PackageName, Entries, true);
     TestTrue(TEXT("Removed asset absent from Content Browser registry"), Entries.IsEmpty());
-    Result = GitWorkspace::StashAndReload(Repo, Repo.ReviewStash(Review.Oid), FString(), Lease);
+    Result = GitWorkspace::StashAndReload(Repo, Repo.ReviewStash(Repo.ListStashes().Entries[0].Oid), FString(), Lease);
     if (!TestTrue(TEXT("Apply restores new asset: ") + Result.Message, Result.bSuccess)) return false;
     TestTrue(TEXT("Exact hydrated bytes restored"), F.Bytes(TEXT("Content/BP_New.uasset")) == Saved);
     Registry.GetAssetsByPackageName(*PackageName, Entries, true);

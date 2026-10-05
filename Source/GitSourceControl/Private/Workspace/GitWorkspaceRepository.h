@@ -178,7 +178,7 @@ private:
     FResult CaptureUntrackedTree(const TArray<FString>& Paths) const;
     FResult CheckStashPaths(const TArray<FString>& Paths, bool bExisting) const;
     FResult UntrackedFingerprint(const TArray<FString>& Paths) const;
-    FResult MakeStashCommit(const FString& Tree, const TArray<FString>& Parents) const;
+    FResult MakeStashCommit(const FString& Tree, const TArray<FString>& Parents, const FString& Message = TEXT("Git Workspace snapshot")) const;
     FResult PrepareStashApply(FStashReview& Review) const;
 #if PLATFORM_MAC
     FResult RestoreStashPaths(const FStashReview& Review) const;

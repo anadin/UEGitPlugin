@@ -93,11 +93,11 @@ FResult FRepository::CaptureUntrackedTree(const TArray<FString>& Paths) const
     return Result;
 #endif
 }
-FResult FRepository::MakeStashCommit(const FString& Tree, const TArray<FString>& Parents) const
+FResult FRepository::MakeStashCommit(const FString& Tree, const TArray<FString>& Parents, const FString& Message) const
 {
     TArray<FString> Args {TEXT("-c"), TEXT("commit.gpgSign=false"), TEXT("commit-tree"), Tree};
     for (const auto& Parent : Parents) { Args.Add(TEXT("-p")); Args.Add(Parent); }
-    Args.Append({TEXT("-m"), TEXT("Git Workspace snapshot")});
+    Args.Append({TEXT("-m"), Message});
     return Git(Args);
 }
 }

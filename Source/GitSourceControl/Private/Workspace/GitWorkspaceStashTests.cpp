@@ -37,6 +37,8 @@ struct FStashFixture
         FFileHelper::SaveStringToFile(Value, *Full, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
     }
     FString Read(const FString& Path) { FString Value; FFileHelper::LoadFileToString(Value, *FPaths::Combine(Root, Path)); return Value; }
+    FString StoredOid() { const auto List = Repo.ListStashes(); return List.Entries.IsEmpty() ? FString() : List.Entries[0].Oid; }
+    FString Shape(const FString& Oid) { return Call({TEXT("show"), TEXT("--no-patch"), TEXT("--format=%T%n%P"), Oid, TEXT("--")}).Text(); }
     FString Marker() { FString Canonical, GitDir; GitWorkspaceSession::FindRepository(Root, Canonical, GitDir); return GitWorkspaceSession::RecoveryFile(GitDir); }
     bool Complete(const GitWorkspace::FStashReview& Review, FString& Error)
     {
@@ -67,11 +69,12 @@ bool FGitStashRoundtripTest::RunTest(const FString&)
     TestEqual(TEXT("Ignored preserved"), F.Read(TEXT("ignored.txt")), FString(TEXT("also keep\n")));
     const auto List = F.Repo.ListStashes();
     if (!TestTrue(TEXT("Named stash is listed"), List.bValid && List.Entries.Num() == 1)) return false;
-    TestEqual(TEXT("Immutable reviewed object stored"), List.Entries[0].Oid, Review.Oid);
+    TestEqual(TEXT("Named commit preserves exact reviewed tree and parents"), F.Shape(List.Entries[0].Oid), F.Shape(Review.Oid));
+    TestEqual(TEXT("Commit subject matches stash label"), F.Call({TEXT("log"), TEXT("-1"), TEXT("--format=%s"), List.Entries[0].Oid}).Text().TrimEnd(), List.Entries[0].Label);
     TestTrue(TEXT("Name listed"), List.Entries[0].Label.Contains(TEXT("Feature material pass")));
-    TestTrue(TEXT("Unrelated untracked work permits apply"), F.Repo.ReviewStash(Review.Oid).bValid);
+    TestTrue(TEXT("Unrelated untracked work permits apply"), F.Repo.ReviewStash(F.StoredOid()).bValid);
     IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT("untracked.txt")));
-    const auto Apply = F.Repo.ReviewStash(Review.Oid);
+    const auto Apply = F.Repo.ReviewStash(F.StoredOid());
     if (!TestTrue(TEXT("Apply exact staged/working versions"), F.Complete(Apply, Error))) { AddError(Error); return false; }
     TestEqual(TEXT("Work version restored"), F.Read(TEXT("README.md")), FString(TEXT("working\n")));
     TestEqual(TEXT("Index version restored"), F.Call({TEXT("show"), TEXT(":README.md")}).Text(), FString(TEXT("staged\n")));
@@ -79,10 +82,43 @@ bool FGitStashRoundtripTest::RunTest(const FString&)
     TestEqual(TEXT("Apply retains stash"), F.Repo.ListStashes().Entries.Num(), 1);
     TestFalse(TEXT("Recovery marker cleared"), IFileManager::Get().FileExists(*F.Marker()));
     F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")}); // Disposable fixture only.
-    const auto WithoutIndex = F.Repo.ReviewStash(Review.Oid, false);
+    const auto WithoutIndex = F.Repo.ReviewStash(F.StoredOid(), false);
     if (!TestTrue(TEXT("Apply without restoring staging"), F.Complete(WithoutIndex, Error))) { AddError(Error); return false; }
     TestTrue(TEXT("Index remains at base"), F.Call({TEXT("diff"), TEXT("--cached"), TEXT("--quiet")}).Ok());
     TestEqual(TEXT("Working content still restored"), F.Read(TEXT("README.md")), FString(TEXT("working\n")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashNamesTest, "GitWorkspace.Stash.NamesMatchGitClients", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashNamesTest::RunTest(const FString&)
+{
+    FStashFixture F;
+    TArray<FString> SavedOids, SavedNames;
+    for (bool bSelected : {false, true}) for (bool bUntracked : {false, true})
+    {
+        F.Write(TEXT("README.md"), TEXT("staged version\n")); F.Call({TEXT("add"), TEXT("README.md")});
+        F.Write(TEXT("README.md"), TEXT("working version\n"));
+        TArray<FString> Paths {TEXT("README.md")};
+        if (bUntracked) { F.Write(TEXT("Docs/new.md"), TEXT("new work\n")); Paths.Add(TEXT("Docs/new.md")); }
+        const FString Name = FString::Printf(TEXT("Material é [v%d] \"copper\" $(literal);"), SavedNames.Num());
+        const auto Review = bSelected ? F.Repo.ReviewSelectedStash(Paths, bUntracked) : F.Repo.ReviewStash(FString(), true, bUntracked);
+        if (!TestTrue(TEXT("Named snapshot review: ") + Review.Error, Review.IsFresh())) return false;
+        const auto Result = F.Repo.ExecuteStash(Review, Name, F.Lease);
+        if (!TestTrue(TEXT("Named snapshot creation: ") + Result.Error, Result.Ok())) return false;
+        const FString Oid = F.StoredOid(); SavedOids.Add(Oid); SavedNames.Add(Name);
+        TestEqual(TEXT("Only snapshot metadata changes"), F.Shape(Oid), F.Shape(Review.Oid));
+        TestEqual(TEXT("Commit message is the literal entered name"), F.Call({TEXT("show"), TEXT("--no-patch"), TEXT("--format=%B"), Oid}).Text().TrimEnd(), Name);
+        FString MarkerText; FFileHelper::LoadFileToString(MarkerText, *F.Marker());
+        TestTrue(TEXT("Recovery points to the named snapshot"), MarkerText.Contains(TEXT("Preserved stash object: ") + Oid));
+        TestTrue(TEXT("Named create completes"), F.Repo.CompleteStash(Review, F.Lease).Ok());
+        const auto List = F.Repo.ListStashes();
+        TestEqual(TEXT("Previous named stashes retained"), List.Entries.Num(), SavedOids.Num());
+        for (int32 I = 0; I < List.Entries.Num(); ++I)
+        {
+            const int32 Saved = SavedOids.Num() - I - 1;
+            TestEqual(TEXT("Prior stash identity preserved"), List.Entries[I].Oid, SavedOids[Saved]);
+            TestEqual(TEXT("Reflog name matches commit message"), List.Entries[I].Label, SavedNames[Saved]);
+        }
+    }
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashGuardsTest, "GitWorkspace.Stash.StaleUnsupportedAndRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -114,7 +150,7 @@ bool FGitStashGuardsTest::RunTest(const FString&)
     F.Write(TEXT("README.md"), TEXT("unexpected postflight work\n"));
     TestFalse(TEXT("Uncertain completion fails"), F.Repo.CompleteStash(Review, F.Lease).Ok());
     TestTrue(TEXT("Recovery retained"), IFileManager::Get().FileExists(*F.Marker()));
-    TestEqual(TEXT("Stash retained"), F.Repo.ListStashes().Entries[0].Oid, Review.Oid);
+    TestEqual(TEXT("Named stash retained with reviewed tree and parents"), F.Shape(F.StoredOid()), F.Shape(Review.Oid));
     TestEqual(TEXT("No automatic rollback"), F.Read(TEXT("README.md")), FString(TEXT("unexpected postflight work\n")));
     return true;
 }
@@ -130,8 +166,9 @@ bool FGitStashLfsTest::RunTest(const FString&)
     F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
     const auto Review = F.Repo.ReviewStash();
     if (!TestTrue(TEXT("Create LFS stash: ") + Review.Error, F.Complete(Review, Error))) { AddError(Error); return false; }
+    const FString SavedOid = F.StoredOid();
     TestEqual(TEXT("Cleanup hydrates baseline despite skip config"), F.Read(TEXT("Content/Probe.uasset")), FString(TEXT("base payload\n")));
-    const auto Apply = F.Repo.ReviewStash(Review.Oid);
+    const auto Apply = F.Repo.ReviewStash(F.StoredOid());
     if (!TestTrue(TEXT("Apply LFS stash"), F.Complete(Apply, Error))) { AddError(Error); return false; }
     TestEqual(TEXT("Hydrates saved working version, not staged version"), F.Read(TEXT("Content/Probe.uasset")), FString(TEXT("working payload\n")));
     TestTrue(TEXT("LFS index keeps distinct staged version"), F.Repo.Refresh().IndexEntries == Index);
@@ -141,7 +178,7 @@ bool FGitStashLfsTest::RunTest(const FString&)
     const auto ThreeParents = F.Repo.ListStashes();
     TestFalse(TEXT("External stash with untracked parent blocked"), F.Repo.ReviewStash(ThreeParents.Entries[0].Oid).bValid);
     F.Write(TEXT("README.md"), TEXT("new base\n")); F.Call({TEXT("add"), TEXT("README.md")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("different base")});
-    TestFalse(TEXT("Cross-commit stash apply blocked"), F.Repo.ReviewStash(Review.Oid).bValid);
+    TestFalse(TEXT("Cross-commit stash apply blocked"), F.Repo.ReviewStash(SavedOid).bValid);
     return true;
 }
 
@@ -277,10 +314,10 @@ bool FGitSelectedStashTest::RunTest(const FString&)
     TestEqual(TEXT("Excluded working version preserved"), F.Read(TEXT("Source/Keep.cpp")), FString(TEXT("excluded working\n")));
     TestEqual(TEXT("Untracked preserved"), F.Read(TEXT("untracked.txt")), FString(TEXT("untracked keep\n")));
     TestEqual(TEXT("Ignored preserved"), F.Read(TEXT("ignored.txt")), FString(TEXT("ignored keep\n")));
-    TestEqual(TEXT("Exact reviewed stash stored"), F.Repo.ListStashes().Entries[0].Oid, Review.Oid);
+    TestEqual(TEXT("Exact reviewed stash trees and parents stored"), F.Shape(F.StoredOid()), F.Shape(Review.Oid));
     // Resolve excluded work only in this disposable fixture before testing Apply.
     F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")}); IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT("untracked.txt")));
-    if (!TestTrue(TEXT("Apply selected-only snapshot"), F.Complete(F.Repo.ReviewStash(Review.Oid), Error))) { AddError(Error); return false; }
+    if (!TestTrue(TEXT("Apply selected-only snapshot"), F.Complete(F.Repo.ReviewStash(F.StoredOid()), Error))) { AddError(Error); return false; }
     TestEqual(TEXT("Selected staged version restored"), F.Call({TEXT("show"), TEXT(":README.md")}).Text(), FString(TEXT("selected index\n")));
     TestEqual(TEXT("Selected working version restored"), F.Read(TEXT("README.md")), FString(TEXT("selected working\n")));
     TestEqual(TEXT("Unselected source not reapplied"), F.Read(TEXT("Source/Keep.cpp")), FString(TEXT("source baseline\n")));
@@ -313,7 +350,9 @@ bool FGitSelectedStashGuardTest::RunTest(const FString&)
     TestFalse(TEXT("Unselected postflight change is detected"), F.Repo.CompleteStash(Review, F.Lease).Ok());
     TestTrue(TEXT("Recovery marker retained"), IFileManager::Get().FileExists(*F.Marker()));
     TestEqual(TEXT("Unexpected work preserved without rollback"), F.Read(TEXT("Docs/keep.txt")), FString(TEXT("unexpected change after cleanup\n")));
-    TestEqual(TEXT("Selected stash retained for recovery"), F.Repo.ListStashes().Entries[0].Oid, Review.Oid);
+    TestEqual(TEXT("Selected snapshot retained for recovery"), F.Shape(F.StoredOid()), F.Shape(Review.Oid));
+    FString MarkerText; FFileHelper::LoadFileToString(MarkerText, *F.Marker());
+    TestTrue(TEXT("Recovery identifies the final named object"), MarkerText.Contains(TEXT("Preserved stash object: ") + F.StoredOid()));
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSelectedStashLfsTest, "GitWorkspace.Stash.SelectedLfsPreservesExcludedVersions", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -368,12 +407,12 @@ bool FGitStashUntrackedTest::RunTest(const FString&)
     // A new ignore rule can hide a collision from ordinary status. Keep it out
     // of repository configuration so review reflects only the collision test.
     F.Write(TEXT(".git/info/exclude"), TEXT("Content/\n")); F.Write(Asset, TEXT("ignored local collision\n"));
-    const auto Collision = F.Repo.ReviewStash(Review.Oid);
+    const auto Collision = F.Repo.ReviewStash(F.StoredOid());
     TestTrue(TEXT("Ignored collision absent from ordinary status"), Collision.IsFresh());
     TestFalse(TEXT("Apply refuses ignored collision"), F.Repo.ExecuteStash(Collision, FString(), F.Lease).Ok());
     TestEqual(TEXT("Ignored collision intact"), F.Read(Asset), FString(TEXT("ignored local collision\n")));
     IFileManager::Get().Delete(*FPaths::Combine(F.Root, Asset), true, true); F.Write(TEXT(".git/info/exclude"), TEXT(""));
-    const auto Apply = F.Repo.ReviewStash(Review.Oid);
+    const auto Apply = F.Repo.ReviewStash(F.StoredOid());
     if (!TestTrue(TEXT("Apply untracked stash: ") + Apply.Error, F.Complete(Apply, Error))) { AddError(Error); return false; }
     TestEqual(TEXT("Hydrated working bytes restored despite skip-smudge"), F.Read(Asset), FString(TEXT("newer bytes\n")));
     TestEqual(TEXT("Literal documentation path restored"), F.Read(Doc), FString(TEXT("new document\n")));
@@ -395,6 +434,7 @@ bool FGitStashNewSelectionTest::RunTest(const FString&)
     const auto Review = F.Repo.ReviewSelectedStash({TEXT("Content/Staged.uasset"), TEXT("Docs/selected.md")}, true);
     if (!TestTrue(TEXT("Review mixed selected new files: ") + Review.Error, Review.IsFresh())) return false;
     if (!TestTrue(TEXT("Create mixed selected stash"), F.Complete(Review, Error))) { AddError(Error); return false; }
+    const FString SelectedOid = F.StoredOid();
     TestEqual(TEXT("Unselected untracked bytes preserved"), F.Read(TEXT("Docs/excluded.md")), FString(TEXT("excluded new file\n")));
     TestEqual(TEXT("Unselected tracked bytes preserved"), F.Read(TEXT("README.md")), FString(TEXT("unselected tracked edit\n")));
     TestFalse(TEXT("Selected staged asset removed"), IFileManager::Get().FileExists(*FPaths::Combine(F.Root, TEXT("Content/Staged.uasset"))));
@@ -403,7 +443,7 @@ bool FGitStashNewSelectionTest::RunTest(const FString&)
     // clean original base, just as the user can do through the same workflow.
     const auto Rest = F.Repo.ReviewStash(FString(), true, true);
     if (!TestTrue(TEXT("Preserve remaining work"), F.Complete(Rest, Error))) { AddError(Error); return false; }
-    const auto Apply = F.Repo.ReviewStash(Review.Oid);
+    const auto Apply = F.Repo.ReviewStash(SelectedOid);
     if (!TestTrue(TEXT("Apply mixed selected stash"), F.Complete(Apply, Error))) { AddError(Error); return false; }
     TestEqual(TEXT("New asset working version restored"), F.Read(TEXT("Content/Staged.uasset")), FString(TEXT("working new asset\n")));
     TestEqual(TEXT("New asset staged version restored separately"), F.Call({TEXT("show"), TEXT(":Content/Staged.uasset")}).Text(), FString(TEXT("staged new asset\n")));
@@ -420,14 +460,14 @@ bool FGitStashUntrackedPathTest::RunTest(const FString&)
     if (!TestTrue(TEXT("Capture for collision tests"), F.Complete(Review, Error))) { AddError(Error); return false; }
     F.Write(TEXT(".git/info/exclude"), TEXT("Docs\n"));
     IFileManager::Get().MakeDirectory(*FPaths::Combine(F.Root, TEXT("Docs/new.md")), true);
-    auto Apply = F.Repo.ReviewStash(Review.Oid);
+    auto Apply = F.Repo.ReviewStash(F.StoredOid());
     TestTrue(TEXT("Ignored directory hidden from ordinary status"), Apply.IsFresh());
     TestFalse(TEXT("Ignored directory collision blocks apply"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
     IFileManager::Get().DeleteDirectory(*FPaths::Combine(F.Root, TEXT("Docs")), false, true);
     F.Write(TEXT("ignored.txt"), TEXT("outside target remains\n"));
     const auto Link = GitWorkspace::Run(TEXT("/bin/ln"), F.Root, {TEXT("-s"), TEXT("."), TEXT("Docs")});
     if (!TestTrue(TEXT("Make ignored ancestor symlink fixture"), Link.Ok())) return false;
-    Apply = F.Repo.ReviewStash(Review.Oid);
+    Apply = F.Repo.ReviewStash(F.StoredOid());
     TestTrue(TEXT("Ignored symlink hidden from ordinary status"), Apply.IsFresh());
     TestFalse(TEXT("Symlink ancestor blocks apply before mutation"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
     TestFalse(TEXT("No redirected write"), IFileManager::Get().FileExists(*FPaths::Combine(F.Root, TEXT("new.md"))));
@@ -466,7 +506,7 @@ bool FGitStashDisjointApplyTest::RunTest(const FString&)
         F.Write(TEXT("Docs/local.md"), TEXT("unrelated untracked\n")); F.Write(TEXT("ignored.txt"), TEXT("unrelated ignored\n"));
         F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
         const auto Before = F.Repo.Refresh();
-        const auto Apply = F.Repo.ReviewStash(Create.Oid, bRestoreIndex);
+        const auto Apply = F.Repo.ReviewStash(F.StoredOid(), bRestoreIndex);
         if (!TestTrue(TEXT("Disjoint Apply review: ") + Apply.Error, Apply.IsFresh())) return false;
         TestTrue(TEXT("Review explicitly lists preserved local files"), Apply.Text.Contains(TEXT("LOCAL CHANGES KEPT IN PLACE")) && Apply.Text.Contains(TEXT("Content/Keep.uasset")));
         TestTrue(TEXT("Review leaves real staging untouched"), F.Repo.Refresh().IndexEntries == Before.IndexEntries);
@@ -493,29 +533,29 @@ bool FGitStashApplyOverlapTest::RunTest(const FString&)
     F.Write(TEXT("README.md"), TEXT("saved changes\n")); auto Create = F.Repo.ReviewStash();
     if (!TestTrue(TEXT("Preserve stash"), F.Complete(Create, Error))) { AddError(Error); return false; }
     F.Write(TEXT("README.md"), TEXT("local overlap\n"));
-    auto Apply = F.Repo.ReviewStash(Create.Oid);
+    auto Apply = F.Repo.ReviewStash(F.StoredOid());
     TestFalse(TEXT("Working overlap blocked"), Apply.IsFresh());
     TestTrue(TEXT("Overlap identifies file"), Apply.Error.Contains(TEXT("README.md")) && Apply.Error.Contains(TEXT("overlaps")));
     F.Call({TEXT("add"), TEXT("README.md")}); F.Write(TEXT("README.md"), TEXT("base\n"));
-    TestFalse(TEXT("Staged overlap blocked even when work equals base"), F.Repo.ReviewStash(Create.Oid).IsFresh());
+    TestFalse(TEXT("Staged overlap blocked even when work equals base"), F.Repo.ReviewStash(F.StoredOid()).IsFresh());
     F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")});
     F.Call({TEXT("mv"), TEXT("README.md"), TEXT("Docs.md")});
-    TestFalse(TEXT("Rename original path overlap blocked"), F.Repo.ReviewStash(Create.Oid).IsFresh());
+    TestFalse(TEXT("Rename original path overlap blocked"), F.Repo.ReviewStash(F.StoredOid()).IsFresh());
     F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")});
     F.Write(TEXT("Docs/Keep.md"), TEXT("local staged\n")); F.Call({TEXT("add"), TEXT("Docs/Keep.md")}); F.Write(TEXT("Docs/Keep.md"), TEXT("local working\n"));
     F.Write(TEXT("Docs/local.md"), TEXT("untracked one\n"));
-    Apply = F.Repo.ReviewStash(Create.Oid);
+    Apply = F.Repo.ReviewStash(F.StoredOid());
     if (!TestTrue(TEXT("Disjoint review ready"), Apply.IsFresh())) { AddError(Apply.Error); return false; }
     const auto Index = F.Repo.Refresh().IndexEntries;
     F.Write(TEXT("Docs/local.md"), TEXT("untracked two\n"));
     TestFalse(TEXT("Changed unrelated untracked bytes invalidate review"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
     TestTrue(TEXT("Refusal preserves staging"), F.Repo.Refresh().IndexEntries == Index);
     TestEqual(TEXT("Refusal leaves target file alone"), F.Read(TEXT("README.md")), FString(TEXT("base\n")));
-    Apply = F.Repo.ReviewStash(Create.Oid); auto Forged = Apply; Forged.ApplyWorkingPaths.Add(TEXT("Docs/Keep.md"));
+    Apply = F.Repo.ReviewStash(F.StoredOid()); auto Forged = Apply; Forged.ApplyWorkingPaths.Add(TEXT("Docs/Keep.md"));
     TestFalse(TEXT("Forged restoration scope refused"), F.Repo.ExecuteStash(Forged, FString(), F.Lease).Ok());
     F.Write(TEXT("Docs/Keep.md"), TEXT("changed after preview\n"));
     TestFalse(TEXT("Changed unrelated tracked version invalidates review"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
-    Apply = F.Repo.ReviewStash(Create.Oid);
+    Apply = F.Repo.ReviewStash(F.StoredOid());
     auto Executed = F.Repo.ExecuteStash(Apply, FString(), F.Lease);
     if (!TestTrue(TEXT("Disjoint execute succeeds: ") + Executed.Error, Executed.Ok())) return false;
     F.Write(TEXT("Docs/local.md"), TEXT("external edit after execution\n"));
@@ -533,12 +573,12 @@ bool FGitStashApplyPathOverlapTest::RunTest(const FString&)
     const auto Create = F.Repo.ReviewStash(FString(), true, true);
     if (!TestTrue(TEXT("Preserve new file stash"), F.Complete(Create, Error))) { AddError(Error); return false; }
     F.Write(TEXT("Docs/New.md/child.txt"), TEXT("local child\n"));
-    auto Apply = F.Repo.ReviewStash(Create.Oid);
+    auto Apply = F.Repo.ReviewStash(F.StoredOid());
     TestFalse(TEXT("Directory replacement overlaps local child"), Apply.IsFresh());
     TestTrue(TEXT("Directory overlap explained"), Apply.Error.Contains(TEXT("overlaps")));
     IFileManager::Get().DeleteDirectory(*FPaths::Combine(F.Root, TEXT("Docs/New.md")), false, true);
     F.Write(TEXT("Docs/new.md"), TEXT("case variant\n"));
-    Apply = F.Repo.ReviewStash(Create.Oid);
+    Apply = F.Repo.ReviewStash(F.StoredOid());
     TestFalse(TEXT("Case variant overlap blocked"), Apply.IsFresh());
     TestTrue(TEXT("Case overlap explained"), Apply.Error.Contains(TEXT("overlaps")));
     TestEqual(TEXT("Case variant remains intact"), F.Read(TEXT("Docs/new.md")), FString(TEXT("case variant\n")));

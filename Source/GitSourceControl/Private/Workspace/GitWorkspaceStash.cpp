@@ -114,7 +114,8 @@ FStashReview FRepository::ReviewStashInternal(const FString& Oid, bool bRestoreI
     if (R.bCreate)
     {
         // Creates immutable Git objects only: does not update refs, index or
-        // working files. Storing this exact object precedes any cleanup.
+        // working files. Execution gives the final commit its user-facing name
+        // while preserving this exact tree and parent structure before cleanup.
         const auto Captured = Git({TEXT("stash"), TEXT("create")});
         if (!Captured.Ok()) return Fail(Captured.Error);
         R.Oid = Captured.Text().TrimEnd();
@@ -349,16 +350,37 @@ FResult FRepository::ExecuteStash(const FStashReview& Reviewed, const FString& N
     }
     const auto Rechecked = ReviewStashInternal(Reviewed.bCreate ? FString() : Reviewed.Oid, Reviewed.bRestoreIndex, Reviewed.bSelected, Reviewed.SelectedPaths, Reviewed.bIncludeUntracked);
     if (!Rechecked.bValid || Rechecked.Fingerprint != Reviewed.Fingerprint) return StashFailure(TEXT("Local work changed during LFS verification; review again."));
+    FString StoredOid = Reviewed.Oid;
+    const FString StashName = Name.TrimStartAndEnd();
+    if (Reviewed.bCreate)
+    {
+        // Git clients may display either the commit subject or the reflog
+        // subject. Finalize both with the supplied name, without recapturing
+        // any files or changing the reviewed index/untracked parents.
+        TArray<FString> Parents {Reviewed.Base, Reviewed.IndexCommit};
+        if (!Reviewed.UntrackedCommit.IsEmpty()) Parents.Add(Reviewed.UntrackedCommit);
+        const auto Named = MakeStashCommit(Reviewed.WorkingTree, Parents, StashName);
+        if (!Named.Ok()) return Named;
+        StoredOid = Named.Text().TrimEnd();
+        if (!ObjectId(StoredOid)) return StashFailure(TEXT("Cannot identify the named stash snapshot."));
+        const auto OriginalShape = Git({TEXT("show"), TEXT("--no-patch"), TEXT("--format=%T%n%P"), Reviewed.Oid, TEXT("--")});
+        const auto NamedShape = Git({TEXT("show"), TEXT("--no-patch"), TEXT("--format=%T%n%P"), StoredOid, TEXT("--")});
+        if (!OriginalShape.Ok() || !NamedShape.Ok() || OriginalShape.Out != NamedShape.Out)
+            return StashFailure(TEXT("Named stash differs from the reviewed snapshot."));
+    }
     IFileManager::Get().MakeDirectory(*FPaths::GetPath(Recovery), true);
     const FString Marker = TEXT("Git Workspace stash operation requires recovery.\nKeep the editor closed. No automatic rollback.\nRepository: ") + Root +
-        TEXT("\nOriginal HEAD: ") + Reviewed.Local.Head + TEXT("\nPreserved stash object: ") + Reviewed.Oid +
+        TEXT("\nOriginal HEAD: ") + Reviewed.Local.Head + TEXT("\nPreserved stash object: ") + StoredOid +
         TEXT("\nOperation: ") + (Reviewed.bCreate ? TEXT("create") : TEXT("apply")) + TEXT("\nInspect status, index and working files. The stash is never automatically dropped. Preserve unexpected work and verify LFS hydration before removing this marker.\n");
     if (!FFileHelper::SaveStringToFile(Marker, *Recovery, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)) return StashFailure(TEXT("Cannot persist stash recovery state."));
     FResult Changed;
     if (Reviewed.bCreate)
     {
-        const auto Stored = Git({TEXT("stash"), TEXT("store"), TEXT("-m"), Name, Reviewed.Oid});
+        const auto Stored = Git({TEXT("stash"), TEXT("store"), TEXT("-m"), StashName, StoredOid});
         if (!Stored.Ok()) return Stored;
+        const auto StoredRef = Git({TEXT("rev-parse"), TEXT("--verify"), TEXT("refs/stash")});
+        if (!StoredRef.Ok() || StoredRef.Text().TrimEnd() != StoredOid)
+            return StashFailure(TEXT("The stash list changed while storing the snapshot. No cleanup started; inspect recovery state."));
         const FString PathFile = FPaths::Combine(FPlatformProcess::UserTempDir(), TEXT("uegit-stash-paths-") + FGuid::NewGuid().ToString(EGuidFormats::Digits));
         ON_SCOPE_EXIT { IFileManager::Get().Delete(*PathFile); };
         TArray<uint8> Bytes;
