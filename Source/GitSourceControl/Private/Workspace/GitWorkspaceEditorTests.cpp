@@ -30,6 +30,7 @@
 #include "Materials/MaterialInstanceConstant.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
+#include "Widgets/Input/SEditableTextBox.h"
 
 namespace
 {
@@ -609,24 +610,28 @@ bool FGitStashPanelTest::RunTest(const FString&)
     auto Panel = SNew(SGitWorkspace).Repository(Repo);
     auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
     Settle(); const auto Before = Repo->Refresh();
+    const auto WorkingBefore = F.Bytes(TEXT("README.md"));
     Panel->ShowStashes(); Settle();
     TestTrue(TEXT("Empty stash list visible"), Panel->Stashes.bValid && Panel->Stashes.Entries.IsEmpty());
     TestFalse(TEXT("Empty selection cannot create a stash"), Panel->CanRunStashAction());
-    TestTrue(TEXT("Initial action explains review instead of offering Apply"), Panel->StashActionText().ToString().Contains(TEXT("Review selected")));
+    TestEqual(TEXT("Initial action is Create stash"), Panel->StashActionText().ToString(), FString(TEXT("Create stash…")));
     TestEqual(TEXT("Content checklist shows new file directly"), Panel->StashFileItems.Num(), 1);
     Panel->SetStashPathChecked(TEXT("Content/New.uasset"), true);
     TestTrue(TEXT("Untracked check requires opt-in"), Panel->StashSelectedPaths.IsEmpty());
     Panel->SetStashIncludeUntracked(true); Panel->SetStashPathChecked(TEXT("Content/New.uasset"), true);
     TestEqual(TEXT("Check files inside Stashes without selecting Changes rows"), Panel->StashSelectedPaths.Num(), 1);
-    TestTrue(TEXT("Changed selection offers a usable review action"), Panel->CanRunStashAction());
-    TestTrue(TEXT("Selection alone is explicitly not a stash"), Panel->StashActionHint().ToString().Contains(TEXT("does not stash")));
+    TestTrue(TEXT("Changed selection offers Create"), Panel->CanRunStashAction());
+    TestTrue(TEXT("Missing name is explained visibly"), Panel->StashActionHint().ToString().Contains(TEXT("Enter a stash name")));
     Panel->RunStashAction(); Settle();
+    TestTrue(TEXT("Create requests a name before preparation"), !Panel->StashReview.IsFresh() && Panel->Feedback.Contains(TEXT("Enter a name")));
+    Panel->StashName->SetText(FText::FromString(TEXT("Panel stash")));
+    Panel->PreviewStash(FString(), FString(), true); Settle();
     TestTrue(TEXT("Checklist drives exact new-file preview"), Panel->StashReview.IsFresh() && Panel->StashReview.UntrackedPaths == TArray<FString>{TEXT("Content/New.uasset")});
     TestTrue(TEXT("Fresh create action explains confirmation"), Panel->StashActionHint().ToString().Contains(TEXT("Yes/No")));
     Panel->StashReview.ReviewedSeconds -= 301;
-    TestTrue(TEXT("Expired Create remains actionable as review"), Panel->CanRunStashAction() && Panel->StashActionText().ToString().Contains(TEXT("Review")));
-    TestTrue(TEXT("Expiry is explained visibly"), Panel->StashActionHint().ToString().Contains(TEXT("expired")));
-    Panel->RunStashAction(); Settle();
+    TestTrue(TEXT("Expired Create retains its action label"), Panel->CanRunStashAction() && Panel->StashActionText().ToString() == TEXT("Create stash…"));
+    TestTrue(TEXT("Create explains automatic checks and confirmation"), Panel->StashActionHint().ToString().Contains(TEXT("checks the files")));
+    Panel->PreviewStash(FString(), FString(), true); Settle();
     TestTrue(TEXT("Expired action refreshes only the selected scope"), Panel->StashReview.IsFresh() && Panel->StashReview.bSelected && Panel->StashReview.SelectedPaths == TArray<FString>{TEXT("Content/New.uasset")});
     TestTrue(TEXT("Refreshing action does not create a stash"), Repo->ListStashes().Entries.IsEmpty());
     Panel->StashFileFilter = TEXT("nothing matches"); Panel->RebuildStashFiles();
@@ -637,14 +642,31 @@ bool FGitStashPanelTest::RunTest(const FString&)
     Panel->StashFileFilter.Empty(); Panel->bStashContentOnly = false; Panel->RebuildStashFiles();
     TestEqual(TEXT("Whole repo checklist exposes document and asset"), Panel->StashFileItems.Num(), 2);
     Panel->SetStashPathChecked(TEXT("README.md"), true);
-    Panel->PreviewStash(FString(), FString(), true); Settle();
+    // Unattended dialogs explicitly default to No. Verify one Create click
+    // reaches confirmation, while rejection leaves the checkout untouched.
+    {
+        TGuardValue<bool> Unattended(GIsRunningUnattendedScript, true);
+        Panel->RunStashAction(); Settle();
+        TestEqual(TEXT("One Create click prepares and reaches confirmation"), Panel->Feedback, FString(TEXT("Stash creation cancelled. No files changed.")));
+        Panel->StashReview.ReviewedSeconds -= 301;
+        Panel->Feedback.Empty(); Panel->RunStashAction(); Settle();
+        TestEqual(TEXT("Expired Create refreshes and reaches confirmation in one click"), Panel->Feedback, FString(TEXT("Stash creation cancelled. No files changed.")));
+    }
+    TestTrue(TEXT("Declining confirmation creates no stash"), Repo->ListStashes().Entries.IsEmpty());
+    TestTrue(TEXT("Declining confirmation keeps working bytes"), F.Bytes(TEXT("README.md")) == WorkingBefore);
     TestTrue(TEXT("Tracked selection works inside window"), Panel->StashReview.IsFresh() && Panel->StashReview.SelectedPaths == TArray<FString>{TEXT("README.md")});
     Panel->SetStashPathChecked(TEXT("README.md"), false);
     TestFalse(TEXT("Unchecking invalidates old Create preview"), Panel->StashReview.IsFresh());
     Panel->PreviewStash(FString()); Settle();
     TestTrue(TEXT("Panel offers reviewed creation: ") + Panel->Feedback, Panel->StashReview.IsFresh());
-    Panel->StashReview.ReviewedSeconds -= 301; Panel->RunStashAction(); Settle();
+    Panel->StashReview.ReviewedSeconds -= 301;
+    {
+        TGuardValue<bool> Unattended(GIsRunningUnattendedScript, true);
+        Panel->Feedback.Empty(); Panel->RunStashAction(); Settle();
+        TestEqual(TEXT("Whole-repo Create reaches confirmation after refresh"), Panel->Feedback, FString(TEXT("Stash creation cancelled. No files changed.")));
+    }
     TestTrue(TEXT("Explicit whole-repository review retains its scope on refresh"), Panel->StashReview.IsFresh() && !Panel->StashReview.bSelected);
+    Panel->PreviewStash(FString()); Settle();
     TestTrue(TEXT("Review labels whole repository scope"), Panel->StashReport->GetText().ToString().Contains(TEXT("WHOLE REPOSITORY")));
     TestTrue(TEXT("Preview lists exact path"), Panel->StashReport->GetText().ToString().Contains(TEXT("README.md")));
     TestEqual(TEXT("Preview preserves HEAD"), Repo->Refresh().Head, Before.Head);

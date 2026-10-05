@@ -307,6 +307,13 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
             }
         }
         if (IncomingWindow.IsValid() && IncomingReport) IncomingReport->SetText(IncomingReportText());
+        // Create prepares its review asynchronously, then presents the exact
+        // paths for confirmation in the same window that requested the action.
+        if (auto Window = Result.StashConfirmationWindow.Pin(); Window && Window == StashWindow.Pin() && Window->IsVisible() && StashReview.bCreate && StashReview.IsFresh())
+        {
+            RunStash();
+            return;
+        }
         // Publish local status before starting the network query. Opening a tab
         // schedules one read-only check; failure must not cause a retry loop.
         if (bVerifyLocksOnOpen)

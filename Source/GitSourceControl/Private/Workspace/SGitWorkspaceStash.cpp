@@ -14,6 +14,7 @@
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Misc/MessageDialog.h"
+#include "Misc/App.h"
 #include "Misc/ScopedSlowTask.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
@@ -100,16 +101,18 @@ void SGitWorkspace::RebuildStashes()
                 .OnClicked_Lambda([Weak, Oid, Selector] { if (auto P = Weak.Pin()) return P->PreviewStash(Oid, Selector); return FReply::Handled(); })];
     }
 }
-FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector, bool bSelected)
+FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector, bool bSelected, bool bConfirmCreate)
 {
     if (!IsIdle()) return FReply::Handled();
     StashReview.bValid = false; StashInspection.bValid = false;
     if (StashReport) StashReport->SetText(StashText(TEXT("Reviewing stash and local work…")));
     auto Repo = Repository; const bool bIndex = bRestoreStashIndex, bUntracked = bIncludeUntrackedStash;
     const auto Paths = StashSelectedPaths;
-    Start([Repo, Oid, Selector, bIndex, bSelected, bUntracked, Paths]
+    const auto ConfirmationWindow = bConfirmCreate && Oid.IsEmpty() ? StashWindow : TWeakPtr<SWindow>();
+    Start([Repo, Oid, Selector, bIndex, bSelected, bUntracked, Paths, ConfirmationWindow]
     {
         FGitWorkspaceTaskResult R; R.bStashReview = true;
+        R.StashConfirmationWindow = ConfirmationWindow;
         if (!Oid.IsEmpty()) R.StashInspection = Repo->InspectStash(Oid, Selector);
         R.StashReview = bSelected ? Repo->ReviewSelectedStash(Paths, bUntracked) : Repo->ReviewStash(Oid, bIndex, bUntracked); R.Snapshot = Repo->Refresh();
         R.Message = R.StashReview.bValid || R.StashInspection.bValid ? TEXT("Stash preview ready. Review the saved paths and action eligibility.") : R.StashReview.Error;
@@ -127,7 +130,7 @@ bool SGitWorkspace::CanRunStashAction() const
 FText SGitWorkspace::StashActionText() const
 {
     if (StashReview.bCreate)
-        return StashText(StashReview.IsFresh() ? TEXT("Create stash…") : StashReview.bSelected ? TEXT("Review selected to create…") : TEXT("Review again to create…"));
+        return StashText(TEXT("Create stash…"));
     return StashText(StashReview.IsFresh() && StashInspection.IsFresh() ? TEXT("Apply stash…") : TEXT("Review again to apply…"));
 }
 FText SGitWorkspace::StashActionHint() const
@@ -135,10 +138,9 @@ FText SGitWorkspace::StashActionHint() const
     if (!IsIdle()) return StashText(TEXT("Stash operation running. Please wait for the result."));
     if (StashReview.bCreate)
     {
-        if (StashReview.IsFresh()) return StashText(TEXT("Create stash opens a Yes/No confirmation. Files change only after Yes."));
-        if (StashReview.bValid) return StashText(TEXT("Review expired after five minutes. Review again below before creating the stash."));
         if (StashReview.bSelected && StashSelectedPaths.IsEmpty()) return StashText(TEXT("Tick files on the left. New files require Include untracked files."));
-        return StashText(TEXT("Review required before Create. Use the review action below; checking a file does not stash it."));
+        if (!StashName || StashName->GetText().ToString().TrimStartAndEnd().IsEmpty()) return StashText(TEXT("Enter a stash name, then click Create stash."));
+        return StashText(TEXT("Create stash checks the files and opens a Yes/No confirmation. Files change only after Yes."));
     }
     if (StashInspection.Entry.Oid.IsEmpty()) return StashText(TEXT("Select a saved stash above to restore its files."));
     if (StashReview.IsFresh() && StashInspection.IsFresh()) return StashText(TEXT("Apply restores the saved files after confirmation and keeps the stash."));
@@ -149,10 +151,17 @@ FText SGitWorkspace::StashActionHint() const
 FReply SGitWorkspace::RunStashAction()
 {
     if (!CanRunStashAction()) return FReply::Handled();
-    // Refreshing a stale or changed review never mutates files or opens a
-    // confirmation. The user sees the new review before choosing Create/Apply.
+    if (StashReview.bCreate && (!StashName || StashName->GetText().ToString().TrimStartAndEnd().IsEmpty()))
+    {
+        Feedback = TEXT("Enter a name for the new stash.");
+        if (StashReport) StashReport->SetText(StashText(Feedback));
+        if (StashName && !FApp::IsUnattended() && !IsRunningCommandlet()) FSlateApplication::Get().SetKeyboardFocus(StashName);
+        return FReply::Handled();
+    }
+    // Create continues to confirmation after preparation. Explicit Preview
+    // actions and refreshing Apply still only publish a review.
     if (!StashReview.IsFresh() || (!StashReview.bCreate && !StashInspection.IsFresh()))
-        return StashReview.bCreate ? PreviewStash(FString(), FString(), StashReview.bSelected) :
+        return StashReview.bCreate ? PreviewStash(FString(), FString(), StashReview.bSelected, true) :
             PreviewStash(StashInspection.Entry.Oid, StashInspection.Entry.Selector);
     return RunStash();
 }
@@ -168,7 +177,12 @@ FReply SGitWorkspace::RunStash()
     if (!Error.IsEmpty()) { Feedback = Error; if (StashReport) StashReport->SetText(StashText(Error)); return FReply::Handled(); }
     const FString Prompt = (Reviewed.bCreate ? TEXT("Create stash: ") + Name : TEXT("Apply stash: ") + Reviewed.Oid) + TEXT("\n\n") + Reviewed.Text +
         TEXT("\nExisting supported assets will reload. New loaded assets must unload before removal; referencing assets can block this. Undo/selection may reset. If a file update or reload becomes uncertain, the editor will close without saving and preserve recovery instructions. The stash will not be dropped.");
-    if (FMessageDialog::Open(EAppMsgType::YesNo, StashText(Prompt)) != EAppReturnType::Yes) return FReply::Handled();
+    if (FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No, StashText(Prompt)) != EAppReturnType::Yes)
+    {
+        Feedback = Reviewed.bCreate ? TEXT("Stash creation cancelled. No files changed.") : TEXT("Stash apply cancelled. No files changed.");
+        if (StashReport) StashReport->SetText(StashText(Feedback));
+        return FReply::Handled();
+    }
     {
         TGuardValue<bool> Busy(bReloading, true);
         FScopedSlowTask Task(1.f, StashText(TEXT("Updating stash and refreshing assets…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
