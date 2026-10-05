@@ -7,7 +7,7 @@ namespace GitWorkspace
 struct FEditorPullResult
 {
     bool bSuccess = false, bRecoveryRequired = false;
-    int32 Reloaded = 0, Refreshed = 0;
+    int32 Reloaded = 0, Refreshed = 0, Unloaded = 0;
     FString Message;
 };
 #if PLATFORM_MAC

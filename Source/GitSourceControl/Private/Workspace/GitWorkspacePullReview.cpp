@@ -56,7 +56,7 @@ bool ResolvePackage(const FString& Filename, const TArray<FMountAlias>& Aliases,
 }
 FIncomingPackage ObservePackage(const FString& Root, const FIncomingChange& Change, const TArray<FMountAlias>& Aliases)
 {
-    FIncomingPackage Item; Item.Path = Change.Path;
+    FIncomingPackage Item; Item.Path = Change.Path; Item.Status = Change.Status;
     const FString Filename = FPaths::ConvertRelativePathToFull(FPaths::Combine(Root, Change.Path));
     Item.bMounted = ResolvePackage(Filename, Aliases, Item.PackageName);
     Item.bMap = Change.Path.EndsWith(TEXT(".umap"));
@@ -87,7 +87,7 @@ FString ChangeName(TCHAR Status)
     switch (Status) { case 'A': return TEXT("Add"); case 'D': return TEXT("Delete"); case 'M': return TEXT("Modify"); case 'T': return TEXT("Type change"); default: return TEXT("Unknown"); }
 }
 }
-FString ReviewPackageChanges(const FString& Root, const TArray<FIncomingChange>& Changes, TArray<FIncomingPackage>& Packages)
+FString ReviewPackageChanges(const FString& Root, const TArray<FIncomingChange>& Changes, TArray<FIncomingPackage>& Packages, bool bAllowRemoval)
 {
     check(IsInGameThread()); Packages.Empty();
     if (GEditor && (GEditor->PlayWorld || GEditor->bIsSimulatingInEditor || GEditor->IsPlaySessionRequestQueued())) return TEXT("Stop Play or Simulate first.");
@@ -96,6 +96,7 @@ FString ReviewPackageChanges(const FString& Root, const TArray<FIncomingChange>&
     const auto Aliases = MountAliases();
     for (const auto& Change : Changes) if (Change.Kind == EPullPathKind::Package)
     {
+        if (Change.Status == 'D' && !bAllowRemoval) return TEXT("Asset removal requires an editor-close workflow: ") + Change.Path;
         auto Item = ObservePackage(Root, Change, Aliases);
         if (Item.bDirty) return TEXT("An affected package has unsaved changes: ") + Item.PackageName;
         if (!Item.ReloadBlocker.IsEmpty()) return Item.ReloadBlocker;

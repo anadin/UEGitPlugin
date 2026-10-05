@@ -23,46 +23,53 @@ FReply SGitWorkspace::ShowStashes()
 {
     if (!IsIdle()) return FReply::Handled();
     if (auto Old = StashWindow.Pin()) Old->RequestDestroyWindow();
+    StashSelectedPaths.Empty(); bIncludeUntrackedStash = false;
+    StashFileFilter.Empty(); bStashContentOnly = bContentOnly;
+    if (List) for (const auto& Row : List->GetSelectedItems())
+        if (Row->Group.IsEmpty() && CanSelectStashFile(Row->File)) StashSelectedPaths.AddUnique(Row->File.Path);
+    StashSelectedPaths.Sort();
     StashReview = GitWorkspace::FStashReview(); StashInspection = GitWorkspace::FStashInspection();
-    const auto Window = SNew(SWindow).Title(StashText(TEXT("Git stashes"))).ClientSize(FVector2D(860, 650)).SupportsMinimize(false);
+    const auto Window = SNew(SWindow).Title(StashText(TEXT("Git stashes"))).ClientSize(FVector2D(1150, 760)).SupportsMinimize(false);
     StashWindow = Window;
     TWeakPtr<SGitWorkspace> Weak = SharedThis(this);
     auto Idle = [Weak] { auto P = Weak.Pin(); return P && P->IsIdle(); };
     Window->SetContent(SNew(SBorder).Padding(12)
-    [SNew(SVerticalBox)
-        + SVerticalBox::Slot().AutoHeight()
-        [SNew(STextBlock).Text(StashText(TEXT("Stashes are local snapshots. Create captures all tracked changes across the repository; untracked and ignored files stay in place. Apply keeps the stash and retains locks."))).AutoWrapText(true)]
-        + SVerticalBox::Slot().AutoHeight().Padding(0, 10)
-        [SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().FillWidth(1)
-            [SAssignNew(StashName, SEditableTextBox).HintText(StashText(TEXT("Name for a new stash"))).IsEnabled_Lambda(Idle)]
-            + SHorizontalBox::Slot().AutoWidth().Padding(8, 0)
-            [SNew(SButton).Text(StashText(TEXT("Review tracked changes"))).IsEnabled_Lambda(Idle).OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->PreviewStash(FString()); return FReply::Handled(); })]
-            + SHorizontalBox::Slot().AutoWidth()
-            [SNew(SButton).Text(StashText(TEXT("Refresh stashes"))).IsEnabled_Lambda(Idle).OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RefreshStashes(); return FReply::Handled(); })]
-        ]
-        + SVerticalBox::Slot().FillHeight(0.3)
-        [SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(StashRows, SVerticalBox)]]
-        + SVerticalBox::Slot().AutoHeight().Padding(0, 8)
-        [SNew(SCheckBox).IsChecked_Lambda([Weak] { auto P = Weak.Pin(); return P && P->bRestoreStashIndex ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-            .IsEnabled_Lambda(Idle).OnCheckStateChanged_Lambda([Weak](ECheckBoxState State)
-            {
-                if (auto P = Weak.Pin()) { P->bRestoreStashIndex = State == ECheckBoxState::Checked; P->StashReview.bValid = false; if (P->StashReport) P->StashReport->SetText(StashText(P->StashInspection.Text + TEXT("\nStaging option changed. Select the stash again before applying."))); }
-            })[SNew(STextBlock).Text(StashText(TEXT("Restore staging when applying")))]]
-        + SVerticalBox::Slot().FillHeight(0.7)
-        [SAssignNew(StashReport, SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(StashText(TEXT("Select a stash to preview, or review your tracked changes before creating one.")))]
-        + SVerticalBox::Slot().AutoHeight().Padding(0, 10, 0, 0)
-        [SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().AutoWidth()
-            [SNew(SButton).Text_Lambda([Weak] { auto P = Weak.Pin(); return StashText(P && P->StashReview.bCreate ? TEXT("Create stash…") : TEXT("Apply stash…")); })
-                .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->IsIdle() && P->StashReview.IsFresh() && (P->StashReview.bCreate || P->StashInspection.IsFresh()); })
-                .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RunStash(); return FReply::Handled(); })]
-            + SHorizontalBox::Slot().AutoWidth().Padding(12, 0)
-            [SNew(SButton).Text(StashText(TEXT("Drop selected stash…")))
-                .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->IsIdle() && P->StashInspection.IsFresh() && P->StashInspection.DropBlocker.IsEmpty(); })
-                .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->DropSelectedStash(); return FReply::Handled(); })]
+    [SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(0.43).Padding(0, 0, 14, 0)
+        [MakeStashFilePicker()]
+        + SHorizontalBox::Slot().FillWidth(0.57)
+        [SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight()
+            [SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1)[SNew(STextBlock).Text(StashText(TEXT("Saved stashes")))]
+                + SHorizontalBox::Slot().AutoWidth()
+                [SNew(SButton).Text(StashText(TEXT("Refresh files and stashes"))).IsEnabled_Lambda(Idle).OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RefreshStashes(); return FReply::Handled(); })]
+            ]
+            + SVerticalBox::Slot().FillHeight(0.25).Padding(0, 8)
+            [SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(StashRows, SVerticalBox)]]
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 8)
+            [SNew(SCheckBox).IsChecked_Lambda([Weak] { auto P = Weak.Pin(); return P && P->bRestoreStashIndex ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .IsEnabled_Lambda(Idle).OnCheckStateChanged_Lambda([Weak](ECheckBoxState State)
+                {
+                    if (auto P = Weak.Pin()) { P->bRestoreStashIndex = State == ECheckBoxState::Checked; P->StashReview.bValid = false; if (P->StashReport) P->StashReport->SetText(StashText(P->StashInspection.Text + TEXT("\nStaging option changed. Select the stash again before applying."))); }
+                })[SNew(STextBlock).Text(StashText(TEXT("Restore staging when applying")))]]
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 4)[SNew(STextBlock).Text(StashText(TEXT("Review")))]
+            + SVerticalBox::Slot().FillHeight(0.75)
+            [SAssignNew(StashReport, SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(StashText(TEXT("Tick files on the left and review them to create a stash, or select a saved stash above to inspect and apply it.")))]
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 10, 0, 0)
+            [SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth()
+                [SNew(SButton).Text_Lambda([Weak] { auto P = Weak.Pin(); return StashText(P && P->StashReview.bCreate ? TEXT("Create stash…") : TEXT("Apply stash…")); })
+                    .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->IsIdle() && P->StashReview.IsFresh() && (P->StashReview.bCreate || P->StashInspection.IsFresh()); })
+                    .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RunStash(); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(12, 0)
+                [SNew(SButton).Text(StashText(TEXT("Drop selected stash…")))
+                    .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->IsIdle() && P->StashInspection.IsFresh() && P->StashInspection.DropBlocker.IsEmpty(); })
+                    .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->DropSelectedStash(); return FReply::Handled(); })]
+            ]
         ]
     ]);
+    RebuildStashFiles();
     FSlateApplication::Get().AddWindow(Window);
     return RefreshStashes();
 }
@@ -70,7 +77,7 @@ FReply SGitWorkspace::RefreshStashes()
 {
     if (!IsIdle()) return FReply::Handled();
     StashReview.bValid = false; StashInspection.bValid = false; auto Repo = Repository;
-    if (StashReport) StashReport->SetText(StashText(TEXT("Select a stash to inspect it, or review tracked changes to create one.")));
+    if (StashReport) StashReport->SetText(StashText(TEXT("Select a stash to inspect it, or review saved changes to create one.")));
     Start([Repo] { FGitWorkspaceTaskResult R; R.bStashes = true; R.Stashes = Repo->ListStashes(); R.Snapshot = Repo->Refresh(); R.Message = R.Stashes.bValid ? TEXT("Local stash list refreshed.") : R.Stashes.Error; return R; });
     return FReply::Handled();
 }
@@ -90,17 +97,18 @@ void SGitWorkspace::RebuildStashes()
                 .OnClicked_Lambda([Weak, Oid, Selector] { if (auto P = Weak.Pin()) return P->PreviewStash(Oid, Selector); return FReply::Handled(); })];
     }
 }
-FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector)
+FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector, bool bSelected)
 {
     if (!IsIdle()) return FReply::Handled();
     StashReview.bValid = false; StashInspection.bValid = false;
     if (StashReport) StashReport->SetText(StashText(TEXT("Reviewing stash and local work…")));
-    auto Repo = Repository; const bool bIndex = bRestoreStashIndex;
-    Start([Repo, Oid, Selector, bIndex]
+    auto Repo = Repository; const bool bIndex = bRestoreStashIndex, bUntracked = bIncludeUntrackedStash;
+    const auto Paths = StashSelectedPaths;
+    Start([Repo, Oid, Selector, bIndex, bSelected, bUntracked, Paths]
     {
         FGitWorkspaceTaskResult R; R.bStashReview = true;
         if (!Oid.IsEmpty()) R.StashInspection = Repo->InspectStash(Oid, Selector);
-        R.StashReview = Repo->ReviewStash(Oid, bIndex); R.Snapshot = Repo->Refresh();
+        R.StashReview = bSelected ? Repo->ReviewSelectedStash(Paths, bUntracked) : Repo->ReviewStash(Oid, bIndex, bUntracked); R.Snapshot = Repo->Refresh();
         R.Message = R.StashReview.bValid || R.StashInspection.bValid ? TEXT("Stash preview ready. Review the saved paths and action eligibility.") : R.StashReview.Error;
         return R;
     });
@@ -112,11 +120,11 @@ FReply SGitWorkspace::RunStash()
 #if PLATFORM_MAC
     const auto Reviewed = StashReview; const FString Name = StashName ? StashName->GetText().ToString() : FString();
     TArray<GitWorkspace::FIncomingPackage> Packages;
-    FString Error = GitWorkspace::ReviewPackageChanges(Reviewed.Local.Root, Reviewed.Changes, Packages);
+    FString Error = GitWorkspace::ReviewPackageChanges(Reviewed.Local.Root, Reviewed.Changes, Packages, Reviewed.bCreate);
     if (Reviewed.bCreate && Name.TrimStartAndEnd().IsEmpty()) Error = TEXT("Enter a name for the new stash.");
     if (!Error.IsEmpty()) { Feedback = Error; if (StashReport) StashReport->SetText(StashText(Error)); return FReply::Handled(); }
     const FString Prompt = (Reviewed.bCreate ? TEXT("Create stash: ") + Name : TEXT("Apply stash: ") + Reviewed.Oid) + TEXT("\n\n") + Reviewed.Text +
-        TEXT("\nLoaded supported assets will reload; Undo/selection may reset. If a file update or reload becomes uncertain, the editor will close without saving and preserve recovery instructions. The stash will not be dropped.");
+        TEXT("\nExisting supported assets will reload. New loaded assets must unload before removal; referencing assets can block this. Undo/selection may reset. If a file update or reload becomes uncertain, the editor will close without saving and preserve recovery instructions. The stash will not be dropped.");
     if (FMessageDialog::Open(EAppMsgType::YesNo, StashText(Prompt)) != EAppReturnType::Yes) return FReply::Handled();
     {
         TGuardValue<bool> Busy(bReloading, true);

@@ -7,6 +7,7 @@ namespace GitWorkspace
 struct FIncomingPackage
 {
     FString Path, PackageName, ReloadBlocker;
+    TCHAR Status = 'M';
     bool bMounted = false, bLoaded = false, bDirty = false, bMap = false, bExternal = false;
 };
 struct FPullReview
@@ -15,7 +16,7 @@ struct FPullReview
     TArray<FIncomingPackage> Packages;
     bool bCanPull = false, bCanRestart = false, bCanReload = false;
 };
-FString ReviewPackageChanges(const FString& Root, const TArray<FIncomingChange>& Changes, TArray<FIncomingPackage>& Packages);
+FString ReviewPackageChanges(const FString& Root, const TArray<FIncomingChange>& Changes, TArray<FIncomingPackage>& Packages, bool bAllowRemoval = false);
 // Game thread only. Observes package state without loading, saving or unloading.
 FPullReview ReviewIncoming(const FRemoteSnapshot& Remote, const FSnapshot& Local);
 }

@@ -115,8 +115,13 @@ struct FStashReview
     FSnapshot Local;
     FString Oid, Base, IndexCommit, WorkingTree, IndexTree, ConfigurationHash, Fingerprint, Error, Text;
     TArray<FIncomingChange> Changes;
+    TArray<FString> SelectedPaths, UntrackedPaths;
+    TArray<FString> ApplyWorkingPaths, ApplyIndexPaths, PreservedUntrackedPaths;
+    FString PreservedUntrackedBytes, LocalIndexTree, LocalWorkingTree;
+    FString UntrackedTree, UntrackedCommit, UntrackedBytes;
+    FString ExpectedIndexTree, ExpectedWorkingTree, ExpectedWorkingCommit;
     double ReviewedSeconds = 0;
-    bool bCreate = false, bRestoreIndex = true, bValid = false;
+    bool bCreate = false, bSelected = false, bIncludeUntracked = false, bRestoreIndex = true, bValid = false;
     bool IsFresh() const;
 };
 
@@ -147,7 +152,8 @@ public:
     FIncomingLfsResult PrepareIncomingLfs(const FRemoteSnapshot& Reviewed);
     FStashList ListStashes();
     FStashInspection InspectStash(const FString& Oid, const FString& Selector = FString());
-    FStashReview ReviewStash(const FString& Oid = FString(), bool bRestoreIndex = true);
+    FStashReview ReviewStash(const FString& Oid = FString(), bool bRestoreIndex = true, bool bIncludeUntracked = false);
+    FStashReview ReviewSelectedStash(const TArray<FString>& Paths, bool bIncludeUntracked = false);
 #if PLATFORM_MAC
     FResult PullAfterEditorExit(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease);
     // Requires quiesced package loaders on the game thread. Leaves recovery
@@ -168,7 +174,16 @@ private:
     FStashList ListStashesInternal();
     FStashInspection InspectStashInternal(const FString& Oid, const FString& Selector);
     FString StashDropRecovery(FString* ReportPath = nullptr) const;
-    FStashReview ReviewStashInternal(const FString& Oid, bool bRestoreIndex);
+    FStashReview ReviewStashInternal(const FString& Oid, bool bRestoreIndex, bool bSelected = false, const TArray<FString>& Paths = {}, bool bIncludeUntracked = false);
+    FResult CaptureUntrackedTree(const TArray<FString>& Paths) const;
+    FResult CheckStashPaths(const TArray<FString>& Paths, bool bExisting) const;
+    FResult UntrackedFingerprint(const TArray<FString>& Paths) const;
+    FResult MakeStashCommit(const FString& Tree, const TArray<FString>& Parents) const;
+    FResult PrepareStashApply(FStashReview& Review) const;
+#if PLATFORM_MAC
+    FResult RestoreStashPaths(const FStashReview& Review) const;
+#endif
+    FResult ProjectStashTree(const FString& Initial, const FString& Target, const TArray<FString>& Paths) const;
     FResult CheckLocalLfs(const FString& Commit) const;
     FResult VerifyStashResult(const FStashReview& Reviewed);
     FSnapshot RefreshInternal();

@@ -577,6 +577,24 @@ bool FGitStashAssetReloadTest::RunTest(const FString&)
     TestTrue(TEXT("Staging restored separately"), Repo.Refresh().IndexEntries == Index);
     TestTrue(TEXT("Map bytes untouched"), F.Bytes(F.Paths[3]) == BaselineMap);
     TestEqual(TEXT("Stash remains after apply"), Repo.ListStashes().Entries.Num(), 1);
+    const TWeakObjectPtr<UObject> ExcludedMaterial = F.Assets[1].Get(), ExcludedTexture = F.Assets[2].Get();
+    const auto Selected = Repo.ReviewSelectedStash({F.Paths[0]});
+    Result = GitWorkspace::StashAndReload(Repo, Selected, TEXT("Blueprint only"), Lease);
+    if (!TestTrue(TEXT("Selected loaded-asset stash: ") + Result.Message, Result.bSuccess)) return false;
+    TestEqual(TEXT("Only selected loaded package reloads"), Result.Reloaded, 1);
+    TestEqual(TEXT("Selected Blueprint reverts in memory"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 0")));
+    TestTrue(TEXT("Excluded material object retained"), ExcludedMaterial.IsValid() && ExcludedMaterial.Get() == F.Assets[1].Get());
+    TestTrue(TEXT("Excluded texture object retained"), ExcludedTexture.IsValid() && ExcludedTexture.Get() == F.Assets[2].Get());
+    for (int32 I = 1; I < 3; ++I) TestTrue(TEXT("Excluded loaded payload unchanged"), F.Bytes(F.Paths[I]) == WorkingBytes[I]);
+    const auto DisjointApply = Repo.ReviewStash(Selected.Oid);
+    Result = GitWorkspace::StashAndReload(Repo, DisjointApply, FString(), Lease);
+    if (!TestTrue(TEXT("Apply while unrelated assets remain changed: ") + Result.Message, Result.bSuccess)) return false;
+    TestEqual(TEXT("Only applied Blueprint reloads"), Result.Reloaded, 1);
+    TestEqual(TEXT("Saved Blueprint restored"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 2")));
+    TestTrue(TEXT("Unrelated material object retained through Apply"), ExcludedMaterial.Get() == F.Assets[1].Get());
+    TestTrue(TEXT("Unrelated texture object retained through Apply"), ExcludedTexture.Get() == F.Assets[2].Get());
+    TestTrue(TEXT("All distinct staged versions retained/restored"), Repo.Refresh().IndexEntries == Index);
+    for (int32 I = 1; I < 3; ++I) TestTrue(TEXT("Unrelated loaded bytes untouched through Apply"), F.Bytes(F.Paths[I]) == WorkingBytes[I]);
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashPanelTest, "GitWorkspace.Editor.StashPreviewThroughPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -586,12 +604,32 @@ bool FGitStashPanelTest::RunTest(const FString&)
     const FString Path = FPaths::Combine(F.Root, TEXT("README.md"));
     FFileHelper::SaveStringToFile(TEXT("base"), *Path); F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("base")});
     FFileHelper::SaveStringToFile(TEXT("working"), *Path);
+    FFileHelper::SaveStringToFile(TEXT("new saved file"), *FPaths::Combine(F.Root, TEXT("Content/New.uasset")));
     auto Repo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Root);
     auto Panel = SNew(SGitWorkspace).Repository(Repo);
     auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
     Settle(); const auto Before = Repo->Refresh();
     Panel->ShowStashes(); Settle();
     TestTrue(TEXT("Empty stash list visible"), Panel->Stashes.bValid && Panel->Stashes.Entries.IsEmpty());
+    TestEqual(TEXT("Content checklist shows new file directly"), Panel->StashFileItems.Num(), 1);
+    Panel->SetStashPathChecked(TEXT("Content/New.uasset"), true);
+    TestTrue(TEXT("Untracked check requires opt-in"), Panel->StashSelectedPaths.IsEmpty());
+    Panel->SetStashIncludeUntracked(true); Panel->SetStashPathChecked(TEXT("Content/New.uasset"), true);
+    TestEqual(TEXT("Check files inside Stashes without selecting Changes rows"), Panel->StashSelectedPaths.Num(), 1);
+    Panel->PreviewStash(FString(), FString(), true); Settle();
+    TestTrue(TEXT("Checklist drives exact new-file preview"), Panel->StashReview.IsFresh() && Panel->StashReview.UntrackedPaths == TArray<FString>{TEXT("Content/New.uasset")});
+    Panel->StashFileFilter = TEXT("nothing matches"); Panel->RebuildStashFiles();
+    TestTrue(TEXT("Filtering retains and discloses hidden checks"), Panel->StashSelectedPaths.Num() == 1 && Panel->StashSelectionSummary().ToString().Contains(TEXT("1 checked files hidden")));
+    Panel->SetStashIncludeUntracked(false);
+    TestTrue(TEXT("Disabling untracked clears ineligible checks"), Panel->StashSelectedPaths.IsEmpty());
+    TestFalse(TEXT("Changing checks invalidates review"), Panel->StashReview.IsFresh());
+    Panel->StashFileFilter.Empty(); Panel->bStashContentOnly = false; Panel->RebuildStashFiles();
+    TestEqual(TEXT("Whole repo checklist exposes document and asset"), Panel->StashFileItems.Num(), 2);
+    Panel->SetStashPathChecked(TEXT("README.md"), true);
+    Panel->PreviewStash(FString(), FString(), true); Settle();
+    TestTrue(TEXT("Tracked selection works inside window"), Panel->StashReview.IsFresh() && Panel->StashReview.SelectedPaths == TArray<FString>{TEXT("README.md")});
+    Panel->SetStashPathChecked(TEXT("README.md"), false);
+    TestFalse(TEXT("Unchecking invalidates old Create preview"), Panel->StashReview.IsFresh());
     Panel->PreviewStash(FString()); Settle();
     TestTrue(TEXT("Panel offers reviewed creation: ") + Panel->Feedback, Panel->StashReview.IsFresh());
     TestTrue(TEXT("Review labels whole repository scope"), Panel->StashReport->GetText().ToString().Contains(TEXT("WHOLE REPOSITORY")));
@@ -599,6 +637,15 @@ bool FGitStashPanelTest::RunTest(const FString&)
     TestEqual(TEXT("Preview preserves HEAD"), Repo->Refresh().Head, Before.Head);
     TestTrue(TEXT("Preview preserves index"), Repo->Refresh().IndexEntries == Before.IndexEntries);
     TestTrue(TEXT("Preview does not publish a stash"), Repo->ListStashes().Entries.IsEmpty());
+    // Capture real row selection when opening Stashes, including duplicate
+    // staged/unstaged rows as a single whole-file selection.
+    Panel->bContentOnly = false; Panel->RebuildRows();
+    for (const auto& Row : Panel->Rows) if (Row->File.Path == TEXT("README.md")) Panel->List->SetItemSelection(Row, true);
+    Panel->ShowStashes(); Settle();
+    TestEqual(TEXT("Selected changed path captured on open"), Panel->StashSelectedPaths.Num(), 1);
+    Panel->PreviewStash(FString(), FString(), true); Settle();
+    TestTrue(TEXT("Panel offers selected creation"), Panel->StashReview.IsFresh() && Panel->StashReview.bSelected);
+    TestTrue(TEXT("Selected scope clearly disclosed"), Panel->StashReport->GetText().ToString().Contains(TEXT("SELECTED FILES")));
     Panel->RefreshStashes(); Settle();
     TestFalse(TEXT("Refresh invalidates previous preview"), Panel->StashReview.IsFresh());
     F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("saved work")});
@@ -612,6 +659,61 @@ bool FGitStashPanelTest::RunTest(const FString&)
     TestTrue(TEXT("Panel explains saved paths and Apply blocker together"), Report.Contains(TEXT("SAVED WORKING CHANGES")) && Report.Contains(TEXT("README.md")) && Report.Contains(TEXT("APPLY BLOCKED")));
     Panel->RefreshStashes(); Settle();
     TestFalse(TEXT("List refresh invalidates Drop inspection"), Panel->StashInspection.IsFresh());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashNewAssetTest, "GitWorkspace.Editor.StashNewLoadedAsset", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashNewAssetTest::RunTest(const FString&)
+{
+    FEditorAssetFixture F;
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("new asset baseline")});
+    const FString PackageName = F.Mount + TEXT("BP_New"), Path = FPaths::Combine(F.Root, TEXT("Content/BP_New.uasset"));
+    TStrongObjectPtr<UBlueprint> Asset(FKismetEditorUtilities::CreateBlueprint(AActor::StaticClass(), F.Package(TEXT("BP_New")), TEXT("BP_New"), BPTYPE_Normal));
+    Asset->BlueprintDescription = TEXT("Saved new asset acceptance");
+    ON_SCOPE_EXIT { if (Asset.IsValid()) { Asset->GetPackage()->SetDirtyFlag(false); Asset->ClearFlags(RF_Public | RF_Standalone); } };
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    if (!TestTrue(TEXT("Save new Blueprint"), UPackage::SavePackage(Asset->GetPackage(), Asset.Get(), *Path, Args))) return false;
+    UPackage::WaitForAsyncFileWrites();
+    const auto Saved = F.Bytes(TEXT("Content/BP_New.uasset"));
+    auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+    Registry.ScanFilesSynchronous({Path}, true);
+    GitWorkspace::FRepository Repo(F.Git, F.Root); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("New asset lease"), Lease.Acquire(F.Root, true, Error))) return false;
+    auto Review = Repo.ReviewSelectedStash({TEXT("Content/BP_New.uasset")}, true);
+    if (!TestTrue(TEXT("New asset preview: ") + Review.Error, Review.IsFresh())) return false;
+    Asset->MarkPackageDirty();
+    auto Result = GitWorkspace::StashAndReload(Repo, Review, TEXT("New Blueprint"), Lease);
+    TestFalse(TEXT("Unsaved edits block removal before unload"), Result.bSuccess);
+    TestTrue(TEXT("Unsaved object retained"), Asset.IsValid() && Asset->GetPackage()->IsDirty());
+    TestTrue(TEXT("Saved bytes untouched"), F.Bytes(TEXT("Content/BP_New.uasset")) == Saved);
+    Asset->GetPackage()->SetDirtyFlag(false);
+    Result = GitWorkspace::StashAndReload(Repo, Review, TEXT("New Blueprint"), Lease);
+    TestFalse(TEXT("Strong reference prevents removal"), Result.bSuccess);
+    TestTrue(TEXT("Reference blocker explained"), Result.Message.Contains(TEXT("reference")));
+    TestFalse(TEXT("No recovery for safe refusal"), Result.bRecoveryRequired);
+    TestTrue(TEXT("Referenced asset file intact"), F.Bytes(TEXT("Content/BP_New.uasset")) == Saved);
+    TestTrue(TEXT("No stash published on refusal"), Repo.ListStashes().Entries.IsEmpty());
+    TWeakObjectPtr<UObject> Original = Asset.Get(); Asset.Reset();
+    Review = Repo.ReviewSelectedStash({TEXT("Content/BP_New.uasset")}, true);
+    Result = GitWorkspace::StashAndReload(Repo, Review, TEXT("New Blueprint"), Lease);
+    if (!TestTrue(TEXT("Unload and stash new asset: ") + Result.Message, Result.bSuccess)) return false;
+    TestEqual(TEXT("One new package unloaded"), Result.Unloaded, 1);
+    TestFalse(TEXT("Original asset purged"), Original.IsValid());
+    TestFalse(TEXT("Saved file removed only after unload"), IFileManager::Get().FileExists(*Path));
+    TArray<FAssetData> Entries; Registry.GetAssetsByPackageName(*PackageName, Entries, true);
+    TestTrue(TEXT("Removed asset absent from Content Browser registry"), Entries.IsEmpty());
+    Result = GitWorkspace::StashAndReload(Repo, Repo.ReviewStash(Review.Oid), FString(), Lease);
+    if (!TestTrue(TEXT("Apply restores new asset: ") + Result.Message, Result.bSuccess)) return false;
+    TestTrue(TEXT("Exact hydrated bytes restored"), F.Bytes(TEXT("Content/BP_New.uasset")) == Saved);
+    Registry.GetAssetsByPackageName(*PackageName, Entries, true);
+    TestFalse(TEXT("Restored asset registered"), Entries.IsEmpty());
+    Asset.Reset(LoadObject<UBlueprint>(nullptr, *(PackageName + TEXT(".BP_New"))));
+    if (!TestTrue(TEXT("Restored asset loads"), Asset.IsValid())) return false;
+    TestEqual(TEXT("Saved Blueprint content restored"), Asset->BlueprintDescription, FString(TEXT("Saved new asset acceptance")));
+    const auto After = Repo.Refresh();
+    TestTrue(TEXT("Restored Blueprint remains untracked"), After.Files.Num() == 1 && After.Files[0].bUntracked);
+    TestEqual(TEXT("Stash retained"), Repo.ListStashes().Entries.Num(), 1);
+    FAssetRegistryModule::AssetDeleted(Asset.Get());
     return true;
 }
 #endif

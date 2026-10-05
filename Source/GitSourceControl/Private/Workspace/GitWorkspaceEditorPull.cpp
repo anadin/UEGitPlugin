@@ -19,10 +19,10 @@ namespace GitWorkspace
 namespace
 {
 FEditorPullResult RunWithPackageReload(const FString& Root, const TArray<FIncomingChange>& Changes,
-    const GitWorkspaceSession::FLease& Lease, TFunctionRef<FResult()> Execute, TFunctionRef<FResult()> Complete)
+    const GitWorkspaceSession::FLease& Lease, TFunctionRef<FResult()> Execute, TFunctionRef<FResult()> Complete, bool bAllowRemoval = false)
 {
     check(IsInGameThread()); FEditorPullResult Result; TArray<FIncomingPackage> Packages;
-    Result.Message = ReviewPackageChanges(Root, Changes, Packages);
+    Result.Message = ReviewPackageChanges(Root, Changes, Packages, bAllowRemoval);
     if (!Result.Message.IsEmpty()) return Result;
     if (!Lease.IsExclusiveFor(Root) || !GitWorkspaceSession::NoOtherEditors(0, Result.Message))
     { Result.Message = TEXT("Exclusive editor access is required. ") + Result.Message; return Result; }
@@ -36,14 +36,37 @@ FEditorPullResult RunWithPackageReload(const FString& Root, const TArray<FIncomi
     for (const auto& Item : Packages)
         if (UPackage* Package = FindPackage(nullptr, *Item.PackageName)) Package->FullyLoad();
     FlushAsyncLoading();
-    Result.Message = ReviewPackageChanges(Root, Changes, Packages);
+    Result.Message = ReviewPackageChanges(Root, Changes, Packages, bAllowRemoval);
+    if (!Result.Message.IsEmpty()) return Result;
+    // New saved assets may disappear only after the package and all references
+    // have actually gone. UnloadPackages returning true is not that guarantee.
+    TArray<UPackage*> ToUnload;
+    for (const auto& Item : Packages) if (Item.Status == 'D')
+        if (UPackage* Package = FindPackage(nullptr, *Item.PackageName)) ToUnload.Add(Package);
+    if (!ToUnload.IsEmpty())
+    {
+        UPackageTools::FUnloadPackageParams Params(ToUnload);
+        UPackageTools::UnloadPackages(Params);
+        for (const auto& Item : Packages) if (Item.Status == 'D' && FindPackage(nullptr, *Item.PackageName))
+        {
+            Result.Message = TEXT("A reference is keeping this new asset in memory: ") + Item.PackageName +
+                TEXT(". Its saved file is intact. Close referencing editors or resolve references before stashing; Undo and selection may have reset.");
+            return Result;
+        }
+        Result.Unloaded = ToUnload.Num();
+    }
+    // Unload observers may change editor state. Refuse any newly dirty package
+    // before touching files, and reacquire live pointers after garbage collection.
+    Result.Message = ReviewPackageChanges(Root, Changes, Packages, bAllowRemoval);
     if (!Result.Message.IsEmpty()) return Result;
     TArray<UPackage*> Loaded;
-    TArray<FString> Files;
+    TArray<FString> Files, RemovedFiles;
     TSet<FString> Expected, Reloaded;
     for (const auto& Item : Packages)
     {
-        Files.Add(FPackageName::LongPackageNameToFilename(Item.PackageName, TEXT(".uasset")));
+        const FString Filename = FPackageName::LongPackageNameToFilename(Item.PackageName, TEXT(".uasset"));
+        if (Item.Status == 'D') { RemovedFiles.Add(Filename); continue; }
+        Files.Add(Filename);
         if (UPackage* Package = FindPackage(nullptr, *Item.PackageName))
         { Loaded.Add(Package); Expected.Add(Item.PackageName); }
     }
@@ -74,17 +97,24 @@ FEditorPullResult RunWithPackageReload(const FString& Root, const TArray<FIncomi
     }
     auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
     if (!Files.IsEmpty()) Registry.ScanFilesSynchronous(Files, true);
+    if (!RemovedFiles.IsEmpty()) Registry.ScanModifiedAssetFiles(RemovedFiles);
     for (const auto& Item : Packages)
     {
         TArray<FAssetData> Assets;
         Registry.GetAssetsByPackageName(*Item.PackageName, Assets, true);
+        if (Item.Status == 'D')
+        {
+            if (!Assets.IsEmpty() || FindPackage(nullptr, *Item.PackageName))
+            { Result.Message = TEXT("Could not confirm removed asset left the editor: ") + Item.PackageName; return Result; }
+            continue;
+        }
         if (Assets.IsEmpty()) { Result.Message = TEXT("Content Browser could not confirm the incoming asset: ") + Item.PackageName; return Result; }
     }
     const auto Completed = Async(EAsyncExecution::ThreadPool, [&] { return Complete(); }).Get();
     if (!Completed.Ok()) { Result.Message = Completed.Error; return Result; }
     Result.bSuccess = true; Result.bRecoveryRequired = false;
     Result.Reloaded = Expected.Num(); Result.Refreshed = Packages.Num();
-    Result.Message = FString::Printf(TEXT("%d assets refreshed, %d loaded packages reloaded. Locks retained."), Result.Refreshed, Result.Reloaded);
+    Result.Message = FString::Printf(TEXT("%d assets refreshed, %d loaded packages reloaded, %d new packages unloaded. Locks retained."), Result.Refreshed, Result.Reloaded, Result.Unloaded);
     return Result;
 }
 }
@@ -105,8 +135,8 @@ FEditorPullResult StashAndReload(FRepository& Repository, const FStashReview& Re
     FEditorPullResult Result;
     if (!Reviewed.IsFresh()) { Result.Message = TEXT("Stash review expired. Review again."); return Result; }
     Result = RunWithPackageReload(Reviewed.Local.Root, Reviewed.Changes, Lease,
-        [&] { return Repository.ExecuteStash(Reviewed, Name, Lease); }, [&] { return Repository.CompleteStash(Reviewed, Lease); });
-    if (Result.bSuccess) Result.Message = (Reviewed.bCreate ? TEXT("Named stash created. Untracked files left in place. ") : TEXT("Stash applied and retained. ")) + Result.Message;
+        [&] { return Repository.ExecuteStash(Reviewed, Name, Lease); }, [&] { return Repository.CompleteStash(Reviewed, Lease); }, Reviewed.bCreate);
+    if (Result.bSuccess) Result.Message = (Reviewed.bCreate ? TEXT("Named stash created. Reviewed files preserved in the stash. ") : TEXT("Stash applied and retained. ")) + Result.Message;
     return Result;
 }
 }

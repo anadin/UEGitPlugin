@@ -69,7 +69,7 @@ bool FGitStashRoundtripTest::RunTest(const FString&)
     if (!TestTrue(TEXT("Named stash is listed"), List.bValid && List.Entries.Num() == 1)) return false;
     TestEqual(TEXT("Immutable reviewed object stored"), List.Entries[0].Oid, Review.Oid);
     TestTrue(TEXT("Name listed"), List.Entries[0].Label.Contains(TEXT("Feature material pass")));
-    TestFalse(TEXT("Untracked work blocks apply"), F.Repo.ReviewStash(Review.Oid).bValid);
+    TestTrue(TEXT("Unrelated untracked work permits apply"), F.Repo.ReviewStash(Review.Oid).bValid);
     IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT("untracked.txt")));
     const auto Apply = F.Repo.ReviewStash(Review.Oid);
     if (!TestTrue(TEXT("Apply exact staged/working versions"), F.Complete(Apply, Error))) { AddError(Error); return false; }
@@ -102,7 +102,7 @@ bool FGitStashGuardsTest::RunTest(const FString&)
     TestFalse(TEXT("Code changes blocked"), F.Repo.ReviewStash().bValid);
     F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")});
     F.Write(TEXT("Content/New.uasset"), TEXT("new asset")); F.Call({TEXT("add"), TEXT("Content/New.uasset")});
-    TestFalse(TEXT("New assets blocked"), F.Repo.ReviewStash().bValid);
+    TestTrue(TEXT("Staged new ordinary assets eligible for guarded unloading"), F.Repo.ReviewStash().bValid);
     F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")});
     F.Call({TEXT("rm"), TEXT("README.md")}); F.Write(TEXT("README.md"), TEXT("untracked replacement\n"));
     TestFalse(TEXT("Untracked replacement of staged deletion protected"), F.Repo.ReviewStash().bValid);
@@ -245,6 +245,303 @@ bool FGitStashDropRaceTest::RunTest(const FString&)
     TestFalse(TEXT("Pending Drop recovery shared across worktrees"), OtherInspection.DropBlocker.IsEmpty());
     F.Write(TEXT("README.md"), TEXT("new local work\n"));
     TestFalse(TEXT("Pending report blocks stash creation"), F.Repo.ReviewStash().IsFresh());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSelectedStashTest, "GitWorkspace.Stash.SelectedSplitVersionsAndRename", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSelectedStashTest::RunTest(const FString&)
+{
+    FStashFixture F; FString Error;
+    const FString Odd = TEXT("Docs/é [selected]\nname.txt"), Renamed = TEXT("Docs/renamed.txt");
+    F.Write(Odd, TEXT("old name\n")); F.Write(TEXT("Source/Keep.cpp"), TEXT("source baseline\n"));
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("selection baseline")});
+    F.Write(TEXT("README.md"), TEXT("selected index\n")); F.Write(TEXT("Source/Keep.cpp"), TEXT("excluded index\n"));
+    F.Call({TEXT("add"), TEXT(".")});
+    F.Write(TEXT("README.md"), TEXT("selected working\n")); F.Write(TEXT("Source/Keep.cpp"), TEXT("excluded working\n"));
+    F.Call({TEXT("mv"), Odd, Renamed});
+    F.Write(TEXT("untracked.txt"), TEXT("untracked keep\n")); F.Write(TEXT("ignored.txt"), TEXT("ignored keep\n"));
+    const auto Before = F.Repo.Refresh();
+    TestFalse(TEXT("Whole-repository stash refuses source changes"), F.Repo.ReviewStash().IsFresh());
+    const auto Review = F.Repo.ReviewSelectedStash({TEXT("README.md"), Renamed, TEXT("README.md")});
+    if (!TestTrue(TEXT("Review selected safe paths: ") + Review.Error, Review.IsFresh())) return false;
+    TestEqual(TEXT("Duplicate selection deduplicated and rename pair expanded"), Review.SelectedPaths.Num(), 3);
+    TestTrue(TEXT("Selection includes original rename path"), Review.SelectedPaths.Contains(Odd));
+    TestTrue(TEXT("Exact selection shown safely"), Review.Text.Contains(TEXT("SELECTED FILES")) && Review.Text.Contains(TEXT("\\nname.txt")));
+    TestTrue(TEXT("Preview leaves real index alone"), F.Repo.Refresh().IndexEntries == Before.IndexEntries);
+    TestEqual(TEXT("Unselected working change absent from stash tree"), F.Call({TEXT("show"), Review.Oid + TEXT(":Source/Keep.cpp")}).Text(), FString(TEXT("source baseline\n")));
+    TestEqual(TEXT("Unselected staging absent from stash index"), F.Call({TEXT("show"), Review.IndexCommit + TEXT(":Source/Keep.cpp")}).Text(), FString(TEXT("source baseline\n")));
+    if (!TestTrue(TEXT("Selected creation"), F.Complete(Review, Error))) { AddError(Error); return false; }
+    TestEqual(TEXT("Selected work cleaned"), F.Read(TEXT("README.md")), FString(TEXT("base\n")));
+    TestEqual(TEXT("Rename reverted only for selected pair"), F.Read(Odd), FString(TEXT("old name\n")));
+    TestFalse(TEXT("Selected rename target removed"), IFileManager::Get().FileExists(*FPaths::Combine(F.Root, Renamed)));
+    TestEqual(TEXT("Excluded index preserved"), F.Call({TEXT("show"), TEXT(":Source/Keep.cpp")}).Text(), FString(TEXT("excluded index\n")));
+    TestEqual(TEXT("Excluded working version preserved"), F.Read(TEXT("Source/Keep.cpp")), FString(TEXT("excluded working\n")));
+    TestEqual(TEXT("Untracked preserved"), F.Read(TEXT("untracked.txt")), FString(TEXT("untracked keep\n")));
+    TestEqual(TEXT("Ignored preserved"), F.Read(TEXT("ignored.txt")), FString(TEXT("ignored keep\n")));
+    TestEqual(TEXT("Exact reviewed stash stored"), F.Repo.ListStashes().Entries[0].Oid, Review.Oid);
+    // Resolve excluded work only in this disposable fixture before testing Apply.
+    F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")}); IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT("untracked.txt")));
+    if (!TestTrue(TEXT("Apply selected-only snapshot"), F.Complete(F.Repo.ReviewStash(Review.Oid), Error))) { AddError(Error); return false; }
+    TestEqual(TEXT("Selected staged version restored"), F.Call({TEXT("show"), TEXT(":README.md")}).Text(), FString(TEXT("selected index\n")));
+    TestEqual(TEXT("Selected working version restored"), F.Read(TEXT("README.md")), FString(TEXT("selected working\n")));
+    TestEqual(TEXT("Unselected source not reapplied"), F.Read(TEXT("Source/Keep.cpp")), FString(TEXT("source baseline\n")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSelectedStashGuardTest, "GitWorkspace.Stash.SelectedGuardsAndRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSelectedStashGuardTest::RunTest(const FString&)
+{
+    FStashFixture F;
+    F.Write(TEXT("Docs/keep.txt"), TEXT("base\n")); F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("base keep")});
+    F.Write(TEXT("README.md"), TEXT("selected\n")); F.Write(TEXT("Docs/keep.txt"), TEXT("excluded\n")); F.Write(TEXT("untracked.txt"), TEXT("new\n"));
+    TestFalse(TEXT("Empty selection never means whole repository"), F.Repo.ReviewSelectedStash({}).IsFresh());
+    F.Write(TEXT(".gitattributes"), TEXT("*.md filter=lfs diff=lfs merge=lfs -text\n"));
+    TestFalse(TEXT("Unselected attribute changes cannot alter selected capture semantics"), F.Repo.ReviewSelectedStash({TEXT("README.md")}).IsFresh());
+    IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT(".gitattributes")));
+    for (const FString& Path : {FString(), FString(TEXT("Docs")), FString(TEXT("../README.md")), FString(TEXT("untracked.txt")), FString(TEXT(".gitignore"))})
+        TestFalse(TEXT("Invalid selection refused: ") + Path, F.Repo.ReviewSelectedStash({Path}).IsFresh());
+    auto Review = F.Repo.ReviewSelectedStash({TEXT("README.md")});
+    auto Forged = Review; Forged.ExpectedIndexTree = Review.WorkingTree;
+    TestFalse(TEXT("Forged cleanup tree refused"), F.Repo.ExecuteStash(Forged, TEXT("forged"), F.Lease).Ok());
+    Forged = Review; Forged.SelectedPaths.Add(TEXT("Docs/keep.txt"));
+    TestFalse(TEXT("Expanded unreviewed selection refused"), F.Repo.ExecuteStash(Forged, TEXT("forged paths"), F.Lease).Ok());
+    F.Write(TEXT("Docs/keep.txt"), TEXT("changed after review\n"));
+    TestFalse(TEXT("Unselected work changed after review blocks execution"), F.Repo.ExecuteStash(Review, TEXT("stale"), F.Lease).Ok());
+    TestTrue(TEXT("Refusal publishes no stash"), F.Repo.ListStashes().Entries.IsEmpty());
+    Review = F.Repo.ReviewSelectedStash({TEXT("README.md")});
+    const auto Execute = F.Repo.ExecuteStash(Review, TEXT("selected recovery"), F.Lease);
+    if (!TestTrue(TEXT("Execute selected: ") + Execute.Error, Execute.Ok())) return false;
+    F.Write(TEXT("Docs/keep.txt"), TEXT("unexpected change after cleanup\n"));
+    TestFalse(TEXT("Unselected postflight change is detected"), F.Repo.CompleteStash(Review, F.Lease).Ok());
+    TestTrue(TEXT("Recovery marker retained"), IFileManager::Get().FileExists(*F.Marker()));
+    TestEqual(TEXT("Unexpected work preserved without rollback"), F.Read(TEXT("Docs/keep.txt")), FString(TEXT("unexpected change after cleanup\n")));
+    TestEqual(TEXT("Selected stash retained for recovery"), F.Repo.ListStashes().Entries[0].Oid, Review.Oid);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSelectedStashLfsTest, "GitWorkspace.Stash.SelectedLfsPreservesExcludedVersions", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSelectedStashLfsTest::RunTest(const FString&)
+{
+    FStashFixture F; FString Error;
+    F.Write(TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text\n"));
+    for (const FString& Path : {FString(TEXT("Content/Selected.uasset")), FString(TEXT("Content/Keep.uasset"))}) F.Write(Path, TEXT("base payload\n"));
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("asset base")});
+    F.Write(TEXT("Content/Selected.uasset"), TEXT("selected index\n")); F.Write(TEXT("Content/Keep.uasset"), TEXT("excluded index\n")); F.Call({TEXT("add"), TEXT(".")});
+    const auto ExcludedIndex = F.Call({TEXT("show"), TEXT(":Content/Keep.uasset")}).Out;
+    F.Write(TEXT("Content/Selected.uasset"), TEXT("selected work\n")); F.Write(TEXT("Content/Keep.uasset"), TEXT("excluded work\n"));
+    F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
+    const auto Review = F.Repo.ReviewSelectedStash({TEXT("Content/Selected.uasset")});
+    if (!TestTrue(TEXT("Selected LFS creation: ") + Review.Error, F.Complete(Review, Error))) { AddError(Error); return false; }
+    TestEqual(TEXT("Selected LFS hydrated to base"), F.Read(TEXT("Content/Selected.uasset")), FString(TEXT("base payload\n")));
+    TestEqual(TEXT("Excluded LFS working payload preserved"), F.Read(TEXT("Content/Keep.uasset")), FString(TEXT("excluded work\n")));
+    TestTrue(TEXT("Excluded distinct LFS index preserved"), F.Call({TEXT("show"), TEXT(":Content/Keep.uasset")}).Out == ExcludedIndex);
+    TestEqual(TEXT("Only one affected asset"), Review.Changes.Num(), 1);
+    TestFalse(TEXT("Successful selected stash clears marker"), IFileManager::Get().FileExists(*F.Marker()));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashUntrackedTest, "GitWorkspace.Stash.UntrackedLfsRoundtripAndGuards", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashUntrackedTest::RunTest(const FString&)
+{
+    FStashFixture F; FString Error;
+    F.Write(TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text lockable\n"));
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("LFS policy")});
+    const FString Asset = TEXT("Content/New [asset].uasset"), Doc = TEXT("Docs/new é\nname.md");
+    F.Write(Asset, TEXT("new saved asset payload\n")); F.Write(Doc, TEXT("new document\n")); F.Write(TEXT("ignored.txt"), TEXT("keep ignored\n"));
+    const auto Before = F.Repo.Refresh();
+    TestFalse(TEXT("Untracked-only stash requires opt-in"), F.Repo.ReviewStash().bValid);
+    auto Review = F.Repo.ReviewStash(FString(), true, true);
+    if (!TestTrue(TEXT("Review untracked-only work: ") + Review.Error, Review.IsFresh())) return false;
+    TestEqual(TEXT("Only non-ignored paths captured"), Review.UntrackedPaths.Num(), 2);
+    TestTrue(TEXT("Review preserves real index"), F.Repo.Refresh().IndexEntries == Before.IndexEntries);
+    TestTrue(TEXT("Third parent uses LFS pointer"), F.Call({TEXT("show"), Review.Oid + TEXT("^3:") + Asset}).Text().StartsWith(TEXT("version https://git-lfs.github.com/spec/v1")));
+    auto Forged = Review; Forged.UntrackedCommit.Empty();
+    TestFalse(TEXT("Omitted untracked parent refused before cleanup"), F.Repo.ExecuteStash(Forged, TEXT("bad parent"), F.Lease).Ok());
+    F.Write(Asset, TEXT("newer bytes\n"));
+    TestFalse(TEXT("Saved bytes changed after review refused"), F.Repo.ExecuteStash(Review, TEXT("stale bytes"), F.Lease).Ok());
+    TestEqual(TEXT("Newer untracked bytes preserved"), F.Read(Asset), FString(TEXT("newer bytes\n")));
+    TestTrue(TEXT("No stash stored on refusal"), F.Repo.ListStashes().Entries.IsEmpty());
+    F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
+    Review = F.Repo.ReviewStash(FString(), true, true);
+    if (!TestTrue(TEXT("Create untracked stash: ") + Review.Error, F.Complete(Review, Error))) { AddError(Error); return false; }
+    TestFalse(TEXT("Captured asset removed"), IFileManager::Get().FileExists(*FPaths::Combine(F.Root, Asset)));
+    TestFalse(TEXT("Captured documentation removed"), IFileManager::Get().FileExists(*FPaths::Combine(F.Root, Doc)));
+    TestEqual(TEXT("Ignored file retained"), F.Read(TEXT("ignored.txt")), FString(TEXT("keep ignored\n")));
+    TestTrue(TEXT("Index and worktree clean after untracked capture"), F.Repo.Refresh().Files.IsEmpty());
+    // A new ignore rule can hide a collision from ordinary status. Keep it out
+    // of repository configuration so review reflects only the collision test.
+    F.Write(TEXT(".git/info/exclude"), TEXT("Content/\n")); F.Write(Asset, TEXT("ignored local collision\n"));
+    const auto Collision = F.Repo.ReviewStash(Review.Oid);
+    TestTrue(TEXT("Ignored collision absent from ordinary status"), Collision.IsFresh());
+    TestFalse(TEXT("Apply refuses ignored collision"), F.Repo.ExecuteStash(Collision, FString(), F.Lease).Ok());
+    TestEqual(TEXT("Ignored collision intact"), F.Read(Asset), FString(TEXT("ignored local collision\n")));
+    IFileManager::Get().Delete(*FPaths::Combine(F.Root, Asset), true, true); F.Write(TEXT(".git/info/exclude"), TEXT(""));
+    const auto Apply = F.Repo.ReviewStash(Review.Oid);
+    if (!TestTrue(TEXT("Apply untracked stash: ") + Apply.Error, F.Complete(Apply, Error))) { AddError(Error); return false; }
+    TestEqual(TEXT("Hydrated working bytes restored despite skip-smudge"), F.Read(Asset), FString(TEXT("newer bytes\n")));
+    TestEqual(TEXT("Literal documentation path restored"), F.Read(Doc), FString(TEXT("new document\n")));
+    const auto After = F.Repo.Refresh();
+    TestTrue(TEXT("Restored new files remain untracked"), After.Files.Num() == 2 && After.Files[0].bUntracked && After.Files[1].bUntracked);
+    TestTrue(TEXT("Real staging remains unchanged"), After.IndexEntries == Before.IndexEntries);
+    TestEqual(TEXT("Apply retains stash"), F.Repo.ListStashes().Entries.Num(), 1);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashNewSelectionTest, "GitWorkspace.Stash.SelectedNewFilesAndStagedAsset", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashNewSelectionTest::RunTest(const FString&)
+{
+    FStashFixture F; FString Error;
+    F.Write(TEXT("Content/Staged.uasset"), TEXT("staged new asset\n")); F.Call({TEXT("add"), TEXT("Content/Staged.uasset")});
+    F.Write(TEXT("Content/Staged.uasset"), TEXT("working new asset\n"));
+    F.Write(TEXT("Docs/selected.md"), TEXT("selected new file\n")); F.Write(TEXT("Docs/excluded.md"), TEXT("excluded new file\n"));
+    F.Write(TEXT("README.md"), TEXT("unselected tracked edit\n"));
+    TestFalse(TEXT("Untracked selection requires opt-in"), F.Repo.ReviewSelectedStash({TEXT("Docs/selected.md")}).bValid);
+    const auto Review = F.Repo.ReviewSelectedStash({TEXT("Content/Staged.uasset"), TEXT("Docs/selected.md")}, true);
+    if (!TestTrue(TEXT("Review mixed selected new files: ") + Review.Error, Review.IsFresh())) return false;
+    if (!TestTrue(TEXT("Create mixed selected stash"), F.Complete(Review, Error))) { AddError(Error); return false; }
+    TestEqual(TEXT("Unselected untracked bytes preserved"), F.Read(TEXT("Docs/excluded.md")), FString(TEXT("excluded new file\n")));
+    TestEqual(TEXT("Unselected tracked bytes preserved"), F.Read(TEXT("README.md")), FString(TEXT("unselected tracked edit\n")));
+    TestFalse(TEXT("Selected staged asset removed"), IFileManager::Get().FileExists(*FPaths::Combine(F.Root, TEXT("Content/Staged.uasset"))));
+    TestTrue(TEXT("Excluded new file absent from third parent"), F.Call({TEXT("ls-tree"), TEXT("-r"), Review.Oid + TEXT("^3")}).Text().Contains(TEXT("selected.md")) && !F.Call({TEXT("ls-tree"), TEXT("-r"), Review.Oid + TEXT("^3")}).Text().Contains(TEXT("excluded.md")));
+    // Preserve exclusions in a second stash so the first can be applied at its
+    // clean original base, just as the user can do through the same workflow.
+    const auto Rest = F.Repo.ReviewStash(FString(), true, true);
+    if (!TestTrue(TEXT("Preserve remaining work"), F.Complete(Rest, Error))) { AddError(Error); return false; }
+    const auto Apply = F.Repo.ReviewStash(Review.Oid);
+    if (!TestTrue(TEXT("Apply mixed selected stash"), F.Complete(Apply, Error))) { AddError(Error); return false; }
+    TestEqual(TEXT("New asset working version restored"), F.Read(TEXT("Content/Staged.uasset")), FString(TEXT("working new asset\n")));
+    TestEqual(TEXT("New asset staged version restored separately"), F.Call({TEXT("show"), TEXT(":Content/Staged.uasset")}).Text(), FString(TEXT("staged new asset\n")));
+    TestEqual(TEXT("Untracked selected doc restored"), F.Read(TEXT("Docs/selected.md")), FString(TEXT("selected new file\n")));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashUntrackedPathTest, "GitWorkspace.Stash.UntrackedPathSafety", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashUntrackedPathTest::RunTest(const FString&)
+{
+    FStashFixture F; FString Error;
+    F.Write(TEXT("Docs/new.md"), TEXT("new document\n"));
+    const auto Review = F.Repo.ReviewStash(FString(), true, true);
+    if (!TestTrue(TEXT("Capture for collision tests"), F.Complete(Review, Error))) { AddError(Error); return false; }
+    F.Write(TEXT(".git/info/exclude"), TEXT("Docs\n"));
+    IFileManager::Get().MakeDirectory(*FPaths::Combine(F.Root, TEXT("Docs/new.md")), true);
+    auto Apply = F.Repo.ReviewStash(Review.Oid);
+    TestTrue(TEXT("Ignored directory hidden from ordinary status"), Apply.IsFresh());
+    TestFalse(TEXT("Ignored directory collision blocks apply"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
+    IFileManager::Get().DeleteDirectory(*FPaths::Combine(F.Root, TEXT("Docs")), false, true);
+    F.Write(TEXT("ignored.txt"), TEXT("outside target remains\n"));
+    const auto Link = GitWorkspace::Run(TEXT("/bin/ln"), F.Root, {TEXT("-s"), TEXT("."), TEXT("Docs")});
+    if (!TestTrue(TEXT("Make ignored ancestor symlink fixture"), Link.Ok())) return false;
+    Apply = F.Repo.ReviewStash(Review.Oid);
+    TestTrue(TEXT("Ignored symlink hidden from ordinary status"), Apply.IsFresh());
+    TestFalse(TEXT("Symlink ancestor blocks apply before mutation"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
+    TestFalse(TEXT("No redirected write"), IFileManager::Get().FileExists(*FPaths::Combine(F.Root, TEXT("new.md"))));
+    TestFalse(TEXT("No mutation recovery marker for collision"), IFileManager::Get().FileExists(*F.Marker()));
+    GitWorkspace::Run(TEXT("/bin/rm"), F.Root, {TEXT("Docs")}); // Fixture symlink only.
+    F.Write(TEXT(".git/info/exclude"), TEXT(""));
+    IFileManager::Get().MakeDirectory(*FPaths::Combine(F.Root, TEXT("Docs")), true);
+    GitWorkspace::Run(TEXT("/bin/ln"), F.Root, {TEXT("-s"), TEXT("../README.md"), TEXT("Docs/link.md")});
+    TestFalse(TEXT("Untracked symlink capture refused"), F.Repo.ReviewStash(FString(), true, true).bValid);
+    GitWorkspace::Run(TEXT("/bin/rm"), F.Root, {TEXT("Docs/link.md")});
+    F.Write(TEXT("Content/New.umap"), TEXT("unsupported map\n"));
+    TestFalse(TEXT("Untracked map capture refused"), F.Repo.ReviewStash(FString(), true, true).bValid);
+    TestEqual(TEXT("Unsupported file retained"), F.Read(TEXT("Content/New.umap")), FString(TEXT("unsupported map\n")));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashDisjointApplyTest, "GitWorkspace.Stash.ApplyPreservesDisjointWork", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashDisjointApplyTest::RunTest(const FString&)
+{
+    for (bool bRestoreIndex : {true, false})
+    {
+        FStashFixture F; FString Error;
+        F.Write(TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text\n"));
+        F.Write(TEXT("Content/Apply.uasset"), TEXT("base asset\n")); F.Write(TEXT("Content/Keep.uasset"), TEXT("base excluded\n"));
+        F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("LFS apply baseline")});
+        F.Write(TEXT("Content/Apply.uasset"), TEXT("stashed staged asset\n")); F.Call({TEXT("add"), TEXT("Content/Apply.uasset")});
+        const FString SavedIndex = F.Call({TEXT("show"), TEXT(":Content/Apply.uasset")}).Text();
+        F.Write(TEXT("Content/Apply.uasset"), TEXT("stashed working asset\n"));
+        F.Write(TEXT("Docs/Stashed new.md"), TEXT("saved untracked\n"));
+        const auto Create = F.Repo.ReviewStash(FString(), true, true);
+        if (!TestTrue(TEXT("Create stash for disjoint apply"), F.Complete(Create, Error))) { AddError(Error); return false; }
+        F.Write(TEXT("Content/Keep.uasset"), TEXT("unrelated staged asset\n")); F.Call({TEXT("add"), TEXT("Content/Keep.uasset")});
+        const FString KeptIndex = F.Call({TEXT("show"), TEXT(":Content/Keep.uasset")}).Text();
+        F.Write(TEXT("Content/Keep.uasset"), TEXT("unrelated working asset\n"));
+        F.Write(TEXT("Source/Keep.cpp"), TEXT("unrelated staged source\n")); F.Call({TEXT("add"), TEXT("Source/Keep.cpp")}); F.Write(TEXT("Source/Keep.cpp"), TEXT("unrelated working source\n"));
+        F.Write(TEXT("Docs/local.md"), TEXT("unrelated untracked\n")); F.Write(TEXT("ignored.txt"), TEXT("unrelated ignored\n"));
+        F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
+        const auto Before = F.Repo.Refresh();
+        const auto Apply = F.Repo.ReviewStash(Create.Oid, bRestoreIndex);
+        if (!TestTrue(TEXT("Disjoint Apply review: ") + Apply.Error, Apply.IsFresh())) return false;
+        TestTrue(TEXT("Review explicitly lists preserved local files"), Apply.Text.Contains(TEXT("LOCAL CHANGES KEPT IN PLACE")) && Apply.Text.Contains(TEXT("Content/Keep.uasset")));
+        TestTrue(TEXT("Review leaves real staging untouched"), F.Repo.Refresh().IndexEntries == Before.IndexEntries);
+        if (!TestTrue(TEXT("Apply onto disjoint work"), F.Complete(Apply, Error))) { AddError(Error); return false; }
+        TestEqual(TEXT("Saved working asset hydrated"), F.Read(TEXT("Content/Apply.uasset")), FString(TEXT("stashed working asset\n")));
+        TestEqual(TEXT("Saved staging option respected"), F.Call({TEXT("show"), TEXT(":Content/Apply.uasset")}).Text(), bRestoreIndex ? SavedIndex : F.Call({TEXT("show"), TEXT("HEAD:Content/Apply.uasset")}).Text());
+        TestEqual(TEXT("Unrelated staged LFS version preserved"), F.Call({TEXT("show"), TEXT(":Content/Keep.uasset")}).Text(), KeptIndex);
+        TestEqual(TEXT("Unrelated working LFS bytes preserved"), F.Read(TEXT("Content/Keep.uasset")), FString(TEXT("unrelated working asset\n")));
+        TestEqual(TEXT("Unrelated new staged source preserved"), F.Call({TEXT("show"), TEXT(":Source/Keep.cpp")}).Text(), FString(TEXT("unrelated staged source\n")));
+        TestEqual(TEXT("Unrelated new working source preserved"), F.Read(TEXT("Source/Keep.cpp")), FString(TEXT("unrelated working source\n")));
+        TestEqual(TEXT("Unrelated untracked bytes preserved"), F.Read(TEXT("Docs/local.md")), FString(TEXT("unrelated untracked\n")));
+        TestEqual(TEXT("Ignored bytes preserved"), F.Read(TEXT("ignored.txt")), FString(TEXT("unrelated ignored\n")));
+        TestEqual(TEXT("Stashed untracked file restored"), F.Read(TEXT("Docs/Stashed new.md")), FString(TEXT("saved untracked\n")));
+        TestEqual(TEXT("HEAD retained"), F.Repo.Refresh().Head, Before.Head);
+        TestEqual(TEXT("Stash retained"), F.Repo.ListStashes().Entries.Num(), 1);
+        TestFalse(TEXT("Recovery cleared after exact verification"), IFileManager::Get().FileExists(*F.Marker()));
+    }
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashApplyOverlapTest, "GitWorkspace.Stash.ApplyOverlapStaleAndRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashApplyOverlapTest::RunTest(const FString&)
+{
+    FStashFixture F; FString Error;
+    F.Write(TEXT("README.md"), TEXT("saved changes\n")); auto Create = F.Repo.ReviewStash();
+    if (!TestTrue(TEXT("Preserve stash"), F.Complete(Create, Error))) { AddError(Error); return false; }
+    F.Write(TEXT("README.md"), TEXT("local overlap\n"));
+    auto Apply = F.Repo.ReviewStash(Create.Oid);
+    TestFalse(TEXT("Working overlap blocked"), Apply.IsFresh());
+    TestTrue(TEXT("Overlap identifies file"), Apply.Error.Contains(TEXT("README.md")) && Apply.Error.Contains(TEXT("overlaps")));
+    F.Call({TEXT("add"), TEXT("README.md")}); F.Write(TEXT("README.md"), TEXT("base\n"));
+    TestFalse(TEXT("Staged overlap blocked even when work equals base"), F.Repo.ReviewStash(Create.Oid).IsFresh());
+    F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")});
+    F.Call({TEXT("mv"), TEXT("README.md"), TEXT("Docs.md")});
+    TestFalse(TEXT("Rename original path overlap blocked"), F.Repo.ReviewStash(Create.Oid).IsFresh());
+    F.Call({TEXT("reset"), TEXT("--hard"), TEXT("HEAD")});
+    F.Write(TEXT("Docs/Keep.md"), TEXT("local staged\n")); F.Call({TEXT("add"), TEXT("Docs/Keep.md")}); F.Write(TEXT("Docs/Keep.md"), TEXT("local working\n"));
+    F.Write(TEXT("Docs/local.md"), TEXT("untracked one\n"));
+    Apply = F.Repo.ReviewStash(Create.Oid);
+    if (!TestTrue(TEXT("Disjoint review ready"), Apply.IsFresh())) { AddError(Apply.Error); return false; }
+    const auto Index = F.Repo.Refresh().IndexEntries;
+    F.Write(TEXT("Docs/local.md"), TEXT("untracked two\n"));
+    TestFalse(TEXT("Changed unrelated untracked bytes invalidate review"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
+    TestTrue(TEXT("Refusal preserves staging"), F.Repo.Refresh().IndexEntries == Index);
+    TestEqual(TEXT("Refusal leaves target file alone"), F.Read(TEXT("README.md")), FString(TEXT("base\n")));
+    Apply = F.Repo.ReviewStash(Create.Oid); auto Forged = Apply; Forged.ApplyWorkingPaths.Add(TEXT("Docs/Keep.md"));
+    TestFalse(TEXT("Forged restoration scope refused"), F.Repo.ExecuteStash(Forged, FString(), F.Lease).Ok());
+    F.Write(TEXT("Docs/Keep.md"), TEXT("changed after preview\n"));
+    TestFalse(TEXT("Changed unrelated tracked version invalidates review"), F.Repo.ExecuteStash(Apply, FString(), F.Lease).Ok());
+    Apply = F.Repo.ReviewStash(Create.Oid);
+    auto Executed = F.Repo.ExecuteStash(Apply, FString(), F.Lease);
+    if (!TestTrue(TEXT("Disjoint execute succeeds: ") + Executed.Error, Executed.Ok())) return false;
+    F.Write(TEXT("Docs/local.md"), TEXT("external edit after execution\n"));
+    TestFalse(TEXT("Postflight unrelated change retains recovery"), F.Repo.CompleteStash(Apply, F.Lease).Ok());
+    TestTrue(TEXT("Recovery marker retained"), IFileManager::Get().FileExists(*F.Marker()));
+    TestEqual(TEXT("No rollback of external edit"), F.Read(TEXT("Docs/local.md")), FString(TEXT("external edit after execution\n")));
+    TestEqual(TEXT("No reset of unrelated staged version"), F.Call({TEXT("show"), TEXT(":Docs/Keep.md")}).Text(), FString(TEXT("local staged\n")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashApplyPathOverlapTest, "GitWorkspace.Stash.ApplyDirectoryAndCaseOverlap", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashApplyPathOverlapTest::RunTest(const FString&)
+{
+    FStashFixture F; FString Error;
+    F.Write(TEXT("Docs/New.md"), TEXT("stashed new file\n"));
+    const auto Create = F.Repo.ReviewStash(FString(), true, true);
+    if (!TestTrue(TEXT("Preserve new file stash"), F.Complete(Create, Error))) { AddError(Error); return false; }
+    F.Write(TEXT("Docs/New.md/child.txt"), TEXT("local child\n"));
+    auto Apply = F.Repo.ReviewStash(Create.Oid);
+    TestFalse(TEXT("Directory replacement overlaps local child"), Apply.IsFresh());
+    TestTrue(TEXT("Directory overlap explained"), Apply.Error.Contains(TEXT("overlaps")));
+    IFileManager::Get().DeleteDirectory(*FPaths::Combine(F.Root, TEXT("Docs/New.md")), false, true);
+    F.Write(TEXT("Docs/new.md"), TEXT("case variant\n"));
+    Apply = F.Repo.ReviewStash(Create.Oid);
+    TestFalse(TEXT("Case variant overlap blocked"), Apply.IsFresh());
+    TestTrue(TEXT("Case overlap explained"), Apply.Error.Contains(TEXT("overlaps")));
+    TestEqual(TEXT("Case variant remains intact"), F.Read(TEXT("Docs/new.md")), FString(TEXT("case variant\n")));
     return true;
 }
 #endif

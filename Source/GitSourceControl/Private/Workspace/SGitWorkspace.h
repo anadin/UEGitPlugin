@@ -80,11 +80,18 @@ private:
     FReply CancelRestart();
     FReply ShowStashes();
     FReply RefreshStashes();
-    FReply PreviewStash(const FString& Oid, const FString& Selector = FString());
+    FReply PreviewStash(const FString& Oid, const FString& Selector = FString(), bool bSelected = false);
     FReply DropSelectedStash();
     FText StashReportText() const;
     FReply RunStash();
     void RebuildStashes();
+    TSharedRef<SWidget> MakeStashFilePicker();
+    void RebuildStashFiles();
+    void SetStashPathChecked(const FString& Path, bool bChecked);
+    void SetStashIncludeUntracked(bool bInclude);
+    void InvalidateStashSelection();
+    bool CanSelectStashFile(const GitWorkspace::FFile& File) const;
+    FText StashSelectionSummary() const;
     FText IncomingLfsStatus() const;
     FText IncomingReportText() const;
     FReply ChangeLock(bool bUnlock);
@@ -124,7 +131,12 @@ private:
     TSharedPtr<SVerticalBox> StashRows;
     TSharedPtr<SEditableTextBox> StashName;
     TSharedPtr<SMultiLineEditableTextBox> StashReport;
-    bool bRestoreStashIndex = true;
+    TArray<FString> StashSelectedPaths;
+    TArray<TSharedPtr<GitWorkspace::FFile>> StashFileItems;
+    TSharedPtr<SListView<TSharedPtr<GitWorkspace::FFile>>> StashFiles;
+    FString StashFileFilter;
+    bool bStashContentOnly = true;
+    bool bRestoreStashIndex = true, bIncludeUntrackedStash = false;
 };
 
 namespace GitWorkspaceUI

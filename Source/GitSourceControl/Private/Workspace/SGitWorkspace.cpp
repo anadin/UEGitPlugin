@@ -286,6 +286,7 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
             Feedback = Snapshot.bValid ? Result.Message : Snapshot.Error;
             if (Result.bCommitSucceeded) Message->SetText(FText::GetEmpty());
             RebuildRows();
+            RebuildStashFiles();
         }
         if (Result.bRestart && Result.Restart.bReady)
         {
