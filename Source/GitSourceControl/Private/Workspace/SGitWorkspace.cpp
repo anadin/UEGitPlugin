@@ -307,11 +307,11 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
             }
         }
         if (IncomingWindow.IsValid() && IncomingReport) IncomingReport->SetText(IncomingReportText());
-        // Create prepares its review asynchronously, then presents the exact
+        // Create/Apply prepare their reviews asynchronously, then present the exact
         // paths for confirmation in the same window that requested the action.
-        if (auto Window = Result.StashConfirmationWindow.Pin(); Window && Window == StashWindow.Pin() && Window->IsVisible() && StashReview.bCreate && StashReview.IsFresh())
+        if (auto Window = Result.StashConfirmationWindow.Pin(); Window && Window == StashWindow.Pin() && Window->IsVisible() && StashReview.IsFresh() && (StashReview.bCreate || StashInspection.IsFresh()))
         {
-            RunStash();
+            RunStash(Result.bDeleteStashAfterApply);
             return;
         }
         // Publish local status before starting the network query. Opening a tab

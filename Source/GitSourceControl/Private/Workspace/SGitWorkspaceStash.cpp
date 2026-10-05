@@ -67,7 +67,14 @@ FReply SGitWorkspace::ShowStashes()
                     .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->CanRunStashAction(); })
                     .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RunStashAction(); return FReply::Handled(); })]
                 + SHorizontalBox::Slot().AutoWidth().Padding(12, 0)
-                [SNew(SButton).Text(StashText(TEXT("Drop selected stash…")))
+                [SNew(SButton).Text(StashText(TEXT("Apply and delete…")))
+                    .Visibility_Lambda([Weak] { auto P = Weak.Pin(); return P && !P->StashReview.bCreate ? EVisibility::Visible : EVisibility::Collapsed; })
+                    .ToolTipText(StashText(TEXT("Restore this stash, then remove it only after files and assets are verified. Locks stay held.")))
+                    .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->CanRunStashAction(true); })
+                    .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->RunStashAction(true); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth()
+                [SNew(SButton).Text(StashText(TEXT("Drop…")))
+                    .ToolTipText(StashText(TEXT("Remove the selected stash without applying it. Working files, staging and locks stay unchanged.")))
                     .IsEnabled_Lambda([Weak] { auto P = Weak.Pin(); return P && P->IsIdle() && P->StashInspection.IsFresh() && P->StashInspection.DropBlocker.IsEmpty(); })
                     .OnClicked_Lambda([Weak] { if (auto P = Weak.Pin()) return P->DropSelectedStash(); return FReply::Handled(); })]
             ]
@@ -101,18 +108,19 @@ void SGitWorkspace::RebuildStashes()
                 .OnClicked_Lambda([Weak, Oid, Selector] { if (auto P = Weak.Pin()) return P->PreviewStash(Oid, Selector); return FReply::Handled(); })];
     }
 }
-FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector, bool bSelected, bool bConfirmCreate)
+FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector, bool bSelected, bool bConfirmAction, bool bDeleteAfterApply)
 {
     if (!IsIdle()) return FReply::Handled();
     StashReview.bValid = false; StashInspection.bValid = false;
     if (StashReport) StashReport->SetText(StashText(TEXT("Reviewing stash and local work…")));
     auto Repo = Repository; const bool bIndex = bRestoreStashIndex, bUntracked = bIncludeUntrackedStash;
     const auto Paths = StashSelectedPaths;
-    const auto ConfirmationWindow = bConfirmCreate && Oid.IsEmpty() ? StashWindow : TWeakPtr<SWindow>();
-    Start([Repo, Oid, Selector, bIndex, bSelected, bUntracked, Paths, ConfirmationWindow]
+    const auto ConfirmationWindow = bConfirmAction ? StashWindow : TWeakPtr<SWindow>();
+    Start([Repo, Oid, Selector, bIndex, bSelected, bUntracked, Paths, ConfirmationWindow, bDeleteAfterApply]
     {
         FGitWorkspaceTaskResult R; R.bStashReview = true;
         R.StashConfirmationWindow = ConfirmationWindow;
+        R.bDeleteStashAfterApply = bDeleteAfterApply;
         if (!Oid.IsEmpty()) R.StashInspection = Repo->InspectStash(Oid, Selector);
         R.StashReview = bSelected ? Repo->ReviewSelectedStash(Paths, bUntracked) : Repo->ReviewStash(Oid, bIndex, bUntracked); R.Snapshot = Repo->Refresh();
         R.Message = R.StashReview.bValid || R.StashInspection.bValid ? TEXT("Stash preview ready. Review the saved paths and action eligibility.") : R.StashReview.Error;
@@ -120,9 +128,10 @@ FReply SGitWorkspace::PreviewStash(const FString& Oid, const FString& Selector, 
     });
     return FReply::Handled();
 }
-bool SGitWorkspace::CanRunStashAction() const
+bool SGitWorkspace::CanRunStashAction(bool bDeleteAfterApply) const
 {
     if (!IsIdle()) return false;
+    if (bDeleteAfterApply && (StashReview.bCreate || !StashInspection.DropBlocker.IsEmpty())) return false;
     if (StashReview.bCreate)
         return StashReview.bSelected ? !StashSelectedPaths.IsEmpty() : StashReview.bValid || !StashReview.Oid.IsEmpty();
     return !StashInspection.Entry.Oid.IsEmpty();
@@ -131,7 +140,7 @@ FText SGitWorkspace::StashActionText() const
 {
     if (StashReview.bCreate)
         return StashText(TEXT("Create stash…"));
-    return StashText(StashReview.IsFresh() && StashInspection.IsFresh() ? TEXT("Apply stash…") : TEXT("Review again to apply…"));
+    return StashText(TEXT("Apply and keep…"));
 }
 FText SGitWorkspace::StashActionHint() const
 {
@@ -143,14 +152,14 @@ FText SGitWorkspace::StashActionHint() const
         return StashText(TEXT("Create stash checks the files and opens a Yes/No confirmation. Files change only after Yes."));
     }
     if (StashInspection.Entry.Oid.IsEmpty()) return StashText(TEXT("Select a saved stash above to restore its files."));
-    if (StashReview.IsFresh() && StashInspection.IsFresh()) return StashText(TEXT("Apply restores the saved files after confirmation and keeps the stash."));
+    if (StashReview.IsFresh() && StashInspection.IsFresh()) return StashText(TEXT("Apply and keep retains the stash. Apply and delete removes it after a verified restore. Drop removes it without applying. Each action asks for confirmation; locks stay held."));
     if (StashReview.bValid || (StashInspection.bValid && !StashInspection.IsFresh()))
-        return StashText(TEXT("Review expired or changed. Review again below before applying the stash."));
-    return StashText(TEXT("Apply is not ready. Read the blocker above, resolve it, then review again."));
+        return StashText(TEXT("The chosen Apply action refreshes the review, then asks for confirmation. No files change before Yes."));
+    return StashText(TEXT("Apply is not ready. Read the blocker above, resolve it, then choose an Apply action to check again."));
 }
-FReply SGitWorkspace::RunStashAction()
+FReply SGitWorkspace::RunStashAction(bool bDeleteAfterApply)
 {
-    if (!CanRunStashAction()) return FReply::Handled();
+    if (!CanRunStashAction(bDeleteAfterApply)) return FReply::Handled();
     if (StashReview.bCreate && (!StashName || StashName->GetText().ToString().TrimStartAndEnd().IsEmpty()))
     {
         Feedback = TEXT("Enter a name for the new stash.");
@@ -158,28 +167,36 @@ FReply SGitWorkspace::RunStashAction()
         if (StashName && !FApp::IsUnattended() && !IsRunningCommandlet()) FSlateApplication::Get().SetKeyboardFocus(StashName);
         return FReply::Handled();
     }
-    // Create continues to confirmation after preparation. Explicit Preview
-    // actions and refreshing Apply still only publish a review.
+    // The chosen action continues to confirmation after preparation. Explicit
+    // Preview actions still only publish a review.
     if (!StashReview.IsFresh() || (!StashReview.bCreate && !StashInspection.IsFresh()))
         return StashReview.bCreate ? PreviewStash(FString(), FString(), StashReview.bSelected, true) :
-            PreviewStash(StashInspection.Entry.Oid, StashInspection.Entry.Selector);
-    return RunStash();
+            PreviewStash(StashInspection.Entry.Oid, StashInspection.Entry.Selector, false, true, bDeleteAfterApply);
+    return RunStash(bDeleteAfterApply);
 }
-FReply SGitWorkspace::RunStash()
+FReply SGitWorkspace::RunStash(bool bDeleteAfterApply)
 {
     if (!IsIdle()) return FReply::Handled();
-    if (!StashReview.IsFresh() || (!StashReview.bCreate && !StashInspection.IsFresh())) return RunStashAction();
+    if (!StashReview.IsFresh() || (!StashReview.bCreate && !StashInspection.IsFresh())) return RunStashAction(bDeleteAfterApply);
 #if PLATFORM_MAC
     const auto Reviewed = StashReview; const FString Name = StashName ? StashName->GetText().ToString() : FString();
+    const auto Inspected = StashInspection;
     TArray<GitWorkspace::FIncomingPackage> Packages;
     FString Error = GitWorkspace::ReviewPackageChanges(Reviewed.Local.Root, Reviewed.Changes, Packages, Reviewed.bCreate);
     if (Reviewed.bCreate && Name.TrimStartAndEnd().IsEmpty()) Error = TEXT("Enter a name for the new stash.");
+    if (bDeleteAfterApply && (Reviewed.bCreate || !Inspected.DropBlocker.IsEmpty()))
+        Error = Inspected.DropBlocker.IsEmpty() ? TEXT("Select a saved stash before Apply and delete.") : Inspected.DropBlocker;
     if (!Error.IsEmpty()) { Feedback = Error; if (StashReport) StashReport->SetText(StashText(Error)); return FReply::Handled(); }
-    const FString Prompt = (Reviewed.bCreate ? TEXT("Create stash: ") + Name : TEXT("Apply stash: ") + Reviewed.Oid) + TEXT("\n\n") + Reviewed.Text +
-        TEXT("\nExisting supported assets will reload. New loaded assets must unload before removal; referencing assets can block this. Undo/selection may reset. If a file update or reload becomes uncertain, the editor will close without saving and preserve recovery instructions. The stash will not be dropped.");
+    const FString Action = bDeleteAfterApply ? TEXT("Apply and delete: ") : TEXT("Apply and keep: ");
+    const FString Retention = bDeleteAfterApply ?
+        TEXT("\nOnly this selected stash entry will be deleted, after files, staging and asset reloads are verified. A failed restore keeps the stash. Local Git recovery references are retained. Close other Git clients before continuing.") :
+        TEXT("\nThe stash will be kept.");
+    const FString Prompt = (Reviewed.bCreate ? TEXT("Create stash: ") + Name : Action + Inspected.Entry.Selector + TEXT("  ") + Inspected.Entry.Label + TEXT("\n") + Reviewed.Oid) + TEXT("\n\n") + Reviewed.Text +
+        TEXT("\nExisting supported assets will reload. New loaded assets must unload before removal; referencing assets can block this. Undo/selection may reset. If a file update or reload becomes uncertain, the editor will close without saving and preserve recovery instructions.") + Retention;
     if (FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No, StashText(Prompt)) != EAppReturnType::Yes)
     {
-        Feedback = Reviewed.bCreate ? TEXT("Stash creation cancelled. No files changed.") : TEXT("Stash apply cancelled. No files changed.");
+        Feedback = Reviewed.bCreate ? TEXT("Stash creation cancelled. No files changed.") :
+            (bDeleteAfterApply ? TEXT("Apply and delete cancelled. No files changed; stash kept.") : TEXT("Apply and keep cancelled. No files changed; stash kept."));
         if (StashReport) StashReport->SetText(StashText(Feedback));
         return FReply::Handled();
     }
@@ -188,13 +205,14 @@ FReply SGitWorkspace::RunStash()
         FScopedSlowTask Task(1.f, StashText(TEXT("Updating stash and refreshing assets…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
         GitWorkspaceSession::FEditorWriteScope Access;
         if (!Access.Acquire(Reviewed.Local.Root, Error)) { Feedback = Error; if (StashReport) StashReport->SetText(StashText(Error)); return FReply::Handled(); }
-        const auto Result = GitWorkspace::StashAndReload(*Repository, Reviewed, Name, Access.Lease());
+        const auto Result = bDeleteAfterApply ? GitWorkspace::ApplyStashAndDelete(*Repository, Reviewed, Inspected, Access.Lease()) :
+            GitWorkspace::StashAndReload(*Repository, Reviewed, Name, Access.Lease());
         if (Result.bRecoveryRequired)
         {
             FString Root, GitDir; GitWorkspaceSession::FindRepository(Reviewed.Local.Root, Root, GitDir);
             GitWorkspaceSession::StopForRecovery(Result.Message + TEXT("\n\nThe editor will close without saving. Recovery report: ") + GitWorkspaceSession::RecoveryFile(GitDir));
         }
-        Feedback = Result.Message; StashReview.bValid = false;
+        Feedback = Result.Message; StashReview.bValid = false; StashInspection.bValid = false;
         if (StashReport) StashReport->SetText(StashText(Feedback));
         if (Result.bSuccess) { RestartMessage = Feedback; Locks.bVerified = false; bVerifyLocksOnOpen = true; }
     }

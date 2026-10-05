@@ -30,6 +30,7 @@ struct FGitWorkspaceTaskResult
     GitWorkspace::FStashInspection StashInspection;
     bool bStashes = false, bStashReview = false;
     TWeakPtr<SWindow> StashConfirmationWindow;
+    bool bDeleteStashAfterApply = false;
     bool bRestart = false;
     bool bReload = false;
     bool bIncomingLfs = false;
@@ -81,14 +82,14 @@ private:
     FReply CancelRestart();
     FReply ShowStashes();
     FReply RefreshStashes();
-    FReply PreviewStash(const FString& Oid, const FString& Selector = FString(), bool bSelected = false, bool bConfirmCreate = false);
+    FReply PreviewStash(const FString& Oid, const FString& Selector = FString(), bool bSelected = false, bool bConfirmAction = false, bool bDeleteAfterApply = false);
     FReply DropSelectedStash();
     FText StashReportText() const;
     FText StashActionText() const;
     FText StashActionHint() const;
-    bool CanRunStashAction() const;
-    FReply RunStashAction();
-    FReply RunStash();
+    bool CanRunStashAction(bool bDeleteAfterApply = false) const;
+    FReply RunStashAction(bool bDeleteAfterApply = false);
+    FReply RunStash(bool bDeleteAfterApply = false);
     void RebuildStashes();
     TSharedRef<SWidget> MakeStashFilePicker();
     void RebuildStashFiles();

@@ -74,7 +74,7 @@ FStashInspection FRepository::InspectStashInternal(const FString& Oid, const FSt
         for (const auto& Change : Changes) R.Text += FString::Chr(Change.Status) + TEXT("  ") + StashDisplay(Change.Path) + TEXT("\n");
         R.Text += TEXT("\n");
     }
-    R.Text += TEXT("Inspection does not change files, staging or locks. Apply keeps this stash; Drop is a separate action.\n");
+    R.Text += TEXT("Apply and keep restores files and retains this stash. Apply and delete removes this entry only after a verified restore. Drop removes the entry without applying it. Locks stay held.\n");
     const auto After = ListStashesInternal();
     if (!After.bValid || After.Fingerprint != R.ListFingerprint) return Fail(TEXT("Stash list changed during inspection. Refresh and select it again."));
     R.DropBlocker = StashDropRecovery();

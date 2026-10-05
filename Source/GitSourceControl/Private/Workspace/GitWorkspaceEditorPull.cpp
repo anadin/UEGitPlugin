@@ -139,5 +139,29 @@ FEditorPullResult StashAndReload(FRepository& Repository, const FStashReview& Re
     if (Result.bSuccess) Result.Message = (Reviewed.bCreate ? TEXT("Named stash created. Reviewed files preserved in the stash. ") : TEXT("Stash applied and retained. ")) + Result.Message;
     return Result;
 }
+FEditorPullResult ApplyStashAndDelete(FRepository& Repository, const FStashReview& Reviewed,
+    const FStashInspection& Inspected, const GitWorkspaceSession::FLease& Lease)
+{
+    FEditorPullResult Result;
+    if (Reviewed.bCreate || !Reviewed.IsFresh() || !Inspected.IsFresh() ||
+        Inspected.Entry.Oid != Reviewed.Oid || Inspected.Root != Reviewed.Local.Root)
+    { Result.Message = TEXT("Review the selected stash again before Apply and delete."); return Result; }
+    if (!Inspected.DropBlocker.IsEmpty()) { Result.Message = Inspected.DropBlocker; return Result; }
+    const auto Listed = Async(EAsyncExecution::ThreadPool, [&] { return Repository.ListStashes(); }).Get();
+    if (!Listed.bValid || Listed.Fingerprint != Inspected.ListFingerprint)
+    { Result.Message = TEXT("The stash list changed. Nothing applied or deleted; select the stash again."); return Result; }
+
+    Result = RunWithPackageReload(Reviewed.Local.Root, Reviewed.Changes, Lease,
+        [&] { return Repository.ExecuteStash(Reviewed, FString(), Lease); }, [&] { return Repository.CompleteStash(Reviewed, Lease); });
+    if (!Result.bSuccess) return Result;
+    // Retain the original selector and list fingerprint across restoration.
+    // Never resolve a newer stash@{n} or delete before asset verification.
+    const auto Dropped = Async(EAsyncExecution::ThreadPool, [&] { return Repository.DropStash(Inspected, Lease); }).Get();
+    Result.bSuccess = Dropped.Ok();
+    Result.Message = (Dropped.Ok() ? TEXT("Stash applied and deleted from the stash list. ") :
+        TEXT("Stash applied successfully, but deletion could not be confirmed. Do not apply again. ")) + Result.Message +
+        TEXT("\n") + (Dropped.Ok() ? Dropped.Text() : Dropped.Error);
+    return Result;
+}
 }
 #endif

@@ -253,7 +253,7 @@ FStashReview FRepository::ReviewStashInternal(const FString& Oid, bool bRestoreI
     R.Fingerprint += R.WorkingTree + R.IndexTree + R.ExpectedWorkingTree + R.ExpectedIndexTree + R.UntrackedTree + R.UntrackedBytes +
         R.LocalWorkingTree + R.LocalIndexTree + R.PreservedUntrackedBytes +
         (bSelected ? TEXT("selected") : TEXT("all")) + (R.bIncludeUntracked ? TEXT("untracked") : TEXT("tracked"));
-    R.Text = R.bCreate ? (bSelected ? TEXT("CREATE STASH — SELECTED FILES\n") : TEXT("CREATE STASH — WHOLE REPOSITORY\n")) : TEXT("APPLY STASH — KEEP THE STASH\n");
+    R.Text = R.bCreate ? (bSelected ? TEXT("CREATE STASH — SELECTED FILES\n") : TEXT("CREATE STASH — WHOLE REPOSITORY\n")) : TEXT("APPLY STASH — RESTORE SAVED FILES\n");
     R.Text += TEXT("\nRepository: ") + Display(R.Local.Root) + TEXT("\nBase: ") + R.Base + TEXT("\nSnapshot: ") + R.Oid;
     R.Text += R.bCreate ? (bSelected ? TEXT("\nOnly the listed paths are captured, with staged and working versions saved separately. Unselected changes and ignored files stay in place. Rename pairs are included together.\n") : TEXT("\nSaved staged and unstaged versions are captured separately. Ignored files stay in place. Filters in Changes do not limit this operation.\n")) :
         (R.bRestoreIndex ? TEXT("\nRestore the saved staging state.\n") : TEXT("\nApply modifications without restoring staging.\n"));

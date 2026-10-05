@@ -578,6 +578,7 @@ bool FGitStashAssetReloadTest::RunTest(const FString&)
     TestTrue(TEXT("Staging restored separately"), Repo.Refresh().IndexEntries == Index);
     TestTrue(TEXT("Map bytes untouched"), F.Bytes(F.Paths[3]) == BaselineMap);
     TestEqual(TEXT("Stash remains after apply"), Repo.ListStashes().Entries.Num(), 1);
+    const FString KeptOid = Repo.ListStashes().Entries[0].Oid;
     const TWeakObjectPtr<UObject> ExcludedMaterial = F.Assets[1].Get(), ExcludedTexture = F.Assets[2].Get();
     const auto Selected = Repo.ReviewSelectedStash({F.Paths[0]});
     Result = GitWorkspace::StashAndReload(Repo, Selected, TEXT("Blueprint only"), Lease);
@@ -588,7 +589,13 @@ bool FGitStashAssetReloadTest::RunTest(const FString&)
     TestTrue(TEXT("Excluded texture object retained"), ExcludedTexture.IsValid() && ExcludedTexture.Get() == F.Assets[2].Get());
     for (int32 I = 1; I < 3; ++I) TestTrue(TEXT("Excluded loaded payload unchanged"), F.Bytes(F.Paths[I]) == WorkingBytes[I]);
     const auto DisjointApply = Repo.ReviewStash(Repo.ListStashes().Entries[0].Oid);
-    Result = GitWorkspace::StashAndReload(Repo, DisjointApply, FString(), Lease);
+    const auto ToDelete = Repo.InspectStash(DisjointApply.Oid, TEXT("stash@{0}"));
+    F.Assets[0]->MarkPackageDirty();
+    Result = GitWorkspace::ApplyStashAndDelete(Repo, DisjointApply, ToDelete, Lease);
+    TestTrue(TEXT("Unsaved asset prevents Apply and delete without recovery"), !Result.bSuccess && !Result.bRecoveryRequired);
+    TestEqual(TEXT("Failed restore keeps both stashes"), Repo.ListStashes().Entries.Num(), 2);
+    F.Assets[0]->GetPackage()->SetDirtyFlag(false);
+    Result = GitWorkspace::ApplyStashAndDelete(Repo, DisjointApply, ToDelete, Lease);
     if (!TestTrue(TEXT("Apply while unrelated assets remain changed: ") + Result.Message, Result.bSuccess)) return false;
     TestEqual(TEXT("Only applied Blueprint reloads"), Result.Reloaded, 1);
     TestEqual(TEXT("Saved Blueprint restored"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 2")));
@@ -596,8 +603,119 @@ bool FGitStashAssetReloadTest::RunTest(const FString&)
     TestTrue(TEXT("Unrelated texture object retained through Apply"), ExcludedTexture.Get() == F.Assets[2].Get());
     TestTrue(TEXT("All distinct staged versions retained/restored"), Repo.Refresh().IndexEntries == Index);
     for (int32 I = 1; I < 3; ++I) TestTrue(TEXT("Unrelated loaded bytes untouched through Apply"), F.Bytes(F.Paths[I]) == WorkingBytes[I]);
+    const auto Remaining = Repo.ListStashes();
+    TestTrue(TEXT("Only successfully restored selected stash deleted"), Remaining.Entries.Num() == 1 && Remaining.Entries[0].Oid == KeptOid);
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashApplyDeleteIdentityTest, "GitWorkspace.Editor.StashApplyDeleteIdentity", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashApplyDeleteIdentityTest::RunTest(const FString&)
+{
+    FEditorAssetFixture F;
+    const FString Path = FPaths::Combine(F.Root, TEXT("README.md"));
+    FFileHelper::SaveStringToFile(TEXT("base"), *Path);
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("base")});
+    FFileHelper::SaveStringToFile(TEXT("staged"), *Path); F.Call({TEXT("add"), TEXT("README.md")});
+    GitWorkspace::FRepository Repo(F.Git, F.Root);
+    const auto Staged = Repo.Refresh().IndexEntries;
+    FFileHelper::SaveStringToFile(TEXT("working"), *Path); const auto Working = F.Bytes(TEXT("README.md"));
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("original")});
+    const FString Oid = F.Call({TEXT("rev-parse"), TEXT("refs/stash")}).Text().TrimEnd();
+    // Git coalesces consecutive identical reflog values; separate duplicates
+    // with a genuinely different stash, as an external client would.
+    FFileHelper::SaveStringToFile(TEXT("intermediate work"), *Path);
+    F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("intermediate")});
+    const FString Middle = F.Call({TEXT("rev-parse"), TEXT("refs/stash")}).Text().TrimEnd();
+    F.Call({TEXT("stash"), TEXT("store"), TEXT("-m"), TEXT("duplicate"), Oid});
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Apply/delete fixture lease"), Lease.Acquire(F.Root, true, Error))) return false;
+    const auto Base = Repo.Refresh(); const auto BeforeBytes = F.Bytes(TEXT("README.md"));
+    const auto Review = Repo.ReviewStash(Oid);
+    auto Inspection = Repo.InspectStash(Oid, TEXT("stash@{2}"));
+    if (!TestTrue(TEXT("Review exact older duplicate entry"), Review.IsFresh() && Inspection.IsFresh())) return false;
+    auto Expired = Inspection; Expired.ReviewedSeconds -= 301;
+    TestFalse(TEXT("Expired deletion inspection refused"), GitWorkspace::ApplyStashAndDelete(Repo, Review, Expired, Lease).bSuccess);
+    auto Mismatch = Inspection; Mismatch.Entry.Oid = Base.Head;
+    TestFalse(TEXT("Different inspected object refused"), GitWorkspace::ApplyStashAndDelete(Repo, Review, Mismatch, Lease).bSuccess);
+    F.Call({TEXT("stash"), TEXT("store"), TEXT("-m"), TEXT("newer entry"), Middle});
+    const auto Stale = GitWorkspace::ApplyStashAndDelete(Repo, Review, Inspection, Lease);
+    TestFalse(TEXT("Changed ordinal list refused before Apply"), Stale.bSuccess);
+    TestTrue(TEXT("Preflight failures leave saved files untouched"), F.Bytes(TEXT("README.md")) == BeforeBytes);
+    TestTrue(TEXT("Preflight failures leave staging untouched"), Repo.Refresh().IndexEntries == Base.IndexEntries);
+    Inspection = Repo.InspectStash(Oid, TEXT("stash@{3}"));
+    const auto Applied = GitWorkspace::ApplyStashAndDelete(Repo, Review, Inspection, Lease);
+    if (!TestTrue(TEXT("Apply/delete older duplicate: ") + Applied.Message, Applied.bSuccess)) return false;
+    TestTrue(TEXT("Working bytes restored"), F.Bytes(TEXT("README.md")) == Working);
+    TestTrue(TEXT("Distinct staging restored"), Repo.Refresh().IndexEntries == Staged);
+    TestEqual(TEXT("HEAD unchanged"), Repo.Refresh().Head, Base.Head);
+    const auto Remaining = Repo.ListStashes();
+    TestTrue(TEXT("Only original entry deleted; duplicates retained in order"), Remaining.Entries.Num() == 3 &&
+        Remaining.Entries[0].Oid == Middle && Remaining.Entries[0].Label == TEXT("newer entry") &&
+        Remaining.Entries[1].Oid == Oid && Remaining.Entries[1].Label == TEXT("duplicate") &&
+        Remaining.Entries[2].Oid == Middle && Remaining.Entries[2].Label.Contains(TEXT("intermediate")));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashApplyDeleteRecoveryTest, "GitWorkspace.Editor.StashApplyDeleteRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitStashApplyDeleteRecoveryTest::RunTest(const FString&)
+{
+    // Simulate external changes during package reload, on each side of the
+    // completion gate. These repositories and packages are disposable.
+    for (bool bFailCompletion : {false, true})
+    {
+        FEditorAssetFixture F;
+        F.Assets.Emplace(FKismetEditorUtilities::CreateBlueprint(AActor::StaticClass(), F.Package(TEXT("BP_Probe")), TEXT("BP_Probe"), BPTYPE_Normal));
+        F.Paths = {TEXT("Content/BP_Probe.uasset")};
+        const FString Document = FPaths::Combine(F.Root, TEXT("README.md"));
+        FFileHelper::SaveStringToFile(TEXT("base"), *Document);
+        if (!TestTrue(TEXT("Save baseline Blueprint"), F.Save())) return false;
+        F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("baseline")});
+        CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription = TEXT("Saved iteration");
+        F.Assets[0]->MarkPackageDirty();
+        if (!TestTrue(TEXT("Save modified Blueprint"), F.Save())) return false;
+        const auto Saved = F.Bytes(F.Paths[0]);
+        GitWorkspace::FRepository Repo(F.Git, F.Root); FString Error; GitWorkspaceSession::FLease Lease;
+        if (!TestTrue(TEXT("Recovery fixture lease"), Lease.Acquire(F.Root, true, Error))) return false;
+        bool bInterfere = false, bObservedStashBeforeCompletion = false, bInterferenceSucceeded = false;
+        FString Oid, AlternateOid;
+        const auto Delegate = FCoreUObjectDelegates::OnPackageReloaded.AddLambda([&](EPackageReloadPhase Phase, FPackageReloadedEvent* Event)
+        {
+            if (Phase == EPackageReloadPhase::OnPackageFixup && Event)
+                if (UObject* const* Replacement = Event->GetRepointedObjects().Find(F.Assets[0].Get())) F.Assets[0].Reset(*Replacement);
+            if (Phase == EPackageReloadPhase::PostPackageFixup && bInterfere)
+            {
+                bInterfere = false;
+                const auto List = Repo.ListStashes();
+                bObservedStashBeforeCompletion = List.Entries.Num() == 1 && List.Entries[0].Oid == Oid;
+                bInterferenceSucceeded = bFailCompletion ? FFileHelper::SaveStringToFile(TEXT("external edit"), *Document) :
+                    F.Call({TEXT("stash"), TEXT("store"), TEXT("-m"), TEXT("concurrent entry"), AlternateOid}).Ok();
+            }
+        });
+        ON_SCOPE_EXIT { FCoreUObjectDelegates::OnPackageReloaded.Remove(Delegate); };
+        const auto CreateReview = Repo.ReviewStash();
+        AlternateOid = CreateReview.Oid; // Same saved files, distinct commit title.
+        const auto Created = GitWorkspace::StashAndReload(Repo, CreateReview, TEXT("Recovery test"), Lease);
+        if (!TestTrue(TEXT("Create recovery fixture stash: ") + Created.Message, Created.bSuccess)) return false;
+        Oid = Repo.ListStashes().Entries[0].Oid;
+        const auto Review = Repo.ReviewStash(Oid);
+        const auto Inspection = Repo.InspectStash(Oid, TEXT("stash@{0}"));
+        bInterfere = true;
+        const auto Result = GitWorkspace::ApplyStashAndDelete(Repo, Review, Inspection, Lease);
+        TestTrue(TEXT("Stash still present during reload, before completion"), bObservedStashBeforeCompletion);
+        TestTrue(TEXT("External interference exercised"), bInterferenceSucceeded);
+        TestFalse(TEXT("Interrupted composite action not reported as success"), Result.bSuccess);
+        TestEqual(TEXT("Only failed restore verification needs editor recovery"), Result.bRecoveryRequired, bFailCompletion);
+        TestTrue(TEXT("Hydrated working asset bytes restored"), F.Bytes(F.Paths[0]) == Saved);
+        TestEqual(TEXT("Loaded asset reflects restored stash"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Saved iteration")));
+        const auto Remaining = Repo.ListStashes();
+        TestEqual(TEXT("No entry deleted after interference"), Remaining.Entries.Num(), bFailCompletion ? 1 : 2);
+        TestTrue(TEXT("Original stash retained"), Remaining.Entries.ContainsByPredicate([&](const auto& Entry) { return Entry.Oid == Oid && Entry.Label == TEXT("Recovery test"); }));
+        if (!bFailCompletion) TestTrue(TEXT("Deletion failure explains Apply completed and must not repeat"), Result.Message.Contains(TEXT("Stash applied successfully")) && Result.Message.Contains(TEXT("Do not apply again")));
+        FString CanonicalRoot, GitDir; GitWorkspaceSession::FindRepository(F.Root, CanonicalRoot, GitDir);
+        TestEqual(TEXT("Recovery marker follows file verification outcome"), IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(GitDir)), bFailCompletion);
+    }
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashPanelTest, "GitWorkspace.Editor.StashPreviewThroughPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitStashPanelTest::RunTest(const FString&)
 {
@@ -614,6 +732,7 @@ bool FGitStashPanelTest::RunTest(const FString&)
     Panel->ShowStashes(); Settle();
     TestTrue(TEXT("Empty stash list visible"), Panel->Stashes.bValid && Panel->Stashes.Entries.IsEmpty());
     TestFalse(TEXT("Empty selection cannot create a stash"), Panel->CanRunStashAction());
+    TestFalse(TEXT("Delete not offered in Create mode"), Panel->CanRunStashAction(true));
     TestEqual(TEXT("Initial action is Create stash"), Panel->StashActionText().ToString(), FString(TEXT("Create stash…")));
     TestEqual(TEXT("Content checklist shows new file directly"), Panel->StashFileItems.Num(), 1);
     Panel->SetStashPathChecked(TEXT("Content/New.uasset"), true);
@@ -694,12 +813,20 @@ bool FGitStashPanelTest::RunTest(const FString&)
     TestTrue(TEXT("Panel explains saved paths and Apply blocker together"), Report.Contains(TEXT("SAVED WORKING CHANGES")) && Report.Contains(TEXT("README.md")) && Report.Contains(TEXT("APPLY BLOCKED")));
     TestTrue(TEXT("Blocked Apply offers review and explains blocker"), Panel->CanRunStashAction() && Panel->StashActionHint().ToString().Contains(TEXT("blocker")));
     F.Call({TEXT("restore"), TEXT("--"), TEXT("README.md")});
-    Panel->RunStashAction(); Settle();
+    {
+        TGuardValue<bool> Unattended(GIsRunningUnattendedScript, true);
+        Panel->RunStashAction(); Settle();
+        TestEqual(TEXT("Apply and keep refreshes and reaches confirmation"), Panel->Feedback, FString(TEXT("Apply and keep cancelled. No files changed; stash kept.")));
+    }
     TestTrue(TEXT("Resolve overlap and review the exact same stash"), Panel->StashReview.IsFresh() && Panel->StashReview.Oid == Oid);
     TestTrue(TEXT("Pruning old Create checks preserves Apply mode and inspection"), Panel->StashSelectedPaths.IsEmpty() && !Panel->StashReview.bCreate && Panel->StashInspection.IsFresh());
     Panel->StashReview.ReviewedSeconds -= 301; Panel->StashInspection.ReviewedSeconds -= 301;
-    TestTrue(TEXT("Expired Apply offers review again"), Panel->CanRunStashAction() && Panel->StashActionText().ToString().Contains(TEXT("Review again")));
-    Panel->RunStashAction(); Settle();
+    TestTrue(TEXT("Expired Apply keeps stable labels and both actions"), Panel->CanRunStashAction() && Panel->CanRunStashAction(true) && Panel->StashActionText().ToString() == TEXT("Apply and keep…"));
+    {
+        TGuardValue<bool> Unattended(GIsRunningUnattendedScript, true);
+        Panel->RunStashAction(true); Settle();
+        TestEqual(TEXT("Expired Apply and delete preserves intent through confirmation"), Panel->Feedback, FString(TEXT("Apply and delete cancelled. No files changed; stash kept.")));
+    }
     TestTrue(TEXT("Expired Apply refreshes inspection and review"), Panel->StashReview.IsFresh() && Panel->StashInspection.IsFresh());
     TestEqual(TEXT("Refreshing Apply does not apply saved work"), F.Call({TEXT("diff"), TEXT("--name-only")}).Text().TrimEnd(), FString());
     TestEqual(TEXT("Refreshing Apply keeps the saved stash"), Repo->ListStashes().Entries.Num(), 1);
