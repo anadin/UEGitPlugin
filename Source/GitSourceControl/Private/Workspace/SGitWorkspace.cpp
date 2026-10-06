@@ -96,6 +96,9 @@ void SGitWorkspace::Construct(const FArguments& Args)
             + SHorizontalBox::Slot().AutoWidth().Padding(4, 0)
             [SNew(SButton).Text(Text(TEXT("Refresh"))).IsEnabled_Lambda([this] { return IsIdle(); }).OnClicked(this, &SGitWorkspace::Refresh)]
             + SHorizontalBox::Slot().AutoWidth().Padding(4, 0)
+            [SNew(SButton).Text(Text(TEXT("History…"))).ToolTipText(Text(TEXT("Browse committed files and revisions in this repository. History inspection does not change files, staging or locks.")))
+                .IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked(this, &SGitWorkspace::ShowHistory)]
+            + SHorizontalBox::Slot().AutoWidth().Padding(4, 0)
             [SNew(SButton).Text(Text(TEXT("Save assets…"))).IsEnabled_Lambda([this] { return IsIdle(); }).OnClicked_Lambda([this]
             {
                 FEditorFileUtils::SaveDirtyPackages(true, true, true);
@@ -218,7 +221,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
     ];
     Refresh();
 }
-SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = UnlockWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HandoffWindow.Pin()) Window->RequestDestroyWindow(); }
+SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = UnlockWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HandoffWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HistoryWindow.Pin()) Window->RequestDestroyWindow(); }
 void SGitWorkspace::WaitForWork() { if (Pending.IsValid()) { Pending.Wait(); Pending = TFuture<FGitWorkspaceTaskResult>(); } }
 void SGitWorkspace::Start(TFunction<FGitWorkspaceTaskResult()> Work)
 {

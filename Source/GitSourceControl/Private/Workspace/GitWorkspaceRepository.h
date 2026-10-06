@@ -85,6 +85,25 @@ struct FIncomingChange
 // Raw, NUL-delimited, no-rename tree diff; paths are never split on whitespace.
 bool ParseIncomingChanges(const TArray<uint8>& Bytes, TArray<FIncomingChange>& Changes, FString& Error);
 
+struct FHistoryCommit { FString Oid, Author, Date, Subject; TArray<FString> Parents; };
+struct FHistoryList
+{
+    FString Root, Branch, Head, Error;
+    TArray<FHistoryCommit> Commits;
+    bool bValid = false, bHasMore = false;
+};
+struct FHistoryChange { FString Path, OldOid, NewOid, OldMode, NewMode; TCHAR Status = '?'; };
+struct FCommitInspection
+{
+    FHistoryCommit Commit;
+    FString Root, Message, Error;
+    TArray<FHistoryChange> Files;
+    bool bValid = false;
+    FString Text() const;
+};
+// Complete NUL-delimited commit records; never split paths/messages on newlines.
+bool ParseHistory(const TArray<uint8>& Bytes, TArray<FHistoryCommit>& Commits, FString& Error);
+
 struct FRemoteSnapshot
 {
     FString Root, Branch, Head, Remote, RemoteRef, RemoteHead, Context, Error;
@@ -179,6 +198,9 @@ public:
     FResult Unstage(const TArray<FString>& Paths);
     FResult Commit(const FSnapshot& Reviewed, const FString& Message);
     FResult Diff(const FString& Path, bool bStaged);
+    FHistoryList ListHistory(int32 Limit = 100);
+    FCommitInspection InspectCommit(const FString& Oid);
+    FResult InspectCommitFile(const FString& Oid, const FString& Path);
     FLockSnapshot VerifyLocks(const FString& Remote);
     FUnlockReview ReviewUnlock(const FString& Remote, const FString& Path);
     FResult ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed = false, const FString& ReviewedHead = FString());
@@ -205,6 +227,7 @@ public:
     const FString& GitExecutable() const { return GitBinary; }
     const FString& Directory() const { return RequestedDirectory; }
 private:
+    FCommitInspection InspectCommitInternal(const FString& Oid);
 #if PLATFORM_MAC
     FResult PullAssets(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bForReload);
     FResult HydratedGit(const TArray<FString>& Args) const;

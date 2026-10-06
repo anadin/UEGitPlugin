@@ -91,6 +91,7 @@ private:
     FString FinishReloadPull();
     FReply CancelRestart();
     FReply ShowStashes();
+    FReply ShowHistory();
     FReply RefreshStashes();
     FReply PreviewStash(const FString& Oid, const FString& Selector = FString(), bool bSelected = false, bool bConfirmAction = false, bool bDeleteAfterApply = false);
     FReply DropSelectedStash();
@@ -161,6 +162,7 @@ private:
     bool bCheckingLocks = false;
     bool bDownloadingLfs = false;
     TWeakPtr<SWindow> IncomingWindow;
+    TWeakPtr<SWindow> HistoryWindow;
     TSharedPtr<SMultiLineEditableTextBox> IncomingReport;
     GitWorkspace::FStashList Stashes;
     GitWorkspace::FStashReview StashReview;
