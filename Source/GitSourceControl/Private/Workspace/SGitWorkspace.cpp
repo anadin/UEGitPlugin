@@ -1,5 +1,6 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "SGitWorkspace.h"
+#include "GitWorkspaceSaveFlow.h"
 #include "GitWorkspacePullReview.h"
 #include "GitWorkspaceEditorPull.h"
 #include "Misc/ScopedSlowTask.h"
@@ -84,6 +85,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
     Repository = Args._Repository;
     if (!Repository)
         Repository = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(GitWorkspace::FindGitExecutable(FGitSourceControlModule::Get().AccessSettings().GetBinaryPath()), FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
+    LockRemote = GitWorkspaceSave::LockRemote();
     RestartMessage = GitWorkspace::LastRestartResult(Repository->Directory());
     ChildSlot
     [
@@ -101,7 +103,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
             + SHorizontalBox::Slot().AutoWidth().Padding(4, 0)
             [SNew(SButton).Text(Text(TEXT("Save assets…"))).IsEnabled_Lambda([this] { return IsIdle(); }).OnClicked_Lambda([this]
             {
-                FEditorFileUtils::SaveDirtyPackages(true, true, true);
+                GitWorkspaceSave::SaveDirtyAssets();
                 return Refresh();
             })]
         ]
@@ -114,7 +116,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
             [SNew(STextBlock).Text(Text(TEXT("Lock remote")))]
             + SHorizontalBox::Slot().MaxWidth(180).FillWidth(1).Padding(0, 0, 8, 0)
             [SNew(SEditableTextBox).Text(Text(LockRemote)).IsEnabled_Lambda([this] { return IsIdle(); })
-                .OnTextChanged_Lambda([this](const FText& Value) { LockRemote = Value.ToString(); Locks = GitWorkspace::FLockSnapshot(); })]
+                .OnTextChanged_Lambda([this](const FText& Value) { LockRemote = Value.ToString(); GitWorkspaceSave::SetLockRemote(LockRemote); Locks = GitWorkspace::FLockSnapshot(); })]
             + SHorizontalBox::Slot().AutoWidth()
             [SNew(SButton).Text(Text(TEXT("Verify locks"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked(this, &SGitWorkspace::VerifyLocks)]
             + SHorizontalBox::Slot().AutoWidth().Padding(8, 0)

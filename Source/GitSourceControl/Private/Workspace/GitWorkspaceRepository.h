@@ -202,11 +202,45 @@ struct FDiscardReview
     bool IsFresh() const { return bValid && Error.IsEmpty() && Capture.IsFresh(); }
 };
 
+struct FAssetSaveReview
+{
+    FSnapshot Local;
+    FLockSnapshot Locks;
+    TArray<FString> Paths, NeedsLock;
+    TArray<uint8> RawHashes;
+    FString Fingerprint, Error;
+    bool bValid = false;
+    bool IsFresh() const { return bValid && Error.IsEmpty() && (Paths.IsEmpty() || Locks.IsFresh()); }
+    FString Text() const;
+};
+// Issued only after preparation. The caller cannot edit its verified identity.
+class FAssetSavePermit
+{
+public:
+    bool ContainsPath(const FString& Path) const { return Review.Paths.Contains(Path); }
+private:
+    friend class FRepository;
+    FAssetSaveReview Review;
+};
+struct FAssetSavePreparation
+{
+    FResult Result;
+    TSharedPtr<const FAssetSavePermit, ESPMode::ThreadSafe> Permit;
+    TArray<FString> AcquiredPaths;
+};
+
 class FRepository
 {
 public:
     FRepository(FString InGit, FString InDirectory);
     FSnapshot Refresh();
+    FAssetSaveReview ReviewAssetSave(const TArray<FString>& Paths, const FString& Remote);
+#if PLATFORM_MAC
+    FAssetSavePreparation PrepareAssetSave(const FAssetSaveReview& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bLockConfirmed = false);
+    FResult ValidateAssetSave(const FAssetSavePermit& Permit, const FString& Path, const GitWorkspaceSession::FLease& Lease);
+#endif
+    FResult IsLockableAsset(const FString& Path);
+
     FResult Stage(const TArray<FString>& Paths);
     FResult Unstage(const TArray<FString>& Paths);
     FResult Commit(const FSnapshot& Reviewed, const FString& Message);
@@ -243,6 +277,8 @@ public:
     const FString& GitExecutable() const { return GitBinary; }
     const FString& Directory() const { return RequestedDirectory; }
 private:
+    FAssetSaveReview ReviewAssetSaveInternal(const TArray<FString>& Paths, const FString& Remote);
+    FResult IsLockableAssetInternal(const FString& Path) const;
     FDiscardReview ReviewDiscardInternal(const TArray<FString>& Paths);
     FResult VerifyDiscardResult(const FDiscardReview& Reviewed);
     FCommitInspection InspectCommitInternal(const FString& Oid);

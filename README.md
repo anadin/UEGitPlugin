@@ -3,6 +3,12 @@
 This is a refactor of the [Git LFS 2 plugin by SRombauts](https://github.com/SRombauts/UE4GitPlugin), with lessons learned from production
 that include performance optimizations, new features and workflow improvements.
 
+## Git-native development branch
+
+Use **Window > Git Workspace** for explicit staging, commit, stashes and remote operations. Standard asset Save now verifies Git LFS locks and offers **Lock and save** for unlocked assets. Saving retains locks and never stages files. See [Lock and save](Docs/LockAndSave.md) for the supported routes and current Mac scope.
+
+The inherited provider instructions below describe legacy workflows. CheckIn, Sync, CheckOut, Revert and MarkForAdd are disabled in this branch; use Git Workspace and the native save flow.
+
 ## Features
 
 * Multi-threaded locking/unlocking, greatly improving performance when locking/unlocking many files

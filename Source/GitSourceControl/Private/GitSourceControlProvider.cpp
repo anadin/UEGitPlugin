@@ -465,9 +465,9 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOperationRef& InOperation, FSourceControlChangelistPtr InChangelist, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency, const FSourceControlOperationComplete& InOperationCompleteDelegate )
 #endif
 {
-    if (InOperation->GetName() == "CheckIn" || InOperation->GetName() == "Sync" || InOperation->GetName() == "CheckOut" || InOperation->GetName() == "Revert")
+    if (InOperation->GetName() == "CheckIn" || InOperation->GetName() == "Sync" || InOperation->GetName() == "CheckOut" || InOperation->GetName() == "Revert" || InOperation->GetName() == "MarkForAdd")
     {
-        InOperation->AddErrorMessge(LOCTEXT("UseGitWorkspace", "Use Window > Git Workspace for explicit staging, commit and verified locks. Legacy checkout/revert may implicitly release locks and are disabled. Use an external Git client for discard and remote integration."));
+        InOperation->AddErrorMessge(LOCTEXT("UseGitWorkspace", "Use Git Workspace for explicit staging, commit, discard and remote operations. Save verifies locks through Lock and save. Legacy checkout/revert and automatic MarkForAdd are disabled; save never stages files."));
         InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Failed);
         return ECommandResult::Failed;
     }
@@ -570,7 +570,7 @@ void FGitSourceControlProvider::CancelOperation( const FSourceControlOperationRe
 
 bool FGitSourceControlProvider::UsesLocalReadOnlyState() const
 {
-	return bUsingGitLfsLocking; // Git LFS Lock uses read-only state
+	return true; // Git Workspace makes only verified locally owned assets writable.
 }
 
 bool FGitSourceControlProvider::UsesChangelists() const
@@ -580,7 +580,7 @@ bool FGitSourceControlProvider::UsesChangelists() const
 
 bool FGitSourceControlProvider::UsesCheckout() const
 {
-	return bUsingGitLfsLocking; // Git LFS Lock uses read-only state
+	return false; // Git-native Lock and save owns acquisition; legacy CheckOut is disabled.
 }
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
@@ -638,7 +638,7 @@ bool FGitSourceControlProvider::UsesSoftRevertOnDelete() const
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
 bool FGitSourceControlProvider::CanExecuteOperation(const FSourceControlOperationRef& InOperation) const {
-    if (InOperation->GetName() == "CheckIn" || InOperation->GetName() == "Sync" || InOperation->GetName() == "CheckOut" || InOperation->GetName() == "Revert") return false;
+    if (InOperation->GetName() == "CheckIn" || InOperation->GetName() == "Sync" || InOperation->GetName() == "CheckOut" || InOperation->GetName() == "Revert" || InOperation->GetName() == "MarkForAdd") return false;
 	return WorkersMap.Find(InOperation->GetName()) != nullptr;
 }
 

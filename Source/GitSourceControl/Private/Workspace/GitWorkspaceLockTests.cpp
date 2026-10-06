@@ -1,6 +1,11 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #if WITH_DEV_AUTOMATION_TESTS
 #include "GitWorkspaceRepository.h"
+#include "GitWorkspaceSaveFlow.h"
+#include "Misc/PackageName.h"
+#include "Misc/ScopeExit.h"
+#include "UObject/SavePackage.h"
+#include "UObject/StrongObjectPtr.h"
 #include "SGitWorkspace.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
@@ -90,6 +95,143 @@ struct FLockFixture
     { const FString Full = FPaths::Combine(Repo, Path); FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*Full, false); FFileHelper::SaveStringToFile(Text, *Full, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM); }
     void Mode(const FString& Mode) { FFileHelper::SaveStringToFile(Mode, *FPaths::Combine(Root, TEXT("mode")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM); }
 };
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveLockReviewTest, "GitWorkspace.SaveLock.CancelDriftAndOwnership", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSaveLockReviewTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Save lock server started"), F.Endpoint.IsEmpty())) return false;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Exclusive fixture lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*FPaths::Combine(F.Repo, TEXT("asset.uasset")), true);
+    auto Review = Repo.ReviewAssetSave({TEXT("asset.uasset")}, TEXT("origin"));
+    if (!TestTrue(TEXT("Unlocked asset review: ") + Review.Error, Review.IsFresh() && Review.NeedsLock.Num() == 1)) return false;
+    TestFalse(TEXT("Cancellation cannot acquire a lock"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestTrue(TEXT("Cancellation keeps asset read only"), IFileManager::Get().IsReadOnly(*FPaths::Combine(F.Repo, TEXT("asset.uasset"))));
+    TestTrue(TEXT("Cancellation has no server lock"), Repo.VerifyLocks(TEXT("origin")).Locks.IsEmpty());
+    TestEqual(TEXT("Cancellation preserves index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("Cancellation preserves HEAD"), Repo.Refresh().Head, Before.Head);
+    TestEqual(TEXT("Cancellation preserves stash list"), Repo.ListStashes().Fingerprint, Stashes);
+    auto Expired = Review; Expired.Locks.VerifiedSeconds -= 61;
+    TestFalse(TEXT("Expired consent cannot lock"), Repo.PrepareAssetSave(Expired, Lease, true).Result.Ok());
+    F.Write(TEXT("asset.uasset"), TEXT("saved bytes changed\n"));
+    TestFalse(TEXT("Raw saved byte drift blocks consent"), Repo.PrepareAssetSave(Review, Lease, true).Result.Ok());
+    F.Write(TEXT("asset.uasset"), TEXT("base A\n"));
+    Review = Repo.ReviewAssetSave({TEXT("asset.uasset")}, TEXT("origin"));
+    for (const TCHAR* Mode : {TEXT("foreign"), TEXT("otherclone"), TEXT("offline"), TEXT("auth")})
+    {
+        F.Mode(Mode);
+        TestFalse(FString(Mode) + TEXT(" blocks review"), Repo.ReviewAssetSave({TEXT("asset.uasset")}, TEXT("origin")).IsFresh());
+        TestFalse(FString(Mode) + TEXT(" blocks previously reviewed save"), Repo.PrepareAssetSave(Review, Lease, true).Result.Ok());
+    }
+    F.Mode(TEXT("conflict"));
+    TestFalse(TEXT("Acquisition race cancels save"), Repo.PrepareAssetSave(Review, Lease, true).Result.Ok());
+    F.Mode(TEXT(""));
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave({TEXT("asset.uasset")}, TEXT("origin")), Lease, true);
+    if (!TestTrue(TEXT("Explicit acquisition prepares permit: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    TestEqual(TEXT("Acquired exactly selected asset"), Prepared.AcquiredPaths.Num(), 1);
+    TestTrue(TEXT("Verified owned asset is writable"), !IFileManager::Get().IsReadOnly(*FPaths::Combine(F.Repo, TEXT("asset.uasset"))));
+    TestTrue(TEXT("Permit validates saved asset"), Repo.ValidateAssetSave(*Prepared.Permit, TEXT("asset.uasset"), Lease).Ok());
+    TestFalse(TEXT("Permit cannot authorize extra paths"), Repo.ValidateAssetSave(*Prepared.Permit, TEXT("extra.uasset"), Lease).Ok());
+    F.Write(TEXT("note.txt"), TEXT("staged change\n")); F.Call({TEXT("add"), TEXT("note.txt")});
+    TestFalse(TEXT("Index drift blocks prepared write"), Repo.ValidateAssetSave(*Prepared.Permit, TEXT("asset.uasset"), Lease).Ok());
+    auto Owned = Repo.ReviewAssetSave({TEXT("asset.uasset")}, TEXT("origin"));
+    TestTrue(TEXT("Recorded existing lock needs no new acquisition"), Owned.IsFresh() && Owned.NeedsLock.IsEmpty());
+    Prepared = Repo.PrepareAssetSave(Owned, Lease);
+    TestTrue(TEXT("Owned file can prepare without lock consent"), Prepared.Result.Ok() && Prepared.AcquiredPaths.IsEmpty());
+    F.Mode(TEXT("foreign"));
+    TestFalse(TEXT("Final write denies replaced ownership"), Repo.ValidateAssetSave(*Prepared.Permit, TEXT("asset.uasset"), Lease).Ok());
+    F.Mode(TEXT("offline"));
+    TestFalse(TEXT("Final write denies unavailable verification"), Repo.ValidateAssetSave(*Prepared.Permit, TEXT("asset.uasset"), Lease).Ok());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveLockPartialTest, "GitWorkspace.SaveLock.PartialAcquisitionAndPointers", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSaveLockPartialTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Save server started"), F.Endpoint.IsEmpty())) return false;
+    F.Write(TEXT("second.uasset"), TEXT("second bytes\n")); F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("second")});
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Exclusive lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    auto Review = Repo.ReviewAssetSave({TEXT("asset.uasset"), TEXT("second.uasset")}, TEXT("origin"));
+    FFileHelper::SaveStringToFile(TEXT("second.uasset"), *FPaths::Combine(F.Root, TEXT("fail-lock-path")));
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    TestFalse(TEXT("Partial lock failure does not issue save permit"), Prepared.Result.Ok() || Prepared.Permit.IsValid());
+    TestTrue(TEXT("First acquired lock recorded for user"), Prepared.AcquiredPaths == TArray<FString>{TEXT("asset.uasset")});
+    auto Locks = Repo.VerifyLocks(TEXT("origin"));
+    TestTrue(TEXT("Partial failure retains first lock"), Locks.IsFresh() && Locks.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours && !Locks.Locks.Contains(TEXT("second.uasset")));
+    IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT("fail-lock-path")));
+    auto Retry = Repo.ReviewAssetSave({TEXT("asset.uasset"), TEXT("second.uasset")}, TEXT("origin"));
+    TestTrue(TEXT("Retry acquires only remaining path"), Retry.IsFresh() && Retry.NeedsLock == TArray<FString>{TEXT("second.uasset")});
+    TestTrue(TEXT("Retry completes"), Repo.PrepareAssetSave(Retry, Lease, true).Result.Ok());
+    const auto Pointer = F.Call({TEXT("show"), TEXT("HEAD:asset.uasset")}); F.Write(TEXT("asset.uasset"), Pointer.Text());
+    TestFalse(TEXT("LFS pointer is not writable asset content"), Repo.ReviewAssetSave({TEXT("asset.uasset")}, TEXT("origin")).IsFresh());
+    F.Write(TEXT("asset.uasset"), TEXT("base A\n"));
+    const FString Link = FPaths::Combine(F.Repo, TEXT("linked.uasset"));
+    symlink("asset.uasset", TCHAR_TO_UTF8(*Link));
+    TestFalse(TEXT("Save cannot follow a symlink"), Repo.ReviewAssetSave({TEXT("linked.uasset")}, TEXT("origin")).IsFresh());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveLockPackageTest, "GitWorkspace.SaveLock.RealPackageWriteGuard", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSaveLockPackageTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Package lock server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Mount = TEXT("/GitSaveFixture") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    const FString Content = FPaths::Combine(F.Repo, TEXT("Content/")); IFileManager::Get().MakeDirectory(*Content, true);
+    FPackageName::RegisterMountPoint(Mount, Content);
+    TStrongObjectPtr<UTexture2D> Asset(NewObject<UTexture2D>(CreatePackage(*(Mount + TEXT("T_Save"))), TEXT("T_Save"), RF_Public | RF_Standalone));
+    ON_SCOPE_EXIT { Asset->GetPackage()->SetDirtyFlag(false); Asset->GetPackage()->SetFlags(RF_Transient); Asset->ClearFlags(RF_Public | RF_Standalone); FPackageName::UnRegisterMountPoint(Mount, Content); };
+    const uint8 Pixel[4] = {255, 0, 0, 255}; Asset->Source.Init(1, 1, 1, 1, TSF_BGRA8, Pixel);
+    const FString Path = TEXT("Content/T_Save.uasset"), Filename = FPaths::Combine(F.Repo, Path);
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    if (!TestTrue(TEXT("Initial fixture save"), UPackage::SavePackage(Asset->GetPackage(), Asset.Get(), *Filename, Args))) return false;
+    UPackage::WaitForAsyncFileWrites();
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("saved texture")});
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh();
+    TArray<uint8> BeforeBytes; FFileHelper::LoadFileToArray(BeforeBytes, *Filename);
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Save fixture lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave({Path}, TEXT("origin")), Lease, true);
+    if (!TestTrue(TEXT("Texture permit: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    GitWorkspaceSave::InstallGuard(); ON_SCOPE_EXIT { GitWorkspaceSave::RemoveGuard(); };
+    Asset->SRGB = !Asset->SRGB; Asset->MarkPackageDirty();
+    F.Write(TEXT(".gitattributes"), TEXT("# attributes changed after preparation\n"));
+    {
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *Prepared.Permit, Lease, F.Repo);
+        TestFalse(TEXT("Attribute changes cannot bypass a reviewed protected save"), UPackage::SavePackage(Asset->GetPackage(), Asset.Get(), *Filename, Args));
+    }
+    F.Write(TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text lockable\n"));
+    IFileManager::Get().Delete(*Filename);
+    {
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *Prepared.Permit, Lease, F.Repo);
+        TestFalse(TEXT("Deleted reviewed file cannot become an unguarded first save"), UPackage::SavePackage(Asset->GetPackage(), Asset.Get(), *Filename, Args));
+    }
+    FFileHelper::SaveArrayToFile(BeforeBytes, *Filename);
+    F.Mode(TEXT("offline"));
+    {
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *Prepared.Permit, Lease, F.Repo);
+        TestFalse(TEXT("Actual package writer refuses offline final verification"), UPackage::SavePackage(Asset->GetPackage(), Asset.Get(), *Filename, Args));
+    }
+    UPackage::WaitForAsyncFileWrites(); TArray<uint8> BlockedBytes; FFileHelper::LoadFileToArray(BlockedBytes, *Filename);
+    TestTrue(TEXT("Blocked save keeps editor dirty"), Asset->GetPackage()->IsDirty());
+    TestEqual(TEXT("Blocked save keeps saved bytes"), BlockedBytes, BeforeBytes);
+    TestEqual(TEXT("Blocked save keeps index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    F.Mode(TEXT(""));
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave({Path}, TEXT("origin")), Lease);
+    if (!TestTrue(TEXT("Retry texture permit: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    {
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *Prepared.Permit, Lease, F.Repo);
+        TestTrue(TEXT("Native package writer saves with verified owned lock"), UPackage::SavePackage(Asset->GetPackage(), Asset.Get(), *Filename, Args));
+        Asset->MarkPackageDirty();
+        TestFalse(TEXT("Same permit cannot be reused for another write"), UPackage::SavePackage(Asset->GetPackage(), Asset.Get(), *Filename, Args));
+        // Make Writable cannot authorize an additional saved file in this session.
+        FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*FPaths::Combine(F.Repo, TEXT("asset.uasset")), false);
+        TestFalse(TEXT("Make Writable bypass is denied"), FCoreUObjectDelegates::IsPackageOKToSaveDelegate.Execute(Asset->GetPackage(), FPaths::Combine(F.Repo, TEXT("asset.uasset")), nullptr));
+    }
+    UPackage::WaitForAsyncFileWrites(); TArray<uint8> Saved; FFileHelper::LoadFileToArray(Saved, *Filename);
+    TestTrue(TEXT("Texture bytes changed"), Saved != BeforeBytes);
+    TestEqual(TEXT("Save never stages texture"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("Save never commits"), Repo.Refresh().Head, Before.Head);
+    TestTrue(TEXT("Save retains verified lock"), Repo.VerifyLocks(TEXT("origin")).State(Path, true) == GitWorkspace::ELockState::Ours);
+    return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitDiscardLockTest, "GitWorkspace.Discard.RetainsVerifiedLock", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitDiscardLockTest::RunTest(const FString&)

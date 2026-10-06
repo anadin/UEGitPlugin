@@ -115,7 +115,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {'ours': list(locks.values()), 'theirs': []})
         elif self.path.endswith('/locks'):
             path = body['path']
-            if path in locks or mode == 'conflict':
+            refused = (root / 'fail-lock-path').read_text().strip() if (root / 'fail-lock-path').exists() else ''
+            if path in locks or mode == 'conflict' or path == refused:
                 self.reply(409, {'message': 'already locked', 'lock': locks.get(path, lock(path, 'someone else', 'race'))})
             else:
                 serial += 1

@@ -26,7 +26,9 @@ public class GitSourceControl : ModuleRules
 				"SourceControl",
 				"SourceControlWindows",
 				"Projects",
-                "MainFrame"
+                "MainFrame",
+                "EditorFramework",
+                "ContentBrowser"
 			}
 		);
 
