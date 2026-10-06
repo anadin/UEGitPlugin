@@ -554,6 +554,7 @@ bool FGitSelectivePushHandoffTest::RunTest(const FString&)
     TestTrue(TEXT("Unchecked Blueprint is still in outgoing publication"), Review.Text({TEXT("texture.uasset")}).Contains(TEXT("asset.uasset")) && Review.Commits[0].Paths.Contains(TEXT("asset.uasset")));
     const auto* Blueprint = Review.Assets.FindByPredicate([](const auto& A) { return A.Path == TEXT("asset.uasset"); });
     TestTrue(TEXT("Saved Blueprint work blocks only its release"), Blueprint && !Blueprint->bReady && Blueprint->Error.Contains(TEXT("stash")));
+    TestTrue(TEXT("Combined report names the blocking stash"), Review.Text({TEXT("texture.uasset")}).Contains(TEXT("Saved stash: stash@{0}")) && Review.Text({TEXT("texture.uasset")}).Contains(TEXT("pending Blueprint work")));
     const auto Result = Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset"), TEXT("material.uasset")}, true);
     if (!TestTrue(TEXT("Push verified before selected releases: ") + Result.Text(), Result.bPushVerified)) return false;
     TestTrue(TEXT("Both selected locks released"), Result.Assets.Num() == 2 && Result.Assets[0].bReleased && Result.Assets[1].bReleased);

@@ -113,7 +113,7 @@ void SGitWorkspace::RebuildHandoffRows()
         const FString Reason = !Allowed ? TEXT("Keep: not a remaining reservation from this handoff, or its identity changed.")
             : Asset.bReady ? (HandoffReview.IsRetry() ? TEXT("Eligible for unlock only; published commit will be checked again.") : TEXT("Eligible after a verified Push; final release checks still apply.")) : TEXT("Keep: ") + Asset.Error;
         HandoffRows->AddSlot().AutoHeight().Padding(0, 0, 0, 8)
-        [SNew(SCheckBox).IsChecked_Lambda([Weak, Path] { auto P = Weak.Pin(); return P && P->HandoffChecked.Contains(Path) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+        [SNew(SCheckBox).ToolTipText(HandoffText(Asset.Text())).IsChecked_Lambda([Weak, Path] { auto P = Weak.Pin(); return P && P->HandoffChecked.Contains(Path) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
             .IsEnabled_Lambda([Weak, Eligible] { auto P = Weak.Pin(); return P && P->IsIdle() && P->HandoffReview.IsFresh() && Eligible; })
             .OnCheckStateChanged_Lambda([Weak, Path](ECheckBoxState State) { if (auto P = Weak.Pin()) { if (State == ECheckBoxState::Checked) P->HandoffChecked.Add(Path); else P->HandoffChecked.Remove(Path); P->UpdateHandoffReport(); } })
             [SNew(SVerticalBox)

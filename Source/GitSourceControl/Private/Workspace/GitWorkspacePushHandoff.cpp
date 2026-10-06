@@ -36,6 +36,12 @@ FString FPushHandoffReview::Text(const TArray<FString>& Selected) const
     for (const auto& Path : Selected) Out += HandoffDisplay(Path) + TEXT("\n");
     Out += TEXT("\nLOCKS TO KEEP\n");
     for (const auto& Asset : Assets) if (!Selected.Contains(Asset.Path)) Out += HandoffDisplay(Asset.Path) + TEXT("\n");
+    for (const auto& Asset : Assets) if (!Asset.bReady)
+    {
+        Out += TEXT("\nRELEASE BLOCKED: ") + HandoffDisplay(Asset.Path) + TEXT("\n") + Asset.Error + TEXT("\n");
+        for (const auto& Stash : Asset.BlockingStashes)
+            Out += TEXT("  Saved stash: ") + HandoffDisplay(Stash.Selector) + TEXT("  ") + Stash.Oid.Left(10) + TEXT("  ") + HandoffDisplay(Stash.Label) + TEXT("\n");
+    }
     Out += TEXT("\nBefore every release, ownership, acquisition, saved/stashed work and live publication are checked again. Failed or unconfirmed Push releases nothing. A later release failure retains that reservation or reports uncertainty; successful releases are not rolled back. Confirm that the team handoff is complete and no other clone still needs each checked lock.\n");
     if (!Error.IsEmpty()) Out += TEXT("\nREVIEW BLOCKED\n") + Error;
     return Out;
