@@ -153,7 +153,7 @@ public:
         const bool bRecovery = IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(GitDir));
         if (!Error.IsEmpty() || bRecovery)
         {
-            const FString Message = bRecovery ? TEXT("Git Workspace stopped an incomplete asset Pull. Project loading is blocked to protect assets. Review the recovery report at:\n") + GitWorkspaceSession::RecoveryFile(GitDir)
+            const FString Message = bRecovery ? TEXT("Git Workspace stopped an incomplete repository/asset operation. Project loading is blocked to protect assets. Review the recovery report at:\n") + GitWorkspaceSession::RecoveryFile(GitDir)
                 : Error + TEXT("\nReopen the project when the operation finishes.");
             UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
             if (!IsRunningCommandlet()) FPlatformMisc::MessageBoxExt(EAppMsgType::Ok, *Message, TEXT("Git Workspace recovery"));

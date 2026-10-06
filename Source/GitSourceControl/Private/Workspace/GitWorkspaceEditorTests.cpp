@@ -607,6 +607,64 @@ bool FGitStashAssetReloadTest::RunTest(const FString&)
     TestTrue(TEXT("Only successfully restored selected stash deleted"), Remaining.Entries.Num() == 1 && Remaining.Entries[0].Oid == KeptOid);
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitDiscardLoadedAssetTest, "GitWorkspace.Discard.LoadedAssetPreservesStaging", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitDiscardLoadedAssetTest::RunTest(const FString&)
+{
+    FEditorAssetFixture F; F.Create(); F.Edit(0);
+    if (!TestTrue(TEXT("Save discard baseline"), F.Save())) return false;
+    F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("discard base")});
+    const auto MapBytes = F.Bytes(F.Paths[3]);
+    auto SaveAssets = [&](int32 Version)
+    {
+        CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription = FString::Printf(TEXT("Fixture version %d"), Version);
+        CastChecked<UMaterial>(F.Assets[1].Get())->TwoSided = Version % 2 != 0;
+        CastChecked<UTexture2D>(F.Assets[2].Get())->SRGB = Version % 2 != 0;
+        bool bOk = true;
+        for (int32 I = 0; I < 3; ++I)
+        {
+            auto* Asset = F.Assets[I].Get(); Asset->MarkPackageDirty();
+            FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+            bOk &= UPackage::SavePackage(Asset->GetPackage(), Asset, *FPaths::Combine(F.Root, F.Paths[I]), Args);
+        }
+        UPackage::WaitForAsyncFileWrites(); return bOk;
+    };
+    if (!TestTrue(TEXT("Save staged version one"), SaveAssets(1))) return false;
+    F.Call({TEXT("add"), TEXT(".")}); const auto StagedBlueprint = F.Bytes(F.Paths[0]);
+    if (!TestTrue(TEXT("Save working version two"), SaveAssets(2))) return false;
+    TArray<TArray<uint8>> Working; for (int32 I = 0; I < 3; ++I) Working.Add(F.Bytes(F.Paths[I]));
+    F.Call({TEXT("config"), TEXT("filter.lfs.process"), TEXT("git-lfs filter-process --skip")});
+    GitWorkspace::FRepository Repo(F.Git, F.Root); const auto Before = Repo.Refresh();
+    const auto Review = Repo.ReviewDiscard({F.Paths[0]});
+    if (!TestTrue(TEXT("Review selected loaded Blueprint: ") + Review.Error, Review.IsFresh())) return false;
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Discard fixture lease"), Lease.Acquire(F.Root, true, Error))) return false;
+    F.Assets[0]->MarkPackageDirty(); auto Result = GitWorkspace::DiscardAndReload(Repo, Review, Lease);
+    TestTrue(TEXT("Unsaved memory blocks discard before recovery"), !Result.bSuccess && !Result.bRecoveryRequired);
+    TestTrue(TEXT("Refusal retains saved bytes"), F.Bytes(F.Paths[0]) == Working[0]);
+    F.Assets[0]->GetPackage()->SetDirtyFlag(false);
+    const auto Delegate = FCoreUObjectDelegates::OnPackageReloaded.AddLambda([&](EPackageReloadPhase Phase, FPackageReloadedEvent* Event)
+    {
+        if (Phase == EPackageReloadPhase::OnPackageFixup && Event)
+            for (auto& Asset : F.Assets)
+                if (UObject* const* Replacement = Event->GetRepointedObjects().Find(Asset.Get())) Asset.Reset(*Replacement);
+    });
+    ON_SCOPE_EXIT { FCoreUObjectDelegates::OnPackageReloaded.Remove(Delegate); };
+    const TWeakObjectPtr<UObject> OldBlueprint = F.Assets[0].Get(), Material = F.Assets[1].Get(), Texture = F.Assets[2].Get();
+    Result = GitWorkspace::DiscardAndReload(Repo, Review, Lease);
+    if (!TestTrue(TEXT("Discard and reload: ") + Result.Message, Result.bSuccess)) return false;
+    TestEqual(TEXT("Only selected asset reloaded"), Result.Reloaded, 1); TestFalse(TEXT("Old Blueprint purged"), OldBlueprint.IsValid());
+    TestEqual(TEXT("Memory restores staged version one"), CastChecked<UBlueprint>(F.Assets[0].Get())->BlueprintDescription, FString(TEXT("Fixture version 1")));
+    TestTrue(TEXT("Exact hydrated staged bytes restored"), F.Bytes(F.Paths[0]) == StagedBlueprint);
+    TestTrue(TEXT("Staging retained exactly"), Repo.Refresh().IndexEntries == Before.IndexEntries); TestEqual(TEXT("HEAD retained"), Repo.Refresh().Head, Before.Head);
+    TestTrue(TEXT("Other loaded objects retained"), Material.Get() == F.Assets[1].Get() && Texture.Get() == F.Assets[2].Get());
+    for (int32 I = 1; I < 3; ++I) TestTrue(TEXT("Other saved edits retained"), F.Bytes(F.Paths[I]) == Working[I]);
+    TestTrue(TEXT("Map retained"), F.Bytes(F.Paths[3]) == MapBytes); TestTrue(TEXT("No stash created"), Repo.ListStashes().Entries.IsEmpty());
+    FString Canonical, GitDir; GitWorkspaceSession::FindRepository(F.Root, Canonical, GitDir);
+    TArray<uint8> Backup; FFileHelper::LoadFileToArray(Backup, *FPaths::Combine(GitDir, TEXT("uegit/discard"), Review.Id, TEXT("payload/0000.bin")));
+    TestTrue(TEXT("Backup has discarded full working asset"), Backup == Working[0]);
+    TestFalse(TEXT("Successful asset reload clears recovery marker"), IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(GitDir)));
+    return true;
+}
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStashApplyDeleteIdentityTest, "GitWorkspace.Editor.StashApplyDeleteIdentity", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitStashApplyDeleteIdentityTest::RunTest(const FString&)
 {

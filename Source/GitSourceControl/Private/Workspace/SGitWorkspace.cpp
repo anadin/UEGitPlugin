@@ -168,6 +168,9 @@ void SGitWorkspace::Construct(const FArguments& Args)
                     [SNew(SButton).Text_Lambda([this] { return Text(FString::Printf(TEXT("Stage selected (%d)"), SelectedIndexPaths(true).Num())); }).ToolTipText(Text(TEXT("Stage eligible saved files in the selection. Submodules are skipped and reported."))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && SelectedIndexPaths(true).Num() > 0; }).OnClicked_Lambda([this] { return ChangeIndex(true); })]
                     + SHorizontalBox::Slot().AutoWidth()
                     [SNew(SButton).Text_Lambda([this] { return Text(FString::Printf(TEXT("Unstage selected (%d)"), SelectedIndexPaths(false).Num())); }).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid && SelectedIndexPaths(false).Num() > 0; }).OnClicked_Lambda([this] { return ChangeIndex(false); })]
+                    + SHorizontalBox::Slot().AutoWidth().Padding(8, 0, 0, 0)
+                    [SNew(SButton).Text(Text(TEXT("Discard working edits…"))).ToolTipText(Text(TEXT("Select tracked modifications in Unstaged changes. Review replacing saved working edits with their staged/index versions, after preserving recovery. Staging and locks stay held. New files, deletions and renames require external review.")))
+                        .IsEnabled(this, &SGitWorkspace::CanDiscardSelected).OnClicked(this, &SGitWorkspace::ShowDiscardReview)]
                 ]
                 + SVerticalBox::Slot().AutoHeight().Padding(10, 4)
                 [SNew(SSegmentedControl<bool>).Value_Lambda([this] { return bContentOnly; }).IsEnabled_Lambda([this] { return IsIdle(); })
@@ -221,7 +224,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
     ];
     Refresh();
 }
-SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = UnlockWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HandoffWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HistoryWindow.Pin()) Window->RequestDestroyWindow(); }
+SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = UnlockWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HandoffWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HistoryWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = DiscardWindow.Pin()) Window->RequestDestroyWindow(); }
 void SGitWorkspace::WaitForWork() { if (Pending.IsValid()) { Pending.Wait(); Pending = TFuture<FGitWorkspaceTaskResult>(); } }
 void SGitWorkspace::Start(TFunction<FGitWorkspaceTaskResult()> Work)
 {
@@ -318,6 +321,17 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
         {
             UnlockReview = MoveTemp(Result.UnlockReview);
             if (UnlockReport) UnlockReport->SetText(Text(UnlockReview.Text()));
+        }
+        if (auto Window = Result.DiscardReviewWindow.Pin(); Result.bDiscardReview && Window && Window == DiscardWindow.Pin() && Window->IsVisible())
+        {
+            DiscardReview = MoveTemp(Result.DiscardReview);
+            DiscardPackageBlocker.Empty();
+            if (DiscardReview.IsFresh())
+            {
+                TArray<GitWorkspace::FIncomingPackage> Packages;
+                DiscardPackageBlocker = GitWorkspace::ReviewPackageChanges(DiscardReview.Capture.Local.Root, DiscardReview.Changes, Packages);
+            }
+            if (DiscardReport) DiscardReport->SetText(Text(DiscardReview.Text + (DiscardPackageBlocker.IsEmpty() ? FString() : TEXT("\nDISCARD BLOCKED\n") + DiscardPackageBlocker)));
         }
         if (auto Window = Result.HandoffReviewWindow.Pin(); Result.bHandoffReview && Window && Window == HandoffWindow.Pin() && Window->IsVisible())
         {

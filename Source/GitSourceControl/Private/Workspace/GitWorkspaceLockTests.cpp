@@ -91,6 +91,31 @@ struct FLockFixture
     void Mode(const FString& Mode) { FFileHelper::SaveStringToFile(Mode, *FPaths::Combine(Root, TEXT("mode")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM); }
 };
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitDiscardLockTest, "GitWorkspace.Discard.RetainsVerifiedLock", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitDiscardLockTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Discard lock server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Path = TEXT("Content/Discard.uasset"); IFileManager::Get().MakeDirectory(*FPaths::Combine(F.Repo, TEXT("Content")), true);
+    F.Write(Path, TEXT("base\n")); F.Call({TEXT("add"), TEXT(".")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("discard asset")});
+    F.Call({TEXT("push"), TEXT("--no-verify"), TEXT("origin"), TEXT("main")});
+    GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Acquire reviewed server lock"), Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), Path, false).Ok())) return false;
+    const auto Locks = Repo.VerifyLocks(TEXT("origin")); const auto* Held = Locks.Locks.Find(Path);
+    if (!TestTrue(TEXT("Owned fixture lock verified"), Held && Held->bOurs)) return false;
+    const FString LockId = Held->Id;
+    F.Write(Path, TEXT("staged A\n")); Repo.Stage({Path}); F.Write(Path, TEXT("working B\n"));
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Exclusive lock fixture lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    const auto Review = Repo.ReviewDiscard({Path});
+    if (!TestTrue(TEXT("Locked asset discard review: ") + Review.Error, Review.IsFresh())) return false;
+    const auto Result = Repo.ExecuteDiscard(Review, Lease, true);
+    if (!TestTrue(TEXT("Discard locked working edits: ") + Result.Error, Result.Ok())) return false;
+    TestTrue(TEXT("Verified discard completion"), Repo.CompleteDiscard(Review, Lease).Ok());
+    const auto After = Repo.VerifyLocks(TEXT("origin")); const auto* Retained = After.Locks.Find(Path);
+    TestTrue(TEXT("Exact server lock stays owned after discard"), After.IsFresh() && Retained && Retained->bOurs && Retained->Id == LockId);
+    TestFalse(TEXT("Staged edits still block handoff"), Repo.ReviewUnlock(TEXT("origin"), Path).IsFresh());
+    return true;
+}
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitLockServerTest, "GitWorkspace.Locks.ServerFailuresAndPagination", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitLockServerTest::RunTest(const FString&)
 {

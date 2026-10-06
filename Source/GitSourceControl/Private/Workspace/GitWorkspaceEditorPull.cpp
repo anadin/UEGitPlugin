@@ -163,5 +163,17 @@ FEditorPullResult ApplyStashAndDelete(FRepository& Repository, const FStashRevie
         TEXT("\n") + (Dropped.Ok() ? Dropped.Text() : Dropped.Error);
     return Result;
 }
+FEditorPullResult DiscardAndReload(FRepository& Repository, const FDiscardReview& Reviewed, const GitWorkspaceSession::FLease& Lease)
+{
+    FEditorPullResult Result;
+    if (!Reviewed.IsFresh()) { Result.Message = TEXT("Discard review expired. Review the selected working edits again."); return Result; }
+    FResult Saved;
+    Result = RunWithPackageReload(Reviewed.Capture.Local.Root, Reviewed.Changes, Lease,
+        [&] { Saved = Repository.ExecuteDiscard(Reviewed, Lease, true); return Saved; },
+        [&] { return Repository.CompleteDiscard(Reviewed, Lease); });
+    if (Result.bSuccess) Result.Message = TEXT("Selected working edits discarded to their staged versions. Staging and locks retained.\n") + Saved.Text() + TEXT("\n") + Result.Message;
+    else if (!Saved.Text().IsEmpty() && !Result.Message.Contains(Saved.Text())) Result.Message += TEXT("\n") + Saved.Text();
+    return Result;
+}
 }
 #endif

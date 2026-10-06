@@ -189,6 +189,19 @@ struct FStashInspection
     bool IsFresh() const;
 };
 
+struct FDiscardReview
+{
+    FStashReview Capture;
+    TArray<FString> Paths, UntrackedPaths;
+    TArray<uint8> RawHashes, UntrackedHashes;
+    FString Id = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    FString BeforeWorkingTree, BeforeWorkingCommit, IndexTree, ExpectedWorkingTree, ExpectedWorkingCommit;
+    FString StashFingerprint, Fingerprint, Text, Error;
+    TArray<FIncomingChange> Changes;
+    bool bValid = false;
+    bool IsFresh() const { return bValid && Error.IsEmpty() && Capture.IsFresh(); }
+};
+
 class FRepository
 {
 public:
@@ -214,7 +227,10 @@ public:
     FStashInspection InspectStash(const FString& Oid, const FString& Selector = FString());
     FStashReview ReviewStash(const FString& Oid = FString(), bool bRestoreIndex = true, bool bIncludeUntracked = false);
     FStashReview ReviewSelectedStash(const TArray<FString>& Paths, bool bIncludeUntracked = false);
+    FDiscardReview ReviewDiscard(const TArray<FString>& Paths);
 #if PLATFORM_MAC
+    FResult ExecuteDiscard(const FDiscardReview& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bConfirmed = false);
+    FResult CompleteDiscard(const FDiscardReview& Reviewed, const GitWorkspaceSession::FLease& Lease);
     FResult PullAfterEditorExit(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease);
     // Requires quiesced package loaders on the game thread. Leaves recovery
     // active until that caller has verified package reload and registry refresh.
@@ -227,6 +243,8 @@ public:
     const FString& GitExecutable() const { return GitBinary; }
     const FString& Directory() const { return RequestedDirectory; }
 private:
+    FDiscardReview ReviewDiscardInternal(const TArray<FString>& Paths);
+    FResult VerifyDiscardResult(const FDiscardReview& Reviewed);
     FCommitInspection InspectCommitInternal(const FString& Oid);
 #if PLATFORM_MAC
     FResult PullAssets(const FRemoteSnapshot& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bForReload);

@@ -28,6 +28,9 @@ struct FGitWorkspaceTaskResult
     GitWorkspace::FStashList Stashes;
     GitWorkspace::FStashReview StashReview;
     GitWorkspace::FStashInspection StashInspection;
+    GitWorkspace::FDiscardReview DiscardReview;
+    TWeakPtr<SWindow> DiscardReviewWindow;
+    bool bDiscardReview = false;
     bool bStashes = false, bStashReview = false;
     TWeakPtr<SWindow> StashConfirmationWindow;
     bool bDeleteStashAfterApply = false;
@@ -67,6 +70,7 @@ private:
     friend class FGitStashPanelTest;
     friend class FGitUnlockReviewPanelTest;
     friend class FGitPushHandoffPanelTest;
+    friend class FGitDiscardPanelTest;
     bool IsIdle() const { return !Pending.IsValid() && RestartFolder.IsEmpty() && !bReloading; }
     void Start(TFunction<FGitWorkspaceTaskResult()> Work);
     FReply Refresh();
@@ -92,6 +96,12 @@ private:
     FReply CancelRestart();
     FReply ShowStashes();
     FReply ShowHistory();
+    bool CanDiscardSelected() const;
+    TArray<FString> SelectedDiscardPaths() const;
+    FReply ShowDiscardReview();
+    FReply RefreshDiscardReview();
+    FReply RunDiscard();
+    bool CanRunDiscard() const;
     FReply RefreshStashes();
     FReply PreviewStash(const FString& Oid, const FString& Selector = FString(), bool bSelected = false, bool bConfirmAction = false, bool bDeleteAfterApply = false);
     FReply DropSelectedStash();
@@ -163,6 +173,10 @@ private:
     bool bDownloadingLfs = false;
     TWeakPtr<SWindow> IncomingWindow;
     TWeakPtr<SWindow> HistoryWindow;
+    GitWorkspace::FDiscardReview DiscardReview;
+    TWeakPtr<SWindow> DiscardWindow;
+    TSharedPtr<SMultiLineEditableTextBox> DiscardReport;
+    FString DiscardPackageBlocker;
     TSharedPtr<SMultiLineEditableTextBox> IncomingReport;
     GitWorkspace::FStashList Stashes;
     GitWorkspace::FStashReview StashReview;

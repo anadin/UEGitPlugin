@@ -16,6 +16,7 @@ struct FEditorPullResult
 FEditorPullResult PullAndReload(FRepository& Repository, const FRemoteSnapshot& Reviewed,
     const FIncomingLfsResult& Prepared, const GitWorkspaceSession::FLease& Lease);
 FEditorPullResult StashAndReload(FRepository& Repository, const FStashReview& Reviewed, const FString& Name, const GitWorkspaceSession::FLease& Lease);
+FEditorPullResult DiscardAndReload(FRepository& Repository, const FDiscardReview& Reviewed, const GitWorkspaceSession::FLease& Lease);
 // Deletes only the inspected entry, after Apply, package reload and completion
 // verification succeed. A deletion failure reports that Apply already completed;
 // bRecoveryRequired refers only to uncertain file/package restoration.
