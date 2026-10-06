@@ -15,9 +15,27 @@
 #endif
 
 namespace { FText UnlockText(const FString& Value) { return FText::FromString(Value); } }
+bool SGitWorkspace::CanUnlockSelected() const
+{
+    if (!IsIdle() || !Selection || !Selection->Group.IsEmpty() || !List || List->GetSelectedItems().Num() != 1) return false;
+    const auto* Lock = Locks.Locks.Find(Selection->File.Path);
+    // A stale reservation owned by us can open a fresh, read-only review.
+    // Absence and foreign ownership do not offer an unlock action.
+    return Lock && Lock->bOurs;
+}
+FText SGitWorkspace::UnlockHint() const
+{
+    if (!Selection || !Selection->Group.IsEmpty() || !List || List->GetSelectedItems().Num() != 1)
+        return UnlockText(TEXT("Select one asset with a lock owned by you."));
+    const auto State = Locks.State(Selection->File.Path, Selection->File.bLockable);
+    if (State == GitWorkspace::ELockState::Unlocked) return UnlockText(TEXT("This asset is verified unlocked. There is no lock to release."));
+    if (State == GitWorkspace::ELockState::Theirs) return UnlockText(TEXT("Another user owns this lock. You cannot release it here."));
+    if (!CanUnlockSelected()) return UnlockText(TEXT("No lock owned by you is known for this asset. Verify locks to refresh ownership."));
+    return UnlockText(TEXT("Review ownership, saved changes, stashes and publication before releasing this asset's lock. Stale ownership is verified again."));
+}
 FReply SGitWorkspace::ShowUnlockReview()
 {
-    if (!IsIdle() || !Selection || !Selection->Group.IsEmpty() || List->GetSelectedItems().Num() != 1) return FReply::Handled();
+    if (!CanUnlockSelected()) return FReply::Handled();
     if (auto Old = UnlockWindow.Pin()) Old->RequestDestroyWindow();
     UnlockReview = GitWorkspace::FUnlockReview(); UnlockReview.Path = Selection->File.Path; UnlockReview.Locks.Remote = LockRemote;
     const auto Window = SNew(SWindow).Title(UnlockText(TEXT("Review unlock"))).ClientSize(FVector2D(840, 640)).SupportsMinimize(false);

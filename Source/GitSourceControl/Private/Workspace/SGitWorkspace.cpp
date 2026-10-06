@@ -117,8 +117,8 @@ void SGitWorkspace::Construct(const FArguments& Args)
             + SHorizontalBox::Slot().AutoWidth().Padding(8, 0)
             [SNew(SButton).Text(Text(TEXT("Lock asset"))).ToolTipText(this, &SGitWorkspace::LockHint).IsEnabled(this, &SGitWorkspace::CanLockSelected).OnClicked_Lambda([this] { return ChangeLock(false); })]
             + SHorizontalBox::Slot().AutoWidth()
-            [SNew(SButton).Text(Text(TEXT("Unlock…"))).ToolTipText(Text(TEXT("Review ownership, saved changes, stashes and publication before releasing this asset's lock.")))
-                .IsEnabled_Lambda([this] { return IsIdle() && Selection && Selection->Group.IsEmpty() && List->GetSelectedItems().Num() == 1 && (Selection->File.bLockable || Locks.Locks.Contains(Selection->File.Path)); }).OnClicked_Lambda([this] { return ChangeLock(true); })]
+            [SNew(SButton).Text(Text(TEXT("Unlock…"))).ToolTipText(this, &SGitWorkspace::UnlockHint)
+                .IsEnabled(this, &SGitWorkspace::CanUnlockSelected).OnClicked_Lambda([this] { return ChangeLock(true); })]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
         [SNew(STextBlock).AutoWrapText(true).Text(this, &SGitWorkspace::LockStatusText)]

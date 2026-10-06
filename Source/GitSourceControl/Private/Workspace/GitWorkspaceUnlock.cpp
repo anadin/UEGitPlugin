@@ -86,8 +86,12 @@ FUnlockReview FRepository::ReviewUnlockInternal(const FLockSnapshot& Current, co
     const auto UpstreamRemote = Git({TEXT("config"), TEXT("--get"), TEXT("branch.") + Status.Branch + TEXT(".remote")});
     const auto Merge = Git({TEXT("config"), TEXT("--get"), TEXT("branch.") + Status.Branch + TEXT(".merge")});
     const auto Upstream = Git({TEXT("rev-parse"), TEXT("--verify"), TEXT("@{upstream}")});
-    if (!UpstreamRemote.Ok() || UpstreamRemote.Text().TrimEnd() != Current.Remote || !Merge.Ok() || !Upstream.Ok() || Upstream.Text().TrimEnd() != Status.Head)
-        return Fail(TEXT("Unlock requires HEAD to match an upstream on the selected remote. Publish/reconcile your work first; no push is automatic."));
+    if (!UpstreamRemote.Ok() || !Merge.Ok() || !Upstream.Ok())
+        return Fail(TEXT("This branch has no readable upstream. Configure its upstream on ") + DisplayUnlock(Current.Remote) + TEXT(" and publish/reconcile the branch before unlocking."));
+    if (UpstreamRemote.Text().TrimEnd() != Current.Remote)
+        return Fail(TEXT("This branch tracks a different remote. Select its upstream remote for locks, or configure an upstream on ") + DisplayUnlock(Current.Remote) + TEXT(" before reviewing handoff."));
+    if (Upstream.Text().TrimEnd() != Status.Head)
+        return Fail(TEXT("This branch does not match its upstream on ") + DisplayUnlock(Current.Remote) + TEXT(". Fetch upstream, review the outgoing commits, then Push (or reconcile incoming changes externally). Refresh this unlock review afterward. Push publishes all outgoing commits on the branch and keeps locks; it does not push only this asset."));
     const FString Ref = Merge.Text().TrimEnd();
     if (!Ref.StartsWith(TEXT("refs/heads/"))) return Fail(TEXT("Cannot identify an upstream branch for handoff."));
     const auto RemoteHead = Git({TEXT("ls-remote"), TEXT("--exit-code"), TEXT("--refs"), TEXT("--"), Current.Remote, Ref});

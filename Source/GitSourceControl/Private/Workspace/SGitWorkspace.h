@@ -74,8 +74,10 @@ private:
     FReply RemoteAction(int32 Action);
     FText PushHint() const;
     FText LockHint() const;
+    FText UnlockHint() const;
     FText LockStatusText() const;
     bool CanLockSelected() const;
+    bool CanUnlockSelected() const;
     bool IsPathVisible(const FString& Path) const;
     int32 HiddenStagedCount() const;
     FReply ShowIncomingReview();
