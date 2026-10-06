@@ -134,7 +134,11 @@ bool FRepository::ValidateRemoteReview(const FRemoteSnapshot& Reviewed, FSnapsho
 }
 FResult FRepository::Push(const FRemoteSnapshot& Reviewed)
 {
-    FScopeLock Guard(&Mutex); FSnapshot Current; FString Error;
+    FScopeLock Guard(&Mutex); return PushInternal(Reviewed);
+}
+FResult FRepository::PushInternal(const FRemoteSnapshot& Reviewed)
+{
+    FSnapshot Current; FString Error;
     if (!ValidateRemoteReview(Reviewed, Current, Error)) return RemoteFailure(Error);
     if (!Reviewed.Ahead || Reviewed.Behind || !Git({TEXT("merge-base"), TEXT("--is-ancestor"), Reviewed.RemoteHead, Reviewed.Head}).Ok())
         return RemoteFailure(TEXT("Push requires outgoing commits without divergence. No rebase, merge or force-push is performed."));

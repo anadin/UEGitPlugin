@@ -1,5 +1,6 @@
 """Loopback-only LFS fixture for the Unreal lock integration test; never production."""
 import json
+import hashlib
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,6 +9,8 @@ from pathlib import Path
 root = Path(sys.argv[1])
 locks = {}
 serial = 0
+objects = root / 'objects'
+objects.mkdir(exist_ok=True)
 
 def lock(path, owner, identity):
     return {'id': identity, 'path': path, 'owner': {'name': owner}, 'locked_at': '2026-10-02T00:00:00Z'}
@@ -28,10 +31,34 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if '/locks' in self.path:
+        if self.path.startswith('/objects/'):
+            oid = self.path.rsplit('/', 1)[-1]
+            if len(oid) != 64 or any(c not in '0123456789abcdef' for c in oid) or not (objects / oid).is_file():
+                self.reply(404, {'message': 'object missing'})
+                return
+            data = (objects / oid).read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif '/locks' in self.path:
             self.reply(200, {'locks': list(locks.values())})
         else:
             self.reply(404, {'message': 'fixture endpoint not found'})
+
+    def do_PUT(self):
+        oid = self.path.rsplit('/', 1)[-1]
+        size = int(self.headers.get('Content-Length', '0'))
+        if not self.path.startswith('/objects/') or len(oid) != 64 or any(c not in '0123456789abcdef' for c in oid) or size > 16 * 1024 * 1024:
+            self.reply(400, {'message': 'invalid fixture object'})
+            return
+        data = self.rfile.read(size)
+        if hashlib.sha256(data).hexdigest() != oid:
+            self.reply(422, {'message': 'object hash mismatch'})
+            return
+        (objects / oid).write_bytes(data)
+        self.reply(200, {})
 
     def do_POST(self):
         global serial
@@ -39,7 +66,29 @@ class Handler(BaseHTTPRequestHandler):
         mode = (root / 'mode').read_text().strip() if (root / 'mode').exists() else ''
         with (root / 'requests').open('a') as log:
             log.write(json.dumps({'path': self.path, 'body': body}) + '\n')
-        if self.path.endswith('/locks/verify'):
+        if self.path.endswith('/objects/batch'):
+            if mode == 'uploadfail':
+                self.reply(503, {'message': 'fixture upload failed'})
+                return
+            operation = body.get('operation')
+            response = []
+            for item in body.get('objects', []):
+                oid, size = item['oid'], item['size']
+                if len(oid) != 64 or any(c not in '0123456789abcdef' for c in oid):
+                    self.reply(400, {'message': 'invalid object ID'})
+                    return
+                saved = objects / oid
+                result = {'oid': oid, 'size': size}
+                action = {'href': f'http://127.0.0.1:{self.server.server_port}/objects/{oid}'}
+                if operation == 'upload' and not saved.exists():
+                    result['actions'] = {'upload': action}
+                elif operation == 'download' and saved.exists():
+                    result['actions'] = {'download': action}
+                elif operation == 'download':
+                    result['error'] = {'code': 404, 'message': 'missing object'}
+                response.append(result)
+            self.reply(200, {'transfer': 'basic', 'objects': response})
+        elif self.path.endswith('/locks/verify'):
             if mode == 'timeout':
                 time.sleep(3)
                 self.reply(200, {'ours': [], 'theirs': []})
@@ -77,7 +126,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.endswith('/unlock'):
             identity = self.path.split('/')[-2]
             found = next((p for p, item in locks.items() if item['id'] == identity), None)
-            if found and not body.get('force'):
+            refused = (root / 'fail-unlock-path').read_text().strip() if (root / 'fail-unlock-path').exists() else ''
+            if found and found == refused:
+                self.reply(403, {'message': 'fixture release refused'})
+            elif found and not body.get('force'):
                 self.reply(200, {'lock': locks.pop(found)})
             else:
                 self.reply(403, {'message': 'not owned'})

@@ -133,6 +133,9 @@ void SGitWorkspace::Construct(const FArguments& Args)
             [SNew(SButton).Text(Text(TEXT("Stashes…"))).IsEnabled_Lambda([this] { return IsIdle() && Snapshot.bValid; }).OnClicked(this, &SGitWorkspace::ShowStashes)]
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
             [SNew(SButton).Text(Text(TEXT("Push…"))).ToolTipText(this, &SGitWorkspace::PushHint).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Ahead > 0 && Remote.Behind == 0; }).OnClicked_Lambda([this] { return RemoteAction(1); })]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(Text(TEXT("Push and unlock…"))).ToolTipText(Text(TEXT("Review every outgoing commit, then choose which owned locks to release after a verified Push. Unchecked locks stay held.")))
+                .IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Ahead > 0 && Remote.Behind == 0; }).OnClicked_Lambda([this] { return ShowPushHandoff(); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 12, 0)
             [SNew(SButton).Text(Text(TEXT("Pull fast-forward…"))).IsEnabled_Lambda([this] { return IsIdle() && Remote.IsFresh() && Remote.Behind > 0 && Remote.Ahead == 0; }).OnClicked_Lambda([this] { return RemoteAction(2); })]
         ]
@@ -215,7 +218,7 @@ void SGitWorkspace::Construct(const FArguments& Args)
     ];
     Refresh();
 }
-SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = UnlockWindow.Pin()) Window->RequestDestroyWindow(); }
+SGitWorkspace::~SGitWorkspace() { WaitForWork(); if (auto Window = IncomingWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = StashWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = UnlockWindow.Pin()) Window->RequestDestroyWindow(); if (auto Window = HandoffWindow.Pin()) Window->RequestDestroyWindow(); }
 void SGitWorkspace::WaitForWork() { if (Pending.IsValid()) { Pending.Wait(); Pending = TFuture<FGitWorkspaceTaskResult>(); } }
 void SGitWorkspace::Start(TFunction<FGitWorkspaceTaskResult()> Work)
 {
@@ -312,6 +315,20 @@ void SGitWorkspace::Tick(const FGeometry&, double, float)
         {
             UnlockReview = MoveTemp(Result.UnlockReview);
             if (UnlockReport) UnlockReport->SetText(Text(UnlockReview.Text()));
+        }
+        if (auto Window = Result.HandoffReviewWindow.Pin(); Result.bHandoffReview && Window && Window == HandoffWindow.Pin() && Window->IsVisible())
+        {
+            if (HandoffReview.Remote.Head != Result.HandoffReview.Remote.Head || HandoffReview.Remote.Context != Result.HandoffReview.Remote.Context || HandoffReview.Locks.Context != Result.HandoffReview.Locks.Context)
+                HandoffChecked.Empty();
+            for (auto It = HandoffChecked.CreateIterator(); It; ++It)
+            {
+                const auto* Old = HandoffReview.Locks.Locks.Find(*It);
+                const auto* Fresh = Result.HandoffReview.Locks.Locks.Find(*It);
+                const auto* Asset = Result.HandoffReview.Assets.FindByPredicate([&](const auto& Item) { return Item.Path == *It; });
+                if (!Old || !Fresh || Old->Id != Fresh->Id || !Asset || !Asset->IsFresh()) It.RemoveCurrent();
+            }
+            HandoffReview = MoveTemp(Result.HandoffReview);
+            RebuildHandoffRows(); UpdateHandoffReport();
         }
         // Create/Apply prepare their reviews asynchronously, then present the exact
         // paths for confirmation in the same window that requested the action.

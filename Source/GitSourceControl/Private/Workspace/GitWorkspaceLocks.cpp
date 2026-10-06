@@ -203,7 +203,10 @@ FLockSnapshot FRepository::VerifyLocksInternal(const FString& Remote)
 }
 FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead)
 {
-    FScopeLock Guard(&Mutex);
+    FScopeLock Guard(&Mutex); return ChangeLockInternal(Reviewed, Path, bUnlock, bHandoffConfirmed, ReviewedHead);
+}
+FResult FRepository::ChangeLockInternal(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead)
+{
     if (!Reviewed.IsFresh() || !SafePath(Path)) return LockFailure(TEXT("Verify locks and review the selected path before continuing."));
     auto Current = VerifyLocksInternal(Reviewed.Remote);
     if (!Current.IsFresh()) return LockFailure(Current.Error);

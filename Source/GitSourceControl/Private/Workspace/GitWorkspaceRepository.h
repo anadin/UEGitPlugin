@@ -118,7 +118,31 @@ struct FUnlockReview
     TArray<FStashEntry> BlockingStashes;
     int32 StashesChecked = 0;
     bool bReady = false;
+    bool bAwaitingPush = false;
     bool IsFresh() const { return bReady && Error.IsEmpty() && Locks.IsFresh(); }
+    FString Text() const;
+};
+struct FOutgoingCommit { FString Oid, Subject; TArray<FString> Paths; };
+struct FPushHandoffReview
+{
+    FRemoteSnapshot Remote;
+    FLockSnapshot Locks;
+    TArray<FOutgoingCommit> Commits;
+    TArray<FUnlockReview> Assets;
+    FString Error;
+    bool bValid = false;
+    bool IsFresh() const { return bValid && Error.IsEmpty() && Remote.IsFresh() && Locks.IsFresh(); }
+    bool IsRetry() const { return Remote.Ahead == 0 && Remote.RemoteHead == Remote.Head; }
+    FString Text(const TArray<FString>& Selected) const;
+};
+struct FHandoffLockResult { FString Path, Id, Error; bool bReleased = false; };
+struct FPushHandoffResult
+{
+    bool bPushVerified = false;
+    bool bUnlockOnly = false;
+    FString Error;
+    TArray<FHandoffLockResult> Assets;
+    FLockSnapshot Locks;
     FString Text() const;
 };
 struct FStashReview
@@ -160,6 +184,8 @@ public:
     FResult ChangeLock(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed = false, const FString& ReviewedHead = FString());
     FRemoteSnapshot Fetch();
     FResult Push(const FRemoteSnapshot& Reviewed);
+    FPushHandoffReview ReviewPushHandoff(const FRemoteSnapshot& Reviewed);
+    FPushHandoffResult ExecutePushHandoff(const FPushHandoffReview& Reviewed, const TArray<FString>& Selected, bool bHandoffConfirmed = false);
     FResult Pull(const FRemoteSnapshot& Reviewed);
     FIncomingLfsResult PrepareIncomingLfs(const FRemoteSnapshot& Reviewed);
     FStashList ListStashes();
@@ -186,7 +212,10 @@ private:
     FStashList ListStashesInternal();
     FStashInspection InspectStashInternal(const FString& Oid, const FString& Selector);
     FResult ReadStashPaths(const FStashEntry& Entry, TArray<FString>& Paths, FString* Details = nullptr) const;
-    FUnlockReview ReviewUnlockInternal(const FLockSnapshot& Current, const FString& Path, const FString& ReviewedHead = FString());
+    FUnlockReview ReviewUnlockInternal(const FLockSnapshot& Current, const FString& Path, const FString& ReviewedHead = FString(), bool bRequirePublished = true);
+    FPushHandoffReview ReviewPushHandoffInternal(const FRemoteSnapshot& Reviewed);
+    FResult PushInternal(const FRemoteSnapshot& Reviewed);
+    FResult ChangeLockInternal(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead);
     FString StashDropRecovery(FString* ReportPath = nullptr) const;
     FStashReview ReviewStashInternal(const FString& Oid, bool bRestoreIndex, bool bSelected = false, const TArray<FString>& Paths = {}, bool bIncludeUntracked = false);
     FResult CaptureUntrackedTree(const TArray<FString>& Paths) const;

@@ -30,7 +30,7 @@ FString FUnlockReview::Text() const
         for (const auto& Entry : BlockingStashes)
             Result += DisplayUnlock(Entry.Selector) + TEXT("  ") + Entry.Oid.Left(10) + TEXT("  ") + DisplayUnlock(Entry.Label) + TEXT("\n");
     }
-    Result += bReady ? TEXT("\nREADY FOR HANDOFF CONFIRMATION\n") : TEXT("\nUNLOCK BLOCKED\n") + Error + TEXT("\n");
+    Result += bReady ? (bAwaitingPush ? TEXT("\nELIGIBLE AFTER VERIFIED PUSH\n") : TEXT("\nREADY FOR HANDOFF CONFIRMATION\n")) : TEXT("\nUNLOCK BLOCKED\n") + Error + TEXT("\n");
     Result += TEXT("\nOnly this asset's lock may be released. Files, staging, commits and other locks stay in place. Nothing is pushed. Server ownership alone cannot prove that another clone no longer needs the lock; confirm the team handoff before releasing it.");
     return Result;
 }
@@ -39,7 +39,7 @@ FUnlockReview FRepository::ReviewUnlock(const FString& Remote, const FString& Pa
     FScopeLock Guard(&Mutex);
     return ReviewUnlockInternal(VerifyLocksInternal(Remote), Path);
 }
-FUnlockReview FRepository::ReviewUnlockInternal(const FLockSnapshot& Current, const FString& Path, const FString& ReviewedHead)
+FUnlockReview FRepository::ReviewUnlockInternal(const FLockSnapshot& Current, const FString& Path, const FString& ReviewedHead, bool bRequirePublished)
 {
     FUnlockReview R; R.Locks = Current; R.Path = Path;
     auto Fail = [&](const FString& Error) { R.Error = Error; return R; };
@@ -85,19 +85,26 @@ FUnlockReview FRepository::ReviewUnlockInternal(const FLockSnapshot& Current, co
     R.Checks.Add(FString::Printf(TEXT("%d stashes inspected; none contains changes to this asset."), R.StashesChecked));
     const auto UpstreamRemote = Git({TEXT("config"), TEXT("--get"), TEXT("branch.") + Status.Branch + TEXT(".remote")});
     const auto Merge = Git({TEXT("config"), TEXT("--get"), TEXT("branch.") + Status.Branch + TEXT(".merge")});
-    const auto Upstream = Git({TEXT("rev-parse"), TEXT("--verify"), TEXT("@{upstream}")});
-    if (!UpstreamRemote.Ok() || !Merge.Ok() || !Upstream.Ok())
+    if (!UpstreamRemote.Ok() || !Merge.Ok())
         return Fail(TEXT("This branch has no readable upstream. Configure its upstream on ") + DisplayUnlock(Current.Remote) + TEXT(" and publish/reconcile the branch before unlocking."));
     if (UpstreamRemote.Text().TrimEnd() != Current.Remote)
         return Fail(TEXT("This branch tracks a different remote. Select its upstream remote for locks, or configure an upstream on ") + DisplayUnlock(Current.Remote) + TEXT(" before reviewing handoff."));
-    if (Upstream.Text().TrimEnd() != Status.Head)
-        return Fail(TEXT("This branch does not match its upstream on ") + DisplayUnlock(Current.Remote) + TEXT(". Fetch upstream, review the outgoing commits, then Push (or reconcile incoming changes externally). Refresh this unlock review afterward. Push publishes all outgoing commits on the branch and keeps locks; it does not push only this asset."));
     const FString Ref = Merge.Text().TrimEnd();
-    if (!Ref.StartsWith(TEXT("refs/heads/"))) return Fail(TEXT("Cannot identify an upstream branch for handoff."));
-    const auto RemoteHead = Git({TEXT("ls-remote"), TEXT("--exit-code"), TEXT("--refs"), TEXT("--"), Current.Remote, Ref});
-    if (!RemoteHead.Ok() || RemoteHead.Text().TrimEnd() != Status.Head + TEXT("\t") + Ref)
-        return Fail(TEXT("The live upstream does not match HEAD or cannot be verified. Keep the lock and refresh your branch externally."));
-    R.Checks.Add(TEXT("Published commit matches the live upstream: ") + DisplayUnlock(Current.Remote) + TEXT(" / ") + DisplayUnlock(Ref));
+    if (!Ref.StartsWith(TEXT("refs/heads/")) || !Git({TEXT("check-ref-format"), Ref}).Ok()) return Fail(TEXT("Cannot identify an upstream branch for handoff."));
+    if (bRequirePublished)
+    {
+        // The live ref is authoritative. Ordinary tracking refs can remain stale
+        // after an exact-ref Push with custom fetch mappings.
+        const auto RemoteHead = Git({TEXT("ls-remote"), TEXT("--exit-code"), TEXT("--refs"), TEXT("--"), Current.Remote, Ref});
+        if (!RemoteHead.Ok() || RemoteHead.Text().TrimEnd() != Status.Head + TEXT("\t") + Ref)
+            return Fail(TEXT("The live upstream does not match HEAD or cannot be verified. Fetch upstream, review the outgoing commits, then Push (or reconcile incoming changes externally). Refresh this unlock review afterward. Push publishes all outgoing commits on the branch and keeps locks; it does not push only this asset."));
+        R.Checks.Add(TEXT("Published commit matches the live upstream: ") + DisplayUnlock(Current.Remote) + TEXT(" / ") + DisplayUnlock(Ref));
+    }
+    else
+    {
+        R.bAwaitingPush = true;
+        R.Checks.Add(TEXT("Publication pending. Release requires a successful Push and a fresh live upstream check."));
+    }
     // Revalidate after network/disk work. Arbitrary external writers are not
     // excluded; any observed change is a refusal, never an automatic retry.
     const auto FinalStatus = RefreshInternal(); FLockSnapshot FinalContext;

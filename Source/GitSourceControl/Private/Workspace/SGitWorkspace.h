@@ -34,6 +34,9 @@ struct FGitWorkspaceTaskResult
     GitWorkspace::FUnlockReview UnlockReview;
     TWeakPtr<SWindow> UnlockReviewWindow;
     bool bUnlockReview = false;
+    GitWorkspace::FPushHandoffReview HandoffReview;
+    TWeakPtr<SWindow> HandoffReviewWindow;
+    bool bHandoffReview = false;
     bool bRestart = false;
     bool bReload = false;
     bool bIncomingLfs = false;
@@ -63,6 +66,7 @@ private:
     friend class FGitIncomingLfsPanelTest;
     friend class FGitStashPanelTest;
     friend class FGitUnlockReviewPanelTest;
+    friend class FGitPushHandoffPanelTest;
     bool IsIdle() const { return !Pending.IsValid() && RestartFolder.IsEmpty() && !bReloading; }
     void Start(TFunction<FGitWorkspaceTaskResult()> Work);
     FReply Refresh();
@@ -110,6 +114,13 @@ private:
     FReply ShowUnlockReview();
     FReply RefreshUnlockReview();
     FReply RunUnlock();
+    FReply ShowPushHandoff();
+    FReply RefreshPushHandoff();
+    FReply RunPushHandoff();
+    void ApplyPushHandoffResult(const GitWorkspace::FPushHandoffReview& Reviewed, GitWorkspace::FPushHandoffResult Result);
+    void RebuildHandoffRows();
+    void UpdateHandoffReport();
+    bool CanRunPushHandoff() const;
     bool HasDirtyPackages() const;
     FText Inspector() const;
     void RebuildRows();
@@ -123,6 +134,15 @@ private:
     GitWorkspace::FUnlockReview UnlockReview;
     TWeakPtr<SWindow> UnlockWindow;
     TSharedPtr<SMultiLineEditableTextBox> UnlockReport;
+    GitWorkspace::FPushHandoffReview HandoffReview;
+    GitWorkspace::FPushHandoffResult HandoffResult;
+    TWeakPtr<SWindow> HandoffWindow;
+    TSharedPtr<SMultiLineEditableTextBox> HandoffReport;
+    TSharedPtr<SVerticalBox> HandoffRows;
+    TSet<FString> HandoffChecked;
+    TMap<FString, FString> HandoffRetryIds;
+    FString HandoffRetryHead, HandoffRetryContext, HandoffRetryLockContext;
+    bool bHasHandoffResult = false;
     TFuture<FGitWorkspaceTaskResult> Pending;
     TArray<TSharedPtr<FGitWorkspaceRow>> Rows;
     TSharedPtr<SListView<TSharedPtr<FGitWorkspaceRow>>> List;

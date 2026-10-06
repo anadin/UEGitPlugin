@@ -12,9 +12,13 @@
 #include "Interfaces/IPluginManager.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Misc/App.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectGlobals.h"
+#include "Engine/Texture2D.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
 #include <unistd.h>
+#include <sys/stat.h>
 #endif
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitLockParserTest, "GitWorkspace.Locks.StrictOwnership", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -505,6 +509,219 @@ bool FGitStartupLockVerificationTest::RunTest(const FString&)
     TestEqual(TEXT("Idle ticks and local Refresh do not retry a failed startup check"), Requests(), FailedRequests);
     F.Mode(TEXT("")); Failed->VerifyLocks(); Settle(Failed);
     TestTrue(TEXT("Manual retry recovers after server failure"), Failed->Locks.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    return true;
+}
+
+namespace
+{
+FString HandoffRead(const FString& Path) { FString Text; FFileHelper::LoadFileToString(Text, *Path); return Text; }
+FString HandoffTip(FLockFixture& F)
+{ FString Tip, Ref; F.Call({TEXT("ls-remote"), TEXT("--refs"), TEXT("origin"), TEXT("refs/heads/main")}).Text().TrimEnd().Split(TEXT("\t"), &Tip, &Ref); return Tip; }
+FString HandoffQuote(FString Value) { return TEXT("'") + Value.Replace(TEXT("'"), TEXT("'\"'\"'")) + TEXT("'"); }
+void HandoffHook(FLockFixture& F, const FString& Body)
+{
+    IFileManager::Get().MakeDirectory(*FPaths::Combine(F.Repo, TEXT(".git/test-hooks")), true);
+    F.Write(TEXT(".git/test-hooks/pre-push"), TEXT("#!/bin/sh\n") + Body + TEXT("\n"));
+    chmod(TCHAR_TO_UTF8(*FPaths::Combine(F.Repo, TEXT(".git/test-hooks/pre-push"))), 0755);
+}
+bool PrepareHandoff(FLockFixture& F, GitWorkspace::FRepository& Repo)
+{
+    if (F.Endpoint.IsEmpty() || !F.Call({TEXT("config"), TEXT("lfs.transfer.maxretries"), TEXT("0")}).Ok()) return false;
+    F.Write(TEXT("texture.uasset"), TEXT("base texture\n")); F.Write(TEXT("material.uasset"), TEXT("base material\n"));
+    if (!F.Call({TEXT("add"), TEXT(".")}).Ok() || !F.Call({TEXT("commit"), TEXT("-qm"), TEXT("fixture assets")}).Ok() || !F.Call({TEXT("push"), TEXT("--no-verify"), TEXT("origin"), TEXT("main")}).Ok()) return false;
+    for (const FString Path : {FString(TEXT("asset.uasset")), FString(TEXT("texture.uasset")), FString(TEXT("material.uasset"))})
+        if (!Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), Path, false).Ok()) return false;
+    F.Write(TEXT("asset.uasset"), TEXT("committed Blueprint\n")); F.Write(TEXT("texture.uasset"), TEXT("committed texture\n")); F.Write(TEXT("material.uasset"), TEXT("committed material\n"));
+    if (!Repo.Stage({TEXT("asset.uasset"), TEXT("texture.uasset"), TEXT("material.uasset")}).Ok() || !Repo.Commit(Repo.Refresh(), TEXT("committed feature assets")).Ok()) return false;
+    F.Write(TEXT("README.md"), TEXT("committed feature notes\n"));
+    if (!Repo.Stage({TEXT("README.md")}).Ok() || !Repo.Commit(Repo.Refresh(), TEXT("feature notes")).Ok()) return false;
+    F.Write(TEXT("asset.uasset"), TEXT("resume Blueprint later\n"));
+    if (!F.Call({TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("pending Blueprint work")}).Ok()) return false;
+    F.Write(TEXT("README.md"), TEXT("unrelated staged notes\n"));
+    if (!Repo.Stage({TEXT("README.md")}).Ok()) return false;
+    F.Write(TEXT("README.md"), TEXT("unrelated working notes\n")); return true;
+}
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSelectivePushHandoffTest, "GitWorkspace.Handoff.SelectivePushAndLfs", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSelectivePushHandoffTest::RunTest(const FString&)
+{
+    FLockFixture F; GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Prepare locked feature and pending Blueprint stash"), PrepareHandoff(F, Repo))) return false;
+    const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes();
+    const auto Review = Repo.ReviewPushHandoff(Repo.Fetch());
+    if (!TestTrue(TEXT("Handoff review fresh: ") + Review.Error, Review.IsFresh())) return false;
+    TestEqual(TEXT("Every outgoing commit listed"), Review.Commits.Num(), 2);
+    TestTrue(TEXT("Unchecked Blueprint is still in outgoing publication"), Review.Text({TEXT("texture.uasset")}).Contains(TEXT("asset.uasset")) && Review.Commits[0].Paths.Contains(TEXT("asset.uasset")));
+    const auto* Blueprint = Review.Assets.FindByPredicate([](const auto& A) { return A.Path == TEXT("asset.uasset"); });
+    TestTrue(TEXT("Saved Blueprint work blocks only its release"), Blueprint && !Blueprint->bReady && Blueprint->Error.Contains(TEXT("stash")));
+    const auto Result = Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset"), TEXT("material.uasset")}, true);
+    if (!TestTrue(TEXT("Push verified before selected releases: ") + Result.Text(), Result.bPushVerified)) return false;
+    TestTrue(TEXT("Both selected locks released"), Result.Assets.Num() == 2 && Result.Assets[0].bReleased && Result.Assets[1].bReleased);
+    TestEqual(TEXT("Reviewed HEAD published"), HandoffTip(F), Review.Remote.Head);
+    TestTrue(TEXT("Blueprint lock kept"), Result.Locks.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    TestTrue(TEXT("Index preserved"), Repo.Refresh().IndexEntries == Before.IndexEntries);
+    TestEqual(TEXT("Working notes preserved"), HandoffRead(FPaths::Combine(F.Repo, TEXT("README.md"))), FString(TEXT("unrelated working notes\n")));
+    TestEqual(TEXT("Saved Blueprint stash preserved"), Repo.ListStashes().Fingerprint, Stashes.Fingerprint);
+    const FString Clone = FPaths::Combine(F.Root, TEXT("clone"));
+    auto At = [&](const TArray<FString>& Args) { return GitWorkspace::Run(F.Git, Clone, Args); };
+    if (!TestTrue(TEXT("Clone actual published repository"), F.Call({TEXT("clone"), TEXT("--no-checkout"), F.Remote, Clone}).Ok())) return false;
+    if (!TestTrue(TEXT("Configure clone LFS"), At({TEXT("lfs"), TEXT("install"), TEXT("--local"), TEXT("--skip-repo")}).Ok() && At({TEXT("config"), TEXT("lfs.url"), F.Endpoint}).Ok())) return false;
+    if (!TestTrue(TEXT("Another clone downloads all published LFS objects"), At({TEXT("checkout"), TEXT("main")}).Ok())) return false;
+    TestEqual(TEXT("Unselected Blueprint was published as committed bytes"), HandoffRead(FPaths::Combine(Clone, TEXT("asset.uasset"))), FString(TEXT("committed Blueprint\n")));
+    TestEqual(TEXT("Released texture hydrates"), HandoffRead(FPaths::Combine(Clone, TEXT("texture.uasset"))), FString(TEXT("committed texture\n")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPartialPushHandoffTest, "GitWorkspace.Handoff.PartialReleaseAndRetry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitPartialPushHandoffTest::RunTest(const FString&)
+{
+    FLockFixture F; GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Prepare handoff"), PrepareHandoff(F, Repo))) return false;
+    const FString Counter = FPaths::Combine(F.Root, TEXT("push-count"));
+    HandoffHook(F, TEXT("printf 'push\\n' >> ") + HandoffQuote(Counter));
+    FFileHelper::SaveStringToFile(TEXT("material.uasset"), *FPaths::Combine(F.Root, TEXT("fail-unlock-path")));
+    auto Review = Repo.ReviewPushHandoff(Repo.Fetch());
+    auto Result = Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset"), TEXT("material.uasset")}, true);
+    TestTrue(TEXT("Publication succeeded despite later release refusal"), Result.bPushVerified && !Result.bUnlockOnly);
+    TestTrue(TEXT("Texture success and material failure reported individually"), Result.Assets.Num() == 2 && Result.Assets[0].bReleased && !Result.Assets[1].bReleased);
+    TestTrue(TEXT("Failed material reservation remains ours"), Result.Locks.State(TEXT("material.uasset"), true) == GitWorkspace::ELockState::Ours);
+    TestTrue(TEXT("Result directs unlock-only retry"), Result.Text().Contains(TEXT("Do not repeat Push")));
+    const FString Published = HandoffTip(F);
+    // An intentionally stale tracking ref must not require an external Fetch.
+    F.Call({TEXT("update-ref"), TEXT("refs/remotes/origin/main"), Review.Remote.RemoteHead});
+    IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT("fail-unlock-path")));
+    Review = Repo.ReviewPushHandoff(Repo.Fetch());
+    TestTrue(TEXT("Retry is ready using live publication, despite stale tracking ref"), Review.IsFresh() && Review.IsRetry());
+    Result = Repo.ExecutePushHandoff(Review, {TEXT("material.uasset")}, true);
+    TestTrue(TEXT("Retry releases remaining material only"), Result.bPushVerified && Result.bUnlockOnly && Result.Assets.Num() == 1 && Result.Assets[0].bReleased);
+    TestEqual(TEXT("No second Push hook executed"), HandoffRead(Counter), FString(TEXT("push\n")));
+    TestEqual(TEXT("Retry preserves published ref"), HandoffTip(F), Published);
+    TestTrue(TEXT("Blueprint reservation still ours"), Result.Locks.State(TEXT("asset.uasset"), true) == GitWorkspace::ELockState::Ours);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitFailedPushHandoffTest, "GitWorkspace.Handoff.FailedAndUncertainPush", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitFailedPushHandoffTest::RunTest(const FString&)
+{
+    FLockFixture F; GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Prepare handoff"), PrepareHandoff(F, Repo))) return false;
+    auto Review = Repo.ReviewPushHandoff(Repo.Fetch()); const FString Before = HandoffTip(F);
+    HandoffHook(F, TEXT("echo handoff-hook-rejected >&2\nexit 1"));
+    auto Result = Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset")}, true);
+    TestFalse(TEXT("Rejected Push cannot release"), Result.bPushVerified);
+    TestTrue(TEXT("Push error visible"), Result.Error.Contains(TEXT("handoff-hook-rejected")));
+    TestEqual(TEXT("Rejected ref unchanged"), HandoffTip(F), Before);
+    TestFalse(TEXT("No unlock request after rejected Push"), HandoffRead(FPaths::Combine(F.Root, TEXT("requests"))).Contains(TEXT("/unlock")));
+    F.Mode(TEXT("uploadfail"));
+    Result = Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset")}, true);
+    TestTrue(TEXT("LFS failure prevents publication and release"), !Result.bPushVerified && Result.Error.Contains(TEXT("LFS upload failed")) && HandoffTip(F) == Before);
+    F.Mode(TEXT("")); IFileManager::Get().Delete(*FPaths::Combine(F.Repo, TEXT(".git/test-hooks/pre-push")));
+    const FString Marker = FPaths::Combine(F.Root, TEXT("push-sent"));
+    const FString Wrapper = FPaths::Combine(F.Root, TEXT("uncertain-git.sh"));
+    const FString Script = TEXT("#!/bin/sh\ncase \"$*\" in\n *'push --porcelain'*) ") + HandoffQuote(F.Git) + TEXT(" \"$@\"; result=$?; if [ $result -eq 0 ]; then touch ") + HandoffQuote(Marker) +
+        TEXT("; fi; exit $result;;\n *'ls-remote '*) if [ -f ") + HandoffQuote(Marker) + TEXT(" ]; then echo fixture-confirmation-unavailable >&2; exit 1; fi;;\nesac\nexec ") + HandoffQuote(F.Git) + TEXT(" \"$@\"\n");
+    FFileHelper::SaveStringToFile(Script, *Wrapper, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM); chmod(TCHAR_TO_UTF8(*Wrapper), 0755);
+    GitWorkspace::FRepository Uncertain(Wrapper, F.Repo);
+    Review = Uncertain.ReviewPushHandoff(Uncertain.Fetch());
+    Result = Uncertain.ExecutePushHandoff(Review, {TEXT("texture.uasset")}, true);
+    TestFalse(TEXT("Lost remote confirmation cannot release"), Result.bPushVerified);
+    TestEqual(TEXT("Fixture Git push actually reached remote"), HandoffTip(F), Review.Remote.Head);
+    TestTrue(TEXT("Uncertainty is explicit"), Result.Error.Contains(TEXT("could not be confirmed")));
+    TestFalse(TEXT("No unlock request after uncertain publication"), HandoffRead(FPaths::Combine(F.Root, TEXT("requests"))).Contains(TEXT("/unlock")));
+    TestTrue(TEXT("All three locks retained"), Result.Locks.IsFresh() && Result.Locks.Locks.Num() == 3);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPushHandoffPreflightTest, "GitWorkspace.Handoff.SelectionAndReviewRaces", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitPushHandoffPreflightTest::RunTest(const FString&)
+{
+    FLockFixture F; GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Prepare handoff"), PrepareHandoff(F, Repo))) return false;
+    const auto Review = Repo.ReviewPushHandoff(Repo.Fetch()); const FString Tip = HandoffTip(F);
+    TestFalse(TEXT("No confirmation cannot publish"), Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset")}).bPushVerified);
+    TestFalse(TEXT("Empty selection cannot publish"), Repo.ExecutePushHandoff(Review, {}, true).bPushVerified);
+    TestFalse(TEXT("Duplicate selection refused"), Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset"), TEXT("texture.uasset")}, true).bPushVerified);
+    TestFalse(TEXT("Unreviewed path cannot publish"), Repo.ExecutePushHandoff(Review, {TEXT("not-reviewed.uasset")}, true).bPushVerified);
+    TestFalse(TEXT("Blocked stash path cannot publish"), Repo.ExecutePushHandoff(Review, {TEXT("asset.uasset")}, true).bPushVerified);
+    auto Expired = Review; Expired.Locks.VerifiedSeconds -= 61;
+    TestFalse(TEXT("Expired review refused"), Repo.ExecutePushHandoff(Expired, {TEXT("texture.uasset")}, true).bPushVerified);
+    F.Write(TEXT("texture.uasset"), TEXT("changed since review\n"));
+    TestFalse(TEXT("New working edit prevents publication/release"), Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset")}, true).bPushVerified);
+    F.Call({TEXT("restore"), TEXT("--"), TEXT("texture.uasset")});
+    F.Call({TEXT("lfs"), TEXT("unlock"), TEXT("--remote=origin"), TEXT("--id=") + Review.Locks.Locks[TEXT("texture.uasset")].Id});
+    Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), TEXT("texture.uasset"), false);
+    const auto Replacement = Repo.VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Replacement identity refuses old selection"), Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset")}, true).bPushVerified);
+    TestEqual(TEXT("Replacement remains owned"), Repo.VerifyLocks(TEXT("origin")).Locks[TEXT("texture.uasset")].Id, Replacement.Locks[TEXT("texture.uasset")].Id);
+    auto Current = Repo.ReviewPushHandoff(Repo.Fetch());
+    F.Write(TEXT("README.md"), TEXT("changed commit\n")); Repo.Stage({TEXT("README.md")}); Repo.Commit(Repo.Refresh(), TEXT("new HEAD"));
+    TestFalse(TEXT("Commit drift refuses publication"), Repo.ExecutePushHandoff(Current, {TEXT("texture.uasset")}, true).bPushVerified);
+    TestEqual(TEXT("All preflight refusals preserve remote"), HandoffTip(F), Tip);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPushHandoffPostflightTest, "GitWorkspace.Handoff.PostPushEditsAndReplacement", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitPushHandoffPostflightTest::RunTest(const FString&)
+{
+    FLockFixture F; GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Prepare handoff"), PrepareHandoff(F, Repo))) return false;
+    auto Review = Repo.ReviewPushHandoff(Repo.Fetch());
+    HandoffHook(F, TEXT("printf 'hook local edit\\n' > ") + HandoffQuote(FPaths::Combine(F.Repo, TEXT("texture.uasset"))));
+    auto Result = Repo.ExecutePushHandoff(Review, {TEXT("texture.uasset"), TEXT("material.uasset")}, true);
+    TestTrue(TEXT("Push succeeds but changed texture retained"), Result.bPushVerified && Result.Assets.Num() == 2 && !Result.Assets[0].bReleased && Result.Assets[1].bReleased);
+    TestTrue(TEXT("Texture reason reports local changes"), Result.Assets[0].Error.Contains(TEXT("working or staged")));
+    TestEqual(TEXT("Unexpected hook edit preserved"), HandoffRead(FPaths::Combine(F.Repo, TEXT("texture.uasset"))), FString(TEXT("hook local edit\n")));
+    FLockFixture Other; GitWorkspace::FRepository OtherRepo(Other.Git, Other.Repo);
+    if (!TestTrue(TEXT("Prepare replacement race"), PrepareHandoff(Other, OtherRepo))) return false;
+    Review = OtherRepo.ReviewPushHandoff(OtherRepo.Fetch()); const FString OldId = Review.Locks.Locks[TEXT("texture.uasset")].Id;
+    HandoffHook(Other, HandoffQuote(Other.Git) + TEXT(" lfs unlock --remote=origin --id=") + HandoffQuote(OldId) + TEXT(" >/dev/null && ") + HandoffQuote(Other.Git) + TEXT(" lfs lock --remote=origin texture.uasset >/dev/null"));
+    Result = OtherRepo.ExecutePushHandoff(Review, {TEXT("texture.uasset")}, true);
+    TestTrue(TEXT("Replacement after Push is not released"), Result.bPushVerified && Result.Assets.Num() == 1 && !Result.Assets[0].bReleased);
+    TestTrue(TEXT("New server identity remains ours"), Result.Locks.Locks.Contains(TEXT("texture.uasset")) && Result.Locks.Locks[TEXT("texture.uasset")].Id != OldId);
+    TestTrue(TEXT("Identity refusal explicit"), Result.Assets[0].Error.Contains(TEXT("identity")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPushHandoffPanelTest, "GitWorkspace.Handoff.ReviewSelectionCancelAndRetryPanel", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitPushHandoffPanelTest::RunTest(const FString&)
+{
+    FLockFixture F; auto Repo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(F.Git, F.Repo);
+    if (!TestTrue(TEXT("Prepare panel handoff"), PrepareHandoff(F, *Repo))) return false;
+    auto Panel = SNew(SGitWorkspace).Repository(Repo);
+    auto Settle = [&]() { while (Panel->Pending.IsValid()) { Panel->Pending.Wait(); Panel->Tick(FGeometry(), 0, 0); } };
+    Settle(); Panel->Remote = Repo->Fetch(); Panel->ShowPushHandoff(); Settle();
+    if (!TestTrue(TEXT("Panel prepares fresh handoff"), Panel->HandoffReview.IsFresh())) return false;
+    TestTrue(TEXT("No locks checked by default"), Panel->HandoffChecked.IsEmpty());
+    TestFalse(TEXT("Empty selection disables action"), Panel->CanRunPushHandoff());
+    Panel->HandoffChecked.Add(TEXT("texture.uasset")); Panel->HandoffChecked.Add(TEXT("material.uasset")); Panel->UpdateHandoffReport();
+    TestTrue(TEXT("Eligible selected locks enable action"), Panel->CanRunPushHandoff());
+    TestTrue(TEXT("Report distinguishes publication and kept locks"), Panel->HandoffReport->GetText().ToString().Contains(TEXT("ALL outgoing commits")) && Panel->HandoffReport->GetText().ToString().Contains(TEXT("LOCKS TO KEEP\nasset.uasset")));
+    const auto DisplayLocks = Panel->Locks;
+    Panel->LockRemote = TEXT("another-display-remote"); Panel->Locks = GitWorkspace::FLockSnapshot(); Panel->Locks.Remote = Panel->LockRemote;
+    Panel->RefreshPushHandoff(); Settle();
+    TestEqual(TEXT("Handoff on upstream does not replace a different main lock-remote snapshot"), Panel->Locks.Remote, FString(TEXT("another-display-remote")));
+    Panel->LockRemote = TEXT("origin"); Panel->Locks = DisplayLocks;
+    const FString DirtyName = TEXT("/Game/Automation/HandoffDirty_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    UPackage* Dirty = CreatePackage(*DirtyName); UTexture2D* Object = NewObject<UTexture2D>(Dirty, TEXT("HandoffDirtyTexture"), RF_Public | RF_Standalone); Dirty->SetDirtyFlag(true);
+    TestFalse(TEXT("Unsaved editor package blocks combined handoff"), Panel->CanRunPushHandoff());
+    Dirty->SetDirtyFlag(false); Object->ClearFlags(RF_Public | RF_Standalone);
+    const FString Tip = HandoffTip(F);
+    { TGuardValue<bool> Unattended(GIsRunningUnattendedScript, true); Panel->RunPushHandoff(); }
+    TestTrue(TEXT("Cancellation visible"), Panel->Feedback.Contains(TEXT("cancelled")));
+    TestEqual(TEXT("Cancelled action sends no Push"), HandoffTip(F), Tip);
+    TestFalse(TEXT("Cancelled action sends no release"), HandoffRead(FPaths::Combine(F.Root, TEXT("requests"))).Contains(TEXT("/unlock")));
+    Panel->HandoffReview.Locks.VerifiedSeconds -= 61; TestFalse(TEXT("Expired review disables action"), Panel->CanRunPushHandoff());
+    Panel->RefreshPushHandoff(); Settle();
+    const auto Review = Panel->HandoffReview;
+    FFileHelper::SaveStringToFile(TEXT("material.uasset"), *FPaths::Combine(F.Root, TEXT("fail-unlock-path")));
+    const auto Result = Repo->ExecutePushHandoff(Review, {TEXT("texture.uasset"), TEXT("material.uasset")}, true);
+    if (!TestTrue(TEXT("Actual partial operation produced retry case"), Result.bPushVerified && Result.Assets.Num() == 2 && !Result.Assets[1].bReleased)) return false;
+    Panel->ApplyPushHandoffResult(Review, Result); Settle();
+    TestTrue(TEXT("Only failed original ID retained for retry"), Panel->HandoffRetryIds.Num() == 1 && Panel->HandoffRetryIds.Contains(TEXT("material.uasset")));
+    Panel->RefreshPushHandoff(); Settle();
+    TestTrue(TEXT("Panel retry prepares unlock-only mode"), Panel->HandoffReview.IsFresh() && Panel->HandoffReview.IsRetry());
+    Panel->HandoffChecked.Add(TEXT("asset.uasset")); TestFalse(TEXT("Unchecked reservation cannot be added to retry scope"), Panel->CanRunPushHandoff());
+    Panel->HandoffChecked.Empty(); Panel->HandoffChecked.Add(TEXT("material.uasset")); Panel->UpdateHandoffReport();
+    TestTrue(TEXT("Only remaining eligible reservation can retry"), Panel->CanRunPushHandoff());
+    TestTrue(TEXT("Retry report says no Push"), Panel->HandoffReport->GetText().ToString().Contains(TEXT("No Push will be sent")));
+    F.Write(TEXT("README.md"), TEXT("commit after publication\n")); Repo->Stage({TEXT("README.md")}); Repo->Commit(Repo->Refresh(), TEXT("new commit after handoff"));
+    Panel->RefreshPushHandoff(); Settle(); TestFalse(TEXT("Changed commit disables unlock-only retry"), Panel->CanRunPushHandoff());
+    TestTrue(TEXT("Retry commit/context blocker explained"), Panel->HandoffReview.Error.Contains(TEXT("published commit or acquisition context changed")));
     return true;
 }
 #endif
