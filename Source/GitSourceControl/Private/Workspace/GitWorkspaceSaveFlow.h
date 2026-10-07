@@ -18,6 +18,12 @@ void SetLockRemote(const FString& Remote);
 // Public in this private module for fixture acceptance tests and lifecycle checks.
 void InstallGuard();
 void RemoveGuard();
+struct FPackageSavePaths
+{
+    TArray<FString> Paths, NewPaths;
+    FString Error;
+};
+FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content);
 #if PLATFORM_MAC
 class FPreparedScope
 {

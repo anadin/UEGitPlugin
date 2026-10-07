@@ -105,8 +105,13 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
 #if PLATFORM_MAC
     bReviewedExistingFile = ActiveSave.IsSet() && Inside(File, ActiveSave->Root) && ActiveSave->Permit->ContainsPath(Relative(File, ActiveSave->Root));
 #endif
-    // A deleted reviewed file cannot become an unguarded first save.
-    if (!bReviewedExistingFile && !IFileManager::Get().FileExists(*File)) return true;
+    // Both existing and first writes require a prepared destination. In
+    // particular, Save As cannot silently write an unreviewed new lockable path.
+    bool bInPreparedRepository = false;
+#if PLATFORM_MAC
+    bInPreparedRepository = ActiveSave.IsSet() && Inside(File, ActiveSave->Root);
+#endif
+    if (!bReviewedExistingFile && !bInPreparedRepository && !Inside(File, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()))) return true;
     GitWorkspace::FResult Result; Result.Code = 0;
 #if PLATFORM_MAC
     if (ActiveSave.IsSet() && Inside(File, ActiveSave->Root))
@@ -142,7 +147,7 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
             const FString Path = Relative(File, ProjectRepositoryRoot);
             Result = Async(EAsyncExecution::ThreadPool, [Repo, Path] { return Repo->IsLockableAsset(Path); }).Get();
             if (Result.Code == 1) return true;
-            if (Result.Ok()) Result.Error = TEXT("Use the asset editor Save, Save All or Git Workspace Save assets to verify its lock before saving. Make Writable cannot grant lock ownership.");
+            if (Result.Ok()) Result.Error = TEXT("Use Save, Save All or Git Workspace Save assets to prepare this exact asset destination. Name new assets in game Content before saving. Save As destinations need separate integration; Make Writable cannot grant lock ownership.");
         }
     }
     if (!Result.Error.IsEmpty() || !Result.Ok())
@@ -191,24 +196,15 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     const auto Local = Async(EAsyncExecution::ThreadPool, [Repo] { return Repo->Refresh(); }).Get();
     if (Local.Root.IsEmpty()) { Original.ExecuteIfBound(); return; }
     if (!Local.bValid) { Blocked(Local.Error); return; }
-    TArray<FString> Paths;
-    for (UPackage* Package : Packages)
-    {
-        if (UWorld* World = Package ? UWorld::FindWorldInPackage(Package) : nullptr; World && World->GetWorldPartition())
-        { Blocked(TEXT("World Partition saves need a coordinated external actor/object lock workflow. This first slice supports ordinary saved assets and maps.")); return; }
-        FString Filename;
-        if (Package && FPackageName::DoesPackageExist(Package->GetName(), &Filename))
-        {
-            Filename = FPaths::ConvertRelativePathToFull(Filename);
-            if (Inside(Filename, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()))) Paths.AddUnique(Relative(Filename, Local.Root));
-        }
-    }
+    const auto Destinations = GatherPackageSavePaths(Packages, Local.Root, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
+    if (!Destinations.Error.IsEmpty()) { Blocked(Destinations.Error); return; }
+    const auto& Paths = Destinations.Paths; const auto& NewPaths = Destinations.NewPaths;
     if (Paths.IsEmpty()) { Original.ExecuteIfBound(); return; }
     const FString Remote = LockRemote();
     GitWorkspace::FAssetSaveReview Review;
     {
         FScopedSlowTask Task(1.f, SaveText(TEXT("Verifying asset locks before saving…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
-        Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, Remote] { return Repo->ReviewAssetSave(Paths, Remote); }).Get();
+        Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, NewPaths, Remote] { return Repo->ReviewAssetSave(Paths, Remote, NewPaths); }).Get();
     }
     if (!Review.IsFresh()) { Blocked(Review.Error); return; }
     if (Review.Paths.IsEmpty()) { Original.ExecuteIfBound(); return; }
@@ -235,6 +231,26 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     Blocked(TEXT("Guarded Lock and save is currently available on Mac only."));
 #endif
 }
+}
+FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content)
+{
+    FPackageSavePaths Out;
+    for (UPackage* Package : Packages)
+    {
+        if (!Package) continue;
+        if (UWorld* World = UWorld::FindWorldInPackage(Package); World && World->GetWorldPartition())
+        { Out.Error = TEXT("World Partition saves need a coordinated external actor/object lock workflow. Save cancelled."); return Out; }
+        FString Filename;
+        const bool bExists = FPackageName::DoesPackageExist(Package->GetName(), &Filename);
+        if (!bExists && FPackageName::IsValidLongPackageName(Package->GetName(), false))
+            FPackageName::TryConvertLongPackageNameToFilename(Package->GetName(), Filename, Package->ContainsMap() ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension());
+        if (Filename.IsEmpty()) continue; // Naming dialogs still require their own integration; the writer fails closed.
+        Filename = FPaths::ConvertRelativePathToFull(Filename);
+        if (!Inside(Filename, Content)) continue;
+        const FString Path = Relative(Filename, Root); Out.Paths.AddUnique(Path);
+        if (!bExists || Package->HasAnyPackageFlags(PKG_NewlyCreated)) Out.NewPaths.AddUnique(Path);
+    }
+    return Out;
 }
 bool HandlesProvider(const ISourceControlProvider& Provider)
 {

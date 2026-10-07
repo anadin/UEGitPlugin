@@ -205,7 +205,7 @@ FResult FRepository::ChangeLock(const FLockSnapshot& Reviewed, const FString& Pa
 {
     FScopeLock Guard(&Mutex); return ChangeLockInternal(Reviewed, Path, bUnlock, bHandoffConfirmed, ReviewedHead);
 }
-FResult FRepository::ChangeLockInternal(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead)
+FResult FRepository::ChangeLockInternal(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead, bool bNewAsset)
 {
     if (!Reviewed.IsFresh() || !SafePath(Path)) return LockFailure(TEXT("Verify locks and review the selected path before continuing."));
     auto Current = VerifyLocksInternal(Reviewed.Remote);
@@ -236,28 +236,36 @@ FResult FRepository::ChangeLockInternal(const FLockSnapshot& Reviewed, const FSt
     if (!Attributes.Ok() || Attrs.Num() != 6 || Attrs[2] != TEXT("lfs") || Attrs[5] != TEXT("set")) return LockFailure(TEXT("Only LFS files with the effective lockable attribute can be locked here."));
     const auto Status = RefreshInternal();
     if (!Status.bValid || Status.bOperationInProgress || Status.HasConflicts()) return LockFailure(TEXT("Resolve repository state before locking."));
-    const auto Index = Git({TEXT("ls-files"), TEXT("--stage"), TEXT("-z"), TEXT("--"), Path});
-    const auto Entries = NullRecords(Index);
-    const bool bTracked = Entries.Num() == 1 && (Entries[0].StartsWith(TEXT("100644 ")) || Entries[0].StartsWith(TEXT("100755 ")));
-    // Only accept a new path that Git actually reported as an untracked file.
-    // Ignored files and paths inside nested repositories are not parent assets.
-    const bool bUntracked = Entries.IsEmpty() && Status.Files.ContainsByPredicate([&Path](const FFile& File) { return File.Path == Path && File.bUntracked; });
-    if (!Index.Ok() || (!bTracked && !bUntracked) || !IFileManager::Get().FileExists(*FPaths::Combine(Root, Path)))
-        return LockFailure(TEXT("Save the asset to a regular, non-ignored file in this repository before locking. Deleted and submodule paths require external handling."));
-    TArray<FString> Parts; Path.ParseIntoArray(Parts, TEXT("/")); FString Component = Root;
-    for (const auto& Part : Parts)
+    if (bNewAsset)
     {
-        Component = FPaths::Combine(Component, Part);
+        const auto Destination = CheckNewAssetPath(Path, Status);
+        if (!Destination.Ok()) return LockFailure(Destination.Error);
+    }
+    else
+    {
+        const auto Index = Git({TEXT("ls-files"), TEXT("--stage"), TEXT("-z"), TEXT("--"), Path});
+        const auto Entries = NullRecords(Index);
+        const bool bTracked = Entries.Num() == 1 && (Entries[0].StartsWith(TEXT("100644 ")) || Entries[0].StartsWith(TEXT("100755 ")));
+        // Only accept a new path that Git actually reported as an untracked file.
+        // Ignored files and paths inside nested repositories are not parent assets.
+        const bool bUntracked = Entries.IsEmpty() && Status.Files.ContainsByPredicate([&Path](const FFile& File) { return File.Path == Path && File.bUntracked; });
+        if (!Index.Ok() || (!bTracked && !bUntracked) || !IFileManager::Get().FileExists(*FPaths::Combine(Root, Path)))
+            return LockFailure(TEXT("Save the asset to a regular, non-ignored file in this repository before locking. Deleted and submodule paths require external handling."));
+        TArray<FString> Parts; Path.ParseIntoArray(Parts, TEXT("/")); FString Component = Root;
+        for (const auto& Part : Parts)
+        {
+            Component = FPaths::Combine(Component, Part);
 #if PLATFORM_MAC
-        // Apple's IPlatformFile::IsSymlink uses stat in UE 5.8, which follows
-        // links. lstat must inspect the path itself for this boundary check.
-        struct stat Info;
-        if (lstat(TCHAR_TO_UTF8(*Component), &Info) != 0 || S_ISLNK(Info.st_mode) ||
-            (Component == FPaths::Combine(Root, Path) ? !S_ISREG(Info.st_mode) : !S_ISDIR(Info.st_mode)))
+            // Apple's IPlatformFile::IsSymlink uses stat in UE 5.8, which follows
+            // links. lstat must inspect the path itself for this boundary check.
+            struct stat Info;
+            if (lstat(TCHAR_TO_UTF8(*Component), &Info) != 0 || S_ISLNK(Info.st_mode) ||
+                (Component == FPaths::Combine(Root, Path) ? !S_ISREG(Info.st_mode) : !S_ISDIR(Info.st_mode)))
 #else
-        if (FPlatformFileManager::Get().GetPlatformFile().IsSymlink(*Component) != ESymlinkResult::NonSymlink)
+            if (FPlatformFileManager::Get().GetPlatformFile().IsSymlink(*Component) != ESymlinkResult::NonSymlink)
 #endif
-            return LockFailure(TEXT("Cannot lock through a symlink or a path whose type cannot be verified. Select a saved regular asset inside this repository."));
+                return LockFailure(TEXT("Cannot lock through a symlink or a path whose type cannot be verified. Select a saved regular asset inside this repository."));
+        }
     }
     FLockSnapshot BeforeLock;
     if (!LockContext(Current.Remote, BeforeLock) || BeforeLock.Context != Current.Context)

@@ -206,7 +206,7 @@ struct FAssetSaveReview
 {
     FSnapshot Local;
     FLockSnapshot Locks;
-    TArray<FString> Paths, NeedsLock;
+    TArray<FString> Paths, NeedsLock, NewPaths;
     TArray<uint8> RawHashes;
     FString Fingerprint, Error;
     bool bValid = false;
@@ -234,7 +234,7 @@ class FRepository
 public:
     FRepository(FString InGit, FString InDirectory);
     FSnapshot Refresh();
-    FAssetSaveReview ReviewAssetSave(const TArray<FString>& Paths, const FString& Remote);
+    FAssetSaveReview ReviewAssetSave(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths = {});
 #if PLATFORM_MAC
     FAssetSavePreparation PrepareAssetSave(const FAssetSaveReview& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bLockConfirmed = false);
     FResult ValidateAssetSave(const FAssetSavePermit& Permit, const FString& Path, const GitWorkspaceSession::FLease& Lease);
@@ -277,7 +277,8 @@ public:
     const FString& GitExecutable() const { return GitBinary; }
     const FString& Directory() const { return RequestedDirectory; }
 private:
-    FAssetSaveReview ReviewAssetSaveInternal(const TArray<FString>& Paths, const FString& Remote);
+    FAssetSaveReview ReviewAssetSaveInternal(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths = {});
+    FResult CheckNewAssetPath(const FString& Path, const FSnapshot& Local) const;
     FResult IsLockableAssetInternal(const FString& Path) const;
     FDiscardReview ReviewDiscardInternal(const TArray<FString>& Paths);
     FResult VerifyDiscardResult(const FDiscardReview& Reviewed);
@@ -292,7 +293,7 @@ private:
     FUnlockReview ReviewUnlockInternal(const FLockSnapshot& Current, const FString& Path, const FString& ReviewedHead = FString(), bool bRequirePublished = true);
     FPushHandoffReview ReviewPushHandoffInternal(const FRemoteSnapshot& Reviewed);
     FResult PushInternal(const FRemoteSnapshot& Reviewed);
-    FResult ChangeLockInternal(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead);
+    FResult ChangeLockInternal(const FLockSnapshot& Reviewed, const FString& Path, bool bUnlock, bool bHandoffConfirmed, const FString& ReviewedHead, bool bNewAsset = false);
     FString StashDropRecovery(FString* ReportPath = nullptr) const;
     FStashReview ReviewStashInternal(const FString& Oid, bool bRestoreIndex, bool bSelected = false, const TArray<FString>& Paths = {}, bool bIncludeUntracked = false);
     FResult CaptureUntrackedTree(const TArray<FString>& Paths) const;

@@ -108,9 +108,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200, {'ours': [], 'theirs': [lock('second.uasset', 'me', 'second')]})
             elif mode == 'foreign':
                 # Same display name must never be interpreted as ours.
-                self.reply(200, {'ours': [], 'theirs': [lock('asset.uasset', 'UEGit lock fixture', 'foreign')]})
+                path = (root / 'forced-lock-path').read_text().strip() if (root / 'forced-lock-path').exists() else 'asset.uasset'
+                self.reply(200, {'ours': [], 'theirs': [lock(path, 'UEGit lock fixture', 'foreign')]})
             elif mode == 'otherclone':
-                self.reply(200, {'ours': [lock('asset.uasset', 'UEGit lock fixture', 'otherclone')], 'theirs': []})
+                path = (root / 'forced-lock-path').read_text().strip() if (root / 'forced-lock-path').exists() else 'asset.uasset'
+                self.reply(200, {'ours': [lock(path, 'UEGit lock fixture', 'otherclone')], 'theirs': []})
             else:
                 self.reply(200, {'ours': list(locks.values()), 'theirs': []})
         elif self.path.endswith('/locks'):

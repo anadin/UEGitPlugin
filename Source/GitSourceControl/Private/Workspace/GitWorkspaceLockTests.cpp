@@ -20,6 +20,10 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Blueprint.h"
+#include "Engine/BlueprintGeneratedClass.h"
+#include "GameFramework/Actor.h"
+#include "Kismet2/KismetEditorUtilities.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
 #include <unistd.h>
@@ -169,6 +173,148 @@ bool FGitSaveLockPartialTest::RunTest(const FString&)
     const FString Link = FPaths::Combine(F.Repo, TEXT("linked.uasset"));
     symlink("asset.uasset", TCHAR_TO_UTF8(*Link));
     TestFalse(TEXT("Save cannot follow a symlink"), Repo.ReviewAssetSave({TEXT("linked.uasset")}, TEXT("origin")).IsFresh());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitFirstSaveDestinationTest, "GitWorkspace.SaveLock.FirstSaveDestinations", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitFirstSaveDestinationTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("First-save server started"), F.Endpoint.IsEmpty())) return false;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    const FString Path = TEXT("Content/NewFolder/T_First.uasset"), Full = FPaths::Combine(F.Repo, Path);
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("First-save lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    auto Review = Repo.ReviewAssetSave({Path}, TEXT("origin"), {Path});
+    if (!TestTrue(TEXT("Absent destination reviewed: ") + Review.Error, Review.IsFresh() && Review.NewPaths.Contains(Path) && Review.NeedsLock.Contains(Path))) return false;
+    TestTrue(TEXT("Review identifies first save"), Review.Text().Contains(TEXT("First save")));
+    TestFalse(TEXT("Review creates no placeholder"), IFileManager::Get().FileExists(*Full));
+    TestFalse(TEXT("Review creates no folder"), IFileManager::Get().DirectoryExists(*FPaths::GetPath(Full)));
+    TestFalse(TEXT("Cancellation cannot reserve a new path"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestTrue(TEXT("Cancellation retains empty server lock set"), Repo.VerifyLocks(TEXT("origin")).Locks.IsEmpty());
+    TestFalse(TEXT("Missing paths require explicit first-save intent"), Repo.ReviewAssetSave({Path}, TEXT("origin")).IsFresh());
+    TestFalse(TEXT("Extra first-save paths refused"), Repo.ReviewAssetSave({Path}, TEXT("origin"), {TEXT("extra.uasset")}).IsFresh());
+    FFileHelper::SaveStringToFile(Path, *FPaths::Combine(F.Root, TEXT("forced-lock-path")));
+    for (const TCHAR* Mode : {TEXT("foreign"), TEXT("otherclone"), TEXT("offline"), TEXT("auth")})
+    {
+        F.Mode(Mode);
+        TestFalse(FString(Mode) + TEXT(" refuses new destination"), Repo.ReviewAssetSave({Path}, TEXT("origin"), {Path}).IsFresh());
+        TestFalse(FString(Mode) + TEXT(" invalidates earlier consent"), Repo.PrepareAssetSave(Review, Lease, true).Result.Ok());
+    }
+    F.Mode(TEXT("conflict"));
+    TestFalse(TEXT("New path acquisition race retains unsaved destination"), Repo.PrepareAssetSave(Review, Lease, true).Result.Ok());
+    F.Mode(TEXT(""));
+    TestEqual(TEXT("First-save refusals preserve HEAD"), Repo.Refresh().Head, Before.Head);
+    TestEqual(TEXT("First-save refusals preserve index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("First-save refusals preserve stashes"), Repo.ListStashes().Fingerprint, Stashes);
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Full), true); F.Write(Path, TEXT("external client occupied destination\n"));
+    TestFalse(TEXT("Appearing file invalidates absence review"), Repo.PrepareAssetSave(Review, Lease, true).Result.Ok());
+    TestFalse(TEXT("Occupied path is never treated as new"), Repo.ReviewAssetSave({Path}, TEXT("origin"), {Path}).IsFresh());
+    IFileManager::Get().Delete(*Full);
+    F.Write(TEXT(".gitignore"), TEXT("Content/NewFolder/\n"));
+    TestFalse(TEXT("Ignored future destination refused"), Repo.ReviewAssetSave({Path}, TEXT("origin"), {Path}).IsFresh());
+    F.Write(TEXT(".gitignore"), TEXT(""));
+    F.Call({TEXT("init"), TEXT("-q"), TEXT("Content/Nested")});
+    const FString Nested = TEXT("Content/Nested/T_First.uasset");
+    TestFalse(TEXT("Absent path in nested repository refused"), Repo.ReviewAssetSave({Nested}, TEXT("origin"), {Nested}).IsFresh());
+    const FString Link = FPaths::Combine(F.Repo, TEXT("Content/Link")); symlink(TCHAR_TO_UTF8(*F.Root), TCHAR_TO_UTF8(*Link));
+    const FString Linked = TEXT("Content/Link/T_First.uasset");
+    TestFalse(TEXT("Symlink parent cannot reserve new destination"), Repo.ReviewAssetSave({Linked}, TEXT("origin"), {Linked}).IsFresh());
+    F.Call({TEXT("update-index"), TEXT("--add"), TEXT("--cacheinfo"), TEXT("160000,") + Before.Head + TEXT(",Content/Sub")});
+    const FString Sub = TEXT("Content/Sub/T_First.uasset");
+    TestFalse(TEXT("Absent path below submodule refused"), Repo.ReviewAssetSave({Sub}, TEXT("origin"), {Sub}).IsFresh());
+    F.Call({TEXT("rm"), TEXT("-f"), TEXT("asset.uasset")});
+    TestFalse(TEXT("Staged deletion cannot masquerade as first save"), Repo.ReviewAssetSave({TEXT("asset.uasset")}, TEXT("origin"), {TEXT("asset.uasset")}).IsFresh());
+    TestFalse(TEXT("External actor first-save destination refused"), Repo.ReviewAssetSave({TEXT("Content/__ExternalActors__/A.uasset")}, TEXT("origin"), {TEXT("Content/__ExternalActors__/A.uasset")}).IsFresh());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitFirstSavePartialTest, "GitWorkspace.SaveLock.FirstSavePartialAcquisition", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitFirstSavePartialTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("New batch server started"), F.Endpoint.IsEmpty())) return false;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh();
+    const TArray<FString> Paths {TEXT("Content/A_New.uasset"), TEXT("Content/Z_New.uasset")};
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("New batch lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    auto Review = Repo.ReviewAssetSave(Paths, TEXT("origin"), Paths);
+    if (!TestTrue(TEXT("New batch review: ") + Review.Error, Review.IsFresh())) return false;
+    FFileHelper::SaveStringToFile(Paths[1], *FPaths::Combine(F.Root, TEXT("fail-lock-path")));
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    TestFalse(TEXT("Partial new reservation issues no write permit"), Prepared.Result.Ok() || Prepared.Permit.IsValid());
+    TestTrue(TEXT("Partial new reservation reports held path"), Prepared.AcquiredPaths == TArray<FString>{Paths[0]});
+    TestFalse(TEXT("Partial failure writes no first asset"), IFileManager::Get().FileExists(*FPaths::Combine(F.Repo, Paths[0])));
+    TestFalse(TEXT("Partial failure writes no second asset"), IFileManager::Get().FileExists(*FPaths::Combine(F.Repo, Paths[1])));
+    auto Held = Repo.VerifyLocks(TEXT("origin"));
+    TestTrue(TEXT("Reserved absent path remains visible and owned"), Held.IsFresh() && Held.State(Paths[0], true) == GitWorkspace::ELockState::Ours);
+    IFileManager::Get().Delete(*FPaths::Combine(F.Root, TEXT("fail-lock-path")));
+    Review = Repo.ReviewAssetSave(Paths, TEXT("origin"), Paths);
+    TestTrue(TEXT("Retry only needs remaining reservation"), Review.IsFresh() && Review.NeedsLock == TArray<FString>{Paths[1]});
+    Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    if (!TestTrue(TEXT("Missing-path retry prepares: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    TestTrue(TEXT("Absent destination passes final verification"), Repo.ValidateAssetSave(*Prepared.Permit, Paths[0], Lease).Ok());
+    TestEqual(TEXT("Reservations preserve HEAD"), Repo.Refresh().Head, Before.Head);
+    TestEqual(TEXT("Reservations preserve index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitFirstSavePackageTest, "GitWorkspace.SaveLock.FirstSaveBlueprintAndTexture", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitFirstSavePackageTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("First-write server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Mount = TEXT("/GitFirstSaveFixture") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    const FString Content = FPaths::Combine(F.Repo, TEXT("Content/"));
+    FPackageName::RegisterMountPoint(Mount, Content);
+    TStrongObjectPtr<UTexture2D> Texture(NewObject<UTexture2D>(CreatePackage(*(Mount + TEXT("T_First"))), TEXT("T_First"), RF_Public | RF_Standalone));
+    TStrongObjectPtr<UBlueprint> Blueprint(FKismetEditorUtilities::CreateBlueprint(AActor::StaticClass(), CreatePackage(*(Mount + TEXT("BP_First"))), TEXT("BP_First"), BPTYPE_Normal, UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass()));
+    ON_SCOPE_EXIT
+    {
+        for (UObject* Asset : TArray<UObject*>{Texture.Get(), Blueprint.Get()}) if (Asset)
+        { Asset->GetPackage()->SetDirtyFlag(false); Asset->GetPackage()->SetFlags(RF_Transient); Asset->ClearFlags(RF_Public | RF_Standalone); }
+        FPackageName::UnRegisterMountPoint(Mount, Content);
+    };
+    if (!TestNotNull(TEXT("Real new Blueprint"), Blueprint.Get())) return false;
+    const uint8 Pixel[4] = {0, 255, 0, 255}; Texture->Source.Init(1, 1, 1, 1, TSF_BGRA8, Pixel); Texture->MarkPackageDirty(); Blueprint->MarkPackageDirty();
+    const auto Destinations = GitWorkspaceSave::GatherPackageSavePaths({Blueprint->GetPackage(), Texture->GetPackage()}, F.Repo, Content);
+    if (!TestTrue(TEXT("Actual new package names yield two first-save destinations"), Destinations.Error.IsEmpty() && Destinations.NewPaths.Num() == 2 && Destinations.Paths.Num() == 2)) return false;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh();
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Real first-write lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    const auto Review = Repo.ReviewAssetSave(Destinations.Paths, TEXT("origin"), Destinations.NewPaths);
+    if (!TestTrue(TEXT("Real new package review: ") + Review.Error, Review.IsFresh())) return false;
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    if (!TestTrue(TEXT("First-write permit: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    auto Locks = Repo.VerifyLocks(TEXT("origin"));
+    TestEqual(TEXT("Both new paths reserved before bytes exist"), Locks.Locks.Num(), 2);
+    const FString TexturePath = TEXT("Content/T_First.uasset"), BlueprintPath = TEXT("Content/BP_First.uasset");
+    const FString TextureFile = FPaths::Combine(F.Repo, TexturePath), BlueprintFile = FPaths::Combine(F.Repo, BlueprintPath);
+    TestFalse(TEXT("Preparation makes no texture placeholder"), IFileManager::Get().FileExists(*TextureFile));
+    TestFalse(TEXT("Preparation makes no Blueprint placeholder"), IFileManager::Get().FileExists(*BlueprintFile));
+    GitWorkspaceSave::InstallGuard(); ON_SCOPE_EXIT { GitWorkspaceSave::RemoveGuard(); };
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    {
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *Prepared.Permit, Lease, F.Repo);
+        IFileManager::Get().MakeDirectory(*Content, true); F.Write(TexturePath, TEXT("occupied by external writer\n"));
+        TestFalse(TEXT("Final guard refuses appearing first-save file"), UPackage::SavePackage(Texture->GetPackage(), Texture.Get(), *TextureFile, Args));
+        FString Occupied; FFileHelper::LoadFileToString(Occupied, *TextureFile);
+        TestEqual(TEXT("External file was not overwritten"), Occupied, FString(TEXT("occupied by external writer\n")));
+        TestTrue(TEXT("Failed first write keeps dirty memory"), Texture->GetPackage()->IsDirty());
+        IFileManager::Get().Delete(*TextureFile);
+        TestTrue(TEXT("Native writer first-saves real texture"), UPackage::SavePackage(Texture->GetPackage(), Texture.Get(), *TextureFile, Args));
+        F.Mode(TEXT("offline"));
+        TestFalse(TEXT("Offline final check refuses first Blueprint write"), UPackage::SavePackage(Blueprint->GetPackage(), Blueprint.Get(), *BlueprintFile, Args));
+        TestFalse(TEXT("Offline refusal writes no Blueprint file"), IFileManager::Get().FileExists(*BlueprintFile));
+        TestTrue(TEXT("Offline refusal keeps new Blueprint dirty"), Blueprint->GetPackage()->IsDirty());
+        F.Mode(TEXT(""));
+        TestTrue(TEXT("Native writer first-saves real Blueprint"), UPackage::SavePackage(Blueprint->GetPackage(), Blueprint.Get(), *BlueprintFile, Args));
+        TestFalse(TEXT("First-save permit cannot authorize Save As destination"), FCoreUObjectDelegates::IsPackageOKToSaveDelegate.Execute(Texture->GetPackage(), FPaths::Combine(Content, TEXT("T_Unreviewed.uasset")), nullptr));
+    }
+    UPackage::WaitForAsyncFileWrites();
+    TestTrue(TEXT("Saved texture contains bytes"), IFileManager::Get().FileSize(*TextureFile) > 0);
+    TestTrue(TEXT("Saved Blueprint contains bytes"), IFileManager::Get().FileSize(*BlueprintFile) > 0);
+    TestEqual(TEXT("First save never stages"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("First save never commits"), Repo.Refresh().Head, Before.Head);
+    const auto AfterLocks = Repo.VerifyLocks(TEXT("origin"));
+    for (const auto& Path : Destinations.Paths)
+        TestTrue(TEXT("Exact new lock retained: ") + Path, AfterLocks.IsFresh() && AfterLocks.Locks.Contains(Path) && AfterLocks.Locks[Path].Id == Locks.Locks[Path].Id);
+    auto Subsequent = Repo.ReviewAssetSave(Destinations.Paths, TEXT("origin"));
+    TestTrue(TEXT("Next save uses owned existing assets without acquisition"), Subsequent.IsFresh() && Subsequent.NewPaths.IsEmpty() && Subsequent.NeedsLock.IsEmpty());
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveLockPackageTest, "GitWorkspace.SaveLock.RealPackageWriteGuard", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
