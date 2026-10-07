@@ -33,6 +33,7 @@ struct FAssetCopyDestination
 };
 bool SupportsAssetCopy(const UObject* Source);
 UObject* GetCopySource(const FAssetEditorToolkit& Editor);
+UObject* GetCopyData(FAssetEditorToolkit& Editor);
 // Material editors hold unapplied graph edits in a separate transient preview.
 FString ReviewCopyData(UObject* Source, UObject* EditedData);
 FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& PackageName, const FString& Root, const FString& Content);

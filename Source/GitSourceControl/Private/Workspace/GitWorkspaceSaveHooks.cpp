@@ -29,6 +29,13 @@ UObject* GetCopySource(const FAssetEditorToolkit& Editor)
             { if (Source && Source != Object) return nullptr; Source = Object; }
     return Source;
 }
+UObject* GetCopyData(FAssetEditorToolkit& Editor)
+{
+    if (Editor.GetToolkitFName() == FName(TEXT("MaterialEditor"))) return static_cast<IMaterialEditor&>(Editor).GetMaterialInterface();
+    // Instances edit their source directly; function-instance proxies are
+    // excluded by SupportsAssetCopy. Never substitute their preview instance.
+    return GetCopySource(Editor);
+}
 namespace
 {
 FTSTicker::FDelegateHandle TickHandle;
@@ -62,20 +69,17 @@ bool UpdateHooks(float)
                 return Packages;
             });
             const bool bMaterialEditor = Editor->GetToolkitFName() == FName(TEXT("MaterialEditor"));
+            const bool bMaterialInstanceEditor = Editor->GetToolkitFName() == FName(TEXT("MaterialInstanceEditor"));
             // Material copies read the live preview without applying it to the
             // original. Ordinary Save retains the editor's apply/compile action.
-            if (bMaterialEditor || Editor->GetToolkitFName() == FName(TEXT("BlueprintEditor")) || Editor->GetToolkitFName() == FName(TEXT("TextureEditor")))
+            if (bMaterialEditor || bMaterialInstanceEditor || Editor->GetToolkitFName() == FName(TEXT("BlueprintEditor")) || Editor->GetToolkitFName() == FName(TEXT("TextureEditor")))
                 WrapSaveAsCommand(Editor->GetToolkitCommands(), FInputBindingManager::Get().FindCommandInContext(TEXT("AssetEditor"), TEXT("SaveAssetAs")), [Weak]() -> UObject*
                 {
                     if (auto Live = Weak.Pin()) return GetCopySource(*Live);
                     return nullptr;
-                }, [Weak, bMaterialEditor]() -> UObject*
+                }, [Weak]() -> UObject*
                 {
-                    if (auto Live = Weak.Pin())
-                    {
-                        if (bMaterialEditor) return StaticCastSharedPtr<IMaterialEditor>(Live)->GetMaterialInterface();
-                        return GetCopySource(*Live);
-                    }
+                    if (auto Live = Weak.Pin()) return GetCopyData(*Live);
                     return nullptr;
                 });
         }

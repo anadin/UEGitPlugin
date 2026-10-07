@@ -151,7 +151,7 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
             const FString Path = Relative(File, ProjectRepositoryRoot);
             Result = Async(EAsyncExecution::ThreadPool, [Repo, Path] { return Repo->IsLockableAsset(Path); }).Get();
             if (Result.Code == 1) return true;
-            if (Result.Ok()) Result.Error = TEXT("Use Save, Save All or Git Workspace Save assets to prepare this exact asset destination. Standard Blueprint, Texture2D and Material editors also support reviewed Save As copies. Other naming/custom routes require separate integration; Make Writable cannot grant lock ownership.");
+            if (Result.Ok()) Result.Error = TEXT("Use Save, Save All or Git Workspace Save assets to prepare this exact asset destination. Standard Blueprint, Texture2D, Material, Material Instance and Material Function editors also support reviewed Save As copies. Other naming/custom routes require separate integration; Make Writable cannot grant lock ownership.");
         }
     }
     if (!Result.Error.IsEmpty() || !Result.Ok())

@@ -27,6 +27,15 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialFunction.h"
+#include "Materials/MaterialInstanceConstant.h"
+#include "Materials/MaterialFunctionInstance.h"
+#include "Materials/MaterialFunctionMaterialLayer.h"
+#include "Materials/MaterialExpressionScalarParameter.h"
+#include "Materials/MaterialExpressionFunctionOutput.h"
+#include "Materials/MaterialExpressionComment.h"
+#include "MaterialGraph/MaterialGraphNode.h"
+#include "MaterialEditor/MaterialEditorInstanceConstant.h"
+#include "MaterialEditor/DEditorScalarParameterValue.h"
 #include "MaterialGraph/MaterialGraph.h"
 #include "MaterialEditorModule.h"
 #include "IMaterialEditor.h"
@@ -519,6 +528,200 @@ bool FGitMaterialCopyTest::RunTest(const FString&)
     TestEqual(TEXT("Regular Save still preserves staged snapshot"), Repo.Refresh().IndexEntries, Before.IndexEntries);
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMaterialInstanceCopyTest, "GitWorkspace.SaveLock.SaveAsMaterialInstance", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitMaterialInstanceCopyTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Instance copy server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Mount = TEXT("/GitInstanceCopy") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    const FString Content = FPaths::Combine(F.Repo, TEXT("Content/")); IFileManager::Get().MakeDirectory(*Content, true); FPackageName::RegisterMountPoint(Mount, Content);
+    TStrongObjectPtr<UMaterial> Parent(NewObject<UMaterial>(CreatePackage(*(Mount + TEXT("M_Parent"))), TEXT("M_Parent"), RF_Public | RF_Standalone));
+    auto* Scalar = CastChecked<UMaterialExpressionScalarParameter>(UMaterialEditingLibrary::CreateMaterialExpression(Parent.Get(), UMaterialExpressionScalarParameter::StaticClass()));
+    Scalar->ParameterName = TEXT("Roughness"); Scalar->DefaultValue = 0.25f; Parent->GetEditorOnlyData()->Roughness.Connect(0, Scalar);
+    UMaterialEditingLibrary::RecompileMaterial(Parent.Get());
+    TStrongObjectPtr<UMaterialInstanceConstant> Source(NewObject<UMaterialInstanceConstant>(CreatePackage(*(Mount + TEXT("MI_Original"))), TEXT("MI_Original"), RF_Public | RF_Standalone));
+    Source->SetParentEditorOnly(Parent.Get()); Source->SetScalarParameterValueEditorOnly(FMaterialParameterInfo(TEXT("Roughness")), 0.25f);
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    const FString SourceFile = FPaths::Combine(Content, TEXT("MI_Original.uasset"));
+    if (!TestTrue(TEXT("Save instance parent"), UPackage::SavePackage(Parent->GetPackage(), Parent.Get(), *FPaths::Combine(Content, TEXT("M_Parent.uasset")), Args)) ||
+        !TestTrue(TEXT("Save original instance"), UPackage::SavePackage(Source->GetPackage(), Source.Get(), *SourceFile, Args))) return false;
+    F.Call({TEXT("add"), TEXT("Content")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("instance source")});
+    TArray<uint8> SourceBytes; FFileHelper::LoadFileToArray(SourceBytes, *SourceFile);
+    auto Editor = IMaterialEditorModule::Get().CreateMaterialInstanceEditor(EToolkitMode::Standalone, nullptr, Source.Get());
+    TArray<UObject*> Copies;
+    ON_SCOPE_EXIT
+    {
+        GitWorkspaceSave::RemoveGuard(); Editor->CloseWindow(EAssetEditorCloseReason::AssetForceDeleted);
+        TArray<UObject*> Objects = Copies; Objects.Add(Source.Get()); Objects.Add(Parent.Get());
+        for (UObject* Object : Objects) if (Object) { Object->GetPackage()->SetDirtyFlag(false); Object->GetPackage()->SetFlags(RF_Transient); Object->ClearFlags(RF_Public | RF_Standalone); }
+        FPackageName::UnRegisterMountPoint(Mount, Content);
+    };
+    TestTrue(TEXT("Instance editor source selection"), GitWorkspaceSave::GetCopySource(*Editor) == Source.Get());
+    TestTrue(TEXT("Instance copy uses source, not rendering preview"), GitWorkspaceSave::GetCopyData(*Editor) == Source.Get());
+    UMaterialEditorInstanceConstant* Helper = nullptr;
+    for (UObject* Object : *Editor->GetObjectsCurrentlyBeingEdited()) if (auto* Candidate = Cast<UMaterialEditorInstanceConstant>(Object)) Helper = Candidate;
+    if (!TestNotNull(TEXT("Real instance editor helper"), Helper)) return false;
+    UDEditorScalarParameterValue* Parameter = nullptr;
+    for (const auto& Group : Helper->ParameterGroups) for (UDEditorParameterValue* Value : Group.Parameters)
+        if (auto* Candidate = Cast<UDEditorScalarParameterValue>(Value); Candidate && Candidate->ParameterInfo.Name == TEXT("Roughness")) Parameter = Candidate;
+    if (!TestNotNull(TEXT("Editable scalar override"), Parameter)) return false;
+    Parameter->bOverride = true; Parameter->ParameterValue = 0.75f;
+    Helper->BasePropertyOverrides.bOverride_TwoSided = true; Helper->BasePropertyOverrides.TwoSided = true;
+    FPropertyChangedEvent Changed(nullptr); Helper->PostEditChangeProperty(Changed);
+    TestTrue(TEXT("Live instance edit dirties source"), Source->GetPackage()->IsDirty());
+    TestTrue(TEXT("Live parameter edit updates source"), Source->ScalarParameterValues.ContainsByPredicate([](const FScalarParameterValue& Value) { return Value.ParameterInfo.Name == TEXT("Roughness") && Value.ParameterValue == 0.75f; }));
+    FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*SourceFile, true);
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Instance copy lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    const auto Destination = GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Mount + TEXT("MI_Copy"), F.Repo, Content);
+    const auto Review = Repo.ReviewAssetSave({Destination.Path}, TEXT("origin"), {Destination.Path});
+    TestFalse(TEXT("Instance cancellation does not reserve"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestNull(TEXT("Instance cancellation creates no copy"), FindPackage(nullptr, *Destination.PackageName));
+    const auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    if (!TestTrue(TEXT("Instance destination reserved"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const FString LockId = Repo.VerifyLocks(TEXT("origin")).Locks[Destination.Path].Id;
+    GitWorkspaceSave::InstallGuard(); UObject* Object = nullptr;
+    const auto Written = GitWorkspaceSave::WriteAssetCopy(Source.Get(), Destination, Repo, *Prepared.Permit, Lease, Content, Object, GitWorkspaceSave::GetCopyData(*Editor));
+    if (Object) Copies.Add(Object);
+    if (!TestTrue(TEXT("Instance copy written: ") + Written.Error, Written.Ok() && Object)) return false;
+    auto* Copy = CastChecked<UMaterialInstanceConstant>(Object);
+    TestTrue(TEXT("Copy retains external material parent"), Copy->Parent == Parent.Get());
+    TestTrue(TEXT("Copy retains edited scalar override"), Copy->ScalarParameterValues.ContainsByPredicate([](const FScalarParameterValue& Value) { return Value.ParameterInfo.Name == TEXT("Roughness") && Value.ParameterValue == 0.75f; }));
+    TestTrue(TEXT("Copy retains Two Sided override"), Copy->BasePropertyOverrides.bOverride_TwoSided && Copy->BasePropertyOverrides.TwoSided);
+    TestTrue(TEXT("Source editor stays open with dirty edits"), GitWorkspaceSave::GetCopySource(*Editor) == Source.Get() && Source->GetPackage()->IsDirty());
+    TestFalse(TEXT("Copy saved clean"), Copy->GetPackage()->IsDirty());
+    TArray<uint8> After; FFileHelper::LoadFileToArray(After, *SourceFile); TestEqual(TEXT("Instance original saved bytes retained"), After, SourceBytes);
+    TestTrue(TEXT("Instance original remains read only"), IFileManager::Get().IsReadOnly(*SourceFile));
+    const auto Locks = Repo.VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("No instance source lock acquired"), Locks.Locks.Contains(TEXT("Content/MI_Original.uasset")));
+    TestTrue(TEXT("Exact instance destination lock retained"), Locks.Locks.Contains(Destination.Path) && Locks.Locks[Destination.Path].Id == LockId);
+    const auto Final = Repo.Refresh();
+    TestTrue(TEXT("Instance copy untracked"), Final.Files.ContainsByPredicate([&](const GitWorkspace::FFile& File) { return File.Path == Destination.Path && File.bUntracked; }));
+    TestEqual(TEXT("Instance copy preserves index"), Final.IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("Instance copy preserves HEAD"), Final.Head, Before.Head);
+    TestEqual(TEXT("Instance copy preserves stashes"), Repo.ListStashes().Fingerprint, Stashes);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMaterialFunctionCopyTest, "GitWorkspace.SaveLock.SaveAsMaterialFunctionPreview", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitMaterialFunctionCopyTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Function copy server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Mount = TEXT("/GitFunctionCopy") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    const FString Content = FPaths::Combine(F.Repo, TEXT("Content/")); IFileManager::Get().MakeDirectory(*Content, true); FPackageName::RegisterMountPoint(Mount, Content);
+    TStrongObjectPtr<UMaterialFunction> Source(NewObject<UMaterialFunction>(CreatePackage(*(Mount + TEXT("MF_Original"))), TEXT("MF_Original"), RF_Public | RF_Standalone));
+    Source->Description = TEXT("saved red function"); Source->bExposeToLibrary = false;
+    auto* SavedColor = CastChecked<UMaterialExpressionConstant3Vector>(UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Source.Get(), UMaterialExpressionConstant3Vector::StaticClass()));
+    SavedColor->Constant = FLinearColor::Red;
+    auto* SavedOutput = CastChecked<UMaterialExpressionFunctionOutput>(UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Source.Get(), UMaterialExpressionFunctionOutput::StaticClass()));
+    SavedOutput->OutputName = TEXT("Color"); SavedOutput->A.Connect(0, SavedColor);
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    const FString SourcePath = TEXT("Content/MF_Original.uasset"), SourceFile = FPaths::Combine(F.Repo, SourcePath);
+    if (!TestTrue(TEXT("Save red function source"), UPackage::SavePackage(Source->GetPackage(), Source.Get(), *SourceFile, Args))) return false;
+    F.Call({TEXT("add"), TEXT("Content")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("red function source")});
+    TArray<uint8> SourceBytes; FFileHelper::LoadFileToArray(SourceBytes, *SourceFile);
+    auto Editor = IMaterialEditorModule::Get().CreateMaterialEditor(EToolkitMode::Standalone, nullptr, Source.Get());
+    TArray<UObject*> Copies;
+    ON_SCOPE_EXIT
+    {
+        GitWorkspaceSave::RemoveGuard(); Editor->CloseWindow(EAssetEditorCloseReason::AssetForceDeleted);
+        TArray<UObject*> Objects = Copies; Objects.Add(Source.Get());
+        for (UObject* Object : Objects) if (Object) { Object->GetPackage()->SetDirtyFlag(false); Object->GetPackage()->SetFlags(RF_Transient); Object->ClearFlags(RF_Public | RF_Standalone); }
+        FPackageName::UnRegisterMountPoint(Mount, Content);
+    };
+    auto* Preview = CastChecked<UMaterial>(Editor->GetMaterialInterface());
+    auto* FunctionPreview = Preview->MaterialGraph->MaterialFunction.Get();
+    TestTrue(TEXT("Function original selected despite preview/helper"), GitWorkspaceSave::GetCopySource(*Editor) == Source.Get());
+    TestTrue(TEXT("Function data adapter returns material wrapper"), GitWorkspaceSave::GetCopyData(*Editor) == Preview);
+    if (!TestTrue(TEXT("Preview function belongs to original"), FunctionPreview && FunctionPreview->ParentFunction == Source.Get())) return false;
+    UMaterialExpressionFunctionOutput* Output = nullptr; UMaterialExpressionConstant3Vector* OldColor = nullptr;
+    for (UMaterialExpression* Expression : Preview->GetExpressions())
+    { if (auto* Found = Cast<UMaterialExpressionFunctionOutput>(Expression)) Output = Found; if (auto* Found = Cast<UMaterialExpressionConstant3Vector>(Expression)) OldColor = Found; }
+    if (!TestNotNull(TEXT("Function preview output"), Output) || !TestNotNull(TEXT("Function preview color"), OldColor)) return false;
+    // Exercise added/deleted nodes and new links, not just a value on an old node.
+    auto* NewColor = CastChecked<UMaterialExpressionConstant3Vector>(Editor->CreateNewMaterialExpression(UMaterialExpressionConstant3Vector::StaticClass(), FVector2D(-300, 0), false, false));
+    NewColor->Constant = FLinearColor::Green; Output->A.Connect(0, NewColor);
+    Preview->MaterialGraph->LinkGraphNodesFromMaterial();
+    Editor->DeleteNodes({OldColor->GraphNode});
+    auto* Comment = Editor->CreateNewMaterialExpressionComment(FVector2D(-400, -100)); Comment->GraphNode->NodeComment = TEXT("Copied green function note");
+    FunctionPreview->Description = TEXT("unapplied green function"); FunctionPreview->bExposeToLibrary = true;
+    Preview->MaterialGraph->LinkGraphNodesFromMaterial(); Editor->UpdateMaterialAfterGraphChange();
+    const auto Apply = FInputBindingManager::Get().FindCommandInContext(TEXT("MaterialEditor"), TEXT("Apply"));
+    const auto* ApplyAction = Editor->GetToolkitCommands()->GetActionForCommand(Apply);
+    if (!TestTrue(TEXT("Function preview has unapplied edits"), ApplyAction && ApplyAction->CanExecuteAction.Execute())) return false;
+    TestTrue(TEXT("Real function preview passes boundary"), GitWorkspaceSave::ReviewCopyData(Source.Get(), Preview).IsEmpty());
+    const auto Save = FInputBindingManager::Get().FindCommandInContext(TEXT("AssetEditor"), TEXT("SaveAsset"));
+    const FUIAction OriginalSave = *Editor->GetToolkitCommands()->GetActionForCommand(Save);
+    FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*SourceFile, true);
+    const bool Dirty = Source->GetPackage()->IsDirty(); const FString Name = Source->GetPathName(); const FGuid SourceState = Source->StateId;
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Function copy lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    const auto Destination = GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Mount + TEXT("MF_Copy"), F.Repo, Content);
+    const auto Review = Repo.ReviewAssetSave({Destination.Path}, TEXT("origin"), {Destination.Path});
+    TestFalse(TEXT("Cancel does not reserve function destination"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestNull(TEXT("Cancel creates no function package"), FindPackage(nullptr, *Destination.PackageName));
+    TestTrue(TEXT("Cancel retains function Apply state"), ApplyAction->CanExecuteAction.Execute());
+    const auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    if (!TestTrue(TEXT("Function destination reserved"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const FString LockId = Repo.VerifyLocks(TEXT("origin")).Locks[Destination.Path].Id;
+    // Stale/replaced preview association refuses before duplication, even with a permit.
+    FunctionPreview->ParentFunction = nullptr;
+    GitWorkspaceSave::InstallGuard(); UObject* Object = nullptr;
+    TestFalse(TEXT("Wrong function preview refuses before copy"), GitWorkspaceSave::WriteAssetCopy(Source.Get(), Destination, Repo, *Prepared.Permit, Lease, Content, Object, Preview).Ok());
+    TestNull(TEXT("Refused function creates no copy object"), Object); TestNull(TEXT("Refused function creates no package"), FindPackage(nullptr, *Destination.PackageName));
+    FunctionPreview->ParentFunction = Source.Get();
+    const auto Written = GitWorkspaceSave::WriteAssetCopy(Source.Get(), Destination, Repo, *Prepared.Permit, Lease, Content, Object, Preview);
+    if (Object) Copies.Add(Object);
+    if (!TestTrue(TEXT("Function copy written: ") + Written.Error, Written.Ok() && Object)) return false;
+    auto* Copy = CastChecked<UMaterialFunction>(Object);
+    UMaterialExpressionFunctionOutput* CopyOutput = nullptr;
+    for (UMaterialExpression* Expression : Copy->GetExpressions())
+    {
+        TestTrue(TEXT("Copied function expressions owned independently"), Expression->GetOutermost() == Copy->GetOutermost() && Expression->Function == Copy && !Expression->Material && !Expression->GraphNode);
+        if (auto* Found = Cast<UMaterialExpressionFunctionOutput>(Expression)) CopyOutput = Found;
+    }
+    if (!TestNotNull(TEXT("Copied function output"), CopyOutput)) return false;
+    auto* CopyColor = Cast<UMaterialExpressionConstant3Vector>(CopyOutput->A.Expression);
+    if (!TestNotNull(TEXT("Copied output retains new node link"), CopyColor)) return false;
+    TestEqual(TEXT("Function graph comment retained"), Copy->GetEditorComments().Num(), 1);
+    if (Copy->GetEditorComments().Num() == 1)
+    {
+        auto* CopyComment = Copy->GetEditorComments()[0].Get();
+        TestTrue(TEXT("Function comment copied with independent ownership"), CopyComment->GetOutermost() == Copy->GetOutermost() && CopyComment->Function == Copy && !CopyComment->Material && !CopyComment->GraphNode);
+        TestEqual(TEXT("Function graph comment text retained"), CopyComment->Text, FString(TEXT("Copied green function note")));
+    }
+    TestEqual(TEXT("Function copy uses added green node"), CopyColor->Constant, FLinearColor::Green);
+    TestTrue(TEXT("New function node is copied independently"), CopyColor != NewColor && Copy->GetExpressions().Num() == 2);
+    TestEqual(TEXT("Copy retains edited function description"), Copy->Description, FString(TEXT("unapplied green function")));
+    TestTrue(TEXT("Copy retains library exposure"), Copy->bExposeToLibrary);
+    TestTrue(TEXT("Function copy has no preview/editor state"), !Copy->ParentFunction && !Copy->PreviewMaterial && !Copy->EditorMaterial && !Copy->MaterialGraph);
+    TestTrue(TEXT("Copied function has independent state identity"), Copy->StateId != SourceState);
+    TestFalse(TEXT("Function copy saved clean"), Copy->GetPackage()->IsDirty());
+    TestTrue(TEXT("Function editor keeps unapplied preview"), Editor->GetMaterialInterface() == Preview && ApplyAction->CanExecuteAction.Execute());
+    TestEqual(TEXT("Original function stays red"), SavedColor->Constant, FLinearColor::Red);
+    TestTrue(TEXT("Original function metadata unchanged"), Source->Description == TEXT("saved red function") && !Source->bExposeToLibrary && Source->StateId == SourceState);
+    TestEqual(TEXT("Original function dirty state retained"), Source->GetPackage()->IsDirty(), Dirty); TestEqual(TEXT("Original function name retained"), Source->GetPathName(), Name);
+    TArray<uint8> After; FFileHelper::LoadFileToArray(After, *SourceFile); TestEqual(TEXT("Original function saved bytes retained"), After, SourceBytes);
+    TestTrue(TEXT("Original function remains read only"), IFileManager::Get().IsReadOnly(*SourceFile));
+    const auto Locks = Repo.VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Save As acquires no source function lock"), Locks.Locks.Contains(SourcePath));
+    TestTrue(TEXT("Exact function destination reservation retained"), Locks.Locks.Contains(Destination.Path) && Locks.Locks[Destination.Path].Id == LockId);
+    const auto Final = Repo.Refresh();
+    TestTrue(TEXT("Function copy untracked"), Final.Files.ContainsByPredicate([&](const GitWorkspace::FFile& File) { return File.Path == Destination.Path && File.bUntracked; }));
+    TestEqual(TEXT("Function copy preserves index"), Final.IndexEntries, Before.IndexEntries); TestEqual(TEXT("Function copy preserves HEAD"), Final.Head, Before.Head); TestEqual(TEXT("Function copy preserves stashes"), Repo.ListStashes().Fingerprint, Stashes);
+    const auto SavePrepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave({SourcePath}, TEXT("origin")), Lease, true);
+    if (!TestTrue(TEXT("Prepare ordinary function Save"), SavePrepared.Result.Ok() && SavePrepared.Permit)) return false;
+    Source.Reset();
+    {
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *SavePrepared.Permit, Lease, F.Repo); TGuardValue<bool> ScriptMode(GIsRunningUnattendedScript, true); OriginalSave.ExecuteAction.Execute();
+    }
+    Source.Reset(CastChecked<UMaterialFunction>(GitWorkspaceSave::GetCopySource(*Editor)));
+    TestFalse(TEXT("Regular function Save clears Apply state"), ApplyAction->CanExecuteAction.Execute());
+    TestTrue(TEXT("Regular function Save applies metadata and graph"), Source->Description == TEXT("unapplied green function") && Source->bExposeToLibrary && Source->GetExpressions().Num() == 2);
+    TestFalse(TEXT("Regular function Save writes clean source"), Source->GetPackage()->IsDirty());
+    FFileHelper::LoadFileToArray(After, *SourceFile); TestTrue(TEXT("Regular function Save writes changed bytes"), After != SourceBytes);
+    TestEqual(TEXT("Regular function Save preserves staging"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMaterialCopyDataTest, "GitWorkspace.SaveLock.MaterialCopyDataBoundaries", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitMaterialCopyDataTest::RunTest(const FString&)
 {
@@ -529,7 +732,17 @@ bool FGitMaterialCopyDataTest::RunTest(const FString&)
     TestTrue(TEXT("Direct source copies retain existing behavior"), GitWorkspaceSave::ReviewCopyData(Source.Get(), Source.Get()).IsEmpty());
     TestFalse(TEXT("Unavailable material preview fails closed"), GitWorkspaceSave::ReviewCopyData(Source.Get(), nullptr).IsEmpty());
     TestFalse(TEXT("Unrelated normal material cannot supply preview edits"), GitWorkspaceSave::ReviewCopyData(Source.Get(), Other.Get()).IsEmpty());
-    TestFalse(TEXT("Material functions need a separate adapter"), GitWorkspaceSave::SupportsAssetCopy(Function.Get()));
+    TestTrue(TEXT("Ordinary functions supported"), GitWorkspaceSave::SupportsAssetCopy(Function.Get()));
+    TestFalse(TEXT("Material data cannot substitute a function preview"), GitWorkspaceSave::ReviewCopyData(Function.Get(), Other.Get()).IsEmpty());
+    TStrongObjectPtr<UMaterialInstanceConstant> Instance(NewObject<UMaterialInstanceConstant>(GetTransientPackage()));
+    TStrongObjectPtr<UMaterialInstanceConstant> OtherInstance(NewObject<UMaterialInstanceConstant>(GetTransientPackage()));
+    TestTrue(TEXT("Ordinary instance supported"), GitWorkspaceSave::SupportsAssetCopy(Instance.Get()));
+    TestTrue(TEXT("Instance requires its actual source"), GitWorkspaceSave::ReviewCopyData(Instance.Get(), Instance.Get()).IsEmpty());
+    TestFalse(TEXT("Instance preview proxy cannot replace source"), GitWorkspaceSave::ReviewCopyData(Instance.Get(), OtherInstance.Get()).IsEmpty());
+    TStrongObjectPtr<UMaterialFunctionInstance> FunctionInstance(NewObject<UMaterialFunctionInstance>(GetTransientPackage()));
+    TStrongObjectPtr<UMaterialFunctionMaterialLayer> Layer(NewObject<UMaterialFunctionMaterialLayer>(GetTransientPackage()));
+    TestFalse(TEXT("Function instances still require separate integration"), GitWorkspaceSave::SupportsAssetCopy(FunctionInstance.Get()));
+    TestFalse(TEXT("Layer subclasses still require separate integration"), GitWorkspaceSave::SupportsAssetCopy(Layer.Get()));
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveAsRefusalTest, "GitWorkspace.SaveLock.SaveAsCancellationAndRefusal", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

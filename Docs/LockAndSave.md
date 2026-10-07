@@ -23,15 +23,19 @@ Create and name the asset in game Content, then use one of the supported **Save*
 
 If acquisition succeeds for some files but fails for another, no save permit is issued. The acquired locks remain held and are named in the failure report. Verify locks and retry; the next review lists only the remaining acquisitions. A native multi-package save can still fail partway through; it is not an atomic save transaction, and locks remain held.
 
-### Save As a Blueprint, texture or material copy
+### Save As an asset copy
 
-In the standard Blueprint, Texture2D or Material editor, use **File > Save As**. **Save asset copy as** chooses a new name under game Content. The destination must be absent on disk and in memory. Then **Lock assets before saving** reviews its exact path; **Lock and save** reserves it before creating the copy or writing a file. Cancel either dialog to leave the original untouched, without creating a copy or acquiring a lock.
+In the standard Blueprint, Texture2D, Material, Material Instance or Material Function editor, use **File > Save As**. **Save asset copy as** chooses a new name under game Content. The destination must be absent on disk and in memory. Then **Lock assets before saving** reviews its exact path; **Lock and save** reserves it before creating the copy or writing a file. Cancel either dialog to leave the original untouched, without creating a copy or acquiring a lock.
 
 The copy includes the current edited asset data using Unreal's normal duplication rules (Blueprint Description/Display Name are DuplicateTransient and reset on the copy). Its file is untracked and its lock remains held. The original editor stays open with its unsaved edits; its saved file, staging and existing lock are preserved. Save As does not rename the original, overwrite another asset, save the original, or release its lock. If the copy writer fails after duplication, the unsaved copy stays in memory with its destination lock held; open that copy and use **Save** to retry. An abandoned copy/reservation still needs separate recovery or handoff handling.
 
 Materials copy the current editor preview, including unapplied graph and property edits, into an ordinary Material asset. Save As does not press Apply or change the original material's use in the world; its original editor retains the preview and Apply state. The copy's expressions belong to the new material, and editor-only preview state is not published. Known preview shader errors refuse the copy; errors found while compiling the new copy retain it in memory with its lock for repair and ordinary Save. Regular Material **Save** retains Unreal's original apply/compile/save action.
 
-These adapters preserve command enable/visibility/check delegates and restore the original action on shutdown. Material functions, material instances, other asset classes, multi-asset editors and map naming flows require separate integration. Other providers and non-Git projects keep the inherited Save As behavior.
+Material Instance copies retain the current source's scalar/vector/texture/static overrides, base-property overrides and parent reference. Unreal applies ordinary instance edits directly to that source in memory; its pending edits remain dirty and its saved bytes are not changed by Save As. The rendering preview is not substituted for the source.
+
+Ordinary Material Functions copy their unapplied graph and metadata from the standard Material editor's transient function preview. Graph additions, deletions and links synchronize after lock consent. The new function owns its expressions, preserves the edited library-exposure flag and has an independent state identity. Save As retains the original function's saved data and editor Apply state. Regular function Save still runs Unreal's Apply and save action. Known wrapper-preview shader errors refuse the copy; this adapter does not certify every caller or shader configuration.
+
+These adapters preserve command enable/visibility/check delegates and restore the original action on shutdown. Material Function Instances, Material Layers/Layer Blends, other asset classes, multi-asset editors and map naming flows require separate integration. Exact ordinary asset classes are accepted; derived/custom classes are not. Other providers and non-Git projects keep the inherited Save As behavior.
 
 ## Current scope
 

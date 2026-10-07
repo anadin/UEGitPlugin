@@ -4,6 +4,8 @@
 #include "Engine/Blueprint.h"
 #include "Engine/Texture2D.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInstanceConstant.h"
+#include "Materials/MaterialFunction.h"
 #include "Materials/MaterialExpression.h"
 #include "Materials/MaterialExpressionComment.h"
 #include "MaterialEditor/PreviewMaterial.h"
@@ -23,24 +25,28 @@
 namespace GitWorkspaceSave
 {
 bool SupportsAssetCopy(const UObject* Source)
-{ return Source && (Source->GetClass() == UBlueprint::StaticClass() || Source->GetClass() == UTexture2D::StaticClass() || Source->GetClass() == UMaterial::StaticClass()); }
+{ return Source && (Source->GetClass() == UBlueprint::StaticClass() || Source->GetClass() == UTexture2D::StaticClass() || Source->GetClass() == UMaterial::StaticClass() || Source->GetClass() == UMaterialInstanceConstant::StaticClass() || Source->GetClass() == UMaterialFunction::StaticClass()); }
 FString ReviewCopyData(UObject* Source, UObject* EditedData)
 {
     if (!SupportsAssetCopy(Source) || !EditedData)
-        return TEXT("Guarded Save As requires one ordinary Blueprint, Texture2D or Material in its standard asset editor.");
+        return TEXT("Guarded Save As requires one ordinary Blueprint, Texture2D, Material, Material Instance or Material Function in its standard asset editor.");
     if (Source == EditedData) return FString();
     const auto* Preview = Cast<UMaterial>(EditedData);
-    if (Source->GetClass() != UMaterial::StaticClass() || EditedData->GetClass() != UPreviewMaterial::StaticClass() ||
-        EditedData->GetOutermost() != GetTransientPackage() || !Preview->bIsPreviewMaterial || !Preview->MaterialGraph || Preview->MaterialGraph->Material != Preview)
-        return TEXT("The material editor's current preview is unavailable. Reopen the standard material editor before Save As.");
-    return FString();
+    if (Preview && EditedData->GetOutermost() == GetTransientPackage() && Preview->bIsPreviewMaterial && Preview->MaterialGraph && Preview->MaterialGraph->Material == Preview)
+    {
+        const auto* Function = Preview->MaterialGraph->MaterialFunction.Get();
+        if (Source->GetClass() == UMaterial::StaticClass() && EditedData->GetClass() == UPreviewMaterial::StaticClass() && !Function) return FString();
+        if (Source->GetClass() == UMaterialFunction::StaticClass() && EditedData->GetClass() == UMaterial::StaticClass() && Function &&
+            Function->GetClass() == UMaterialFunction::StaticClass() && Function->GetOutermost() == GetTransientPackage() && Function->ParentFunction == Source) return FString();
+    }
+    return TEXT("The asset editor's current copy data is unavailable or belongs to another asset. Reopen its standard editor before Save As.");
 }
 FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& PackageName, const FString& Root, const FString& Content)
 {
     check(IsInGameThread());
     FAssetCopyDestination Out;
     if (!SupportsAssetCopy(Source))
-    { Out.Error = TEXT("Guarded Save As currently supports one ordinary Blueprint, Texture2D or Material in its standard asset editor."); return Out; }
+    { Out.Error = TEXT("Guarded Save As currently supports one ordinary Blueprint, Texture2D, Material, Material Instance or Material Function in its standard asset editor."); return Out; }
     if (!FPackageName::IsValidLongPackageName(PackageName, false) || PackageName == Source->GetOutermost()->GetName() ||
         !FPackageName::TryConvertLongPackageNameToFilename(PackageName, Out.Filename, FPackageName::GetAssetPackageExtension()))
     { Out.Error = TEXT("Choose a new valid asset name in game Content. Save As does not overwrite or rename the source."); return Out; }
@@ -86,6 +92,7 @@ GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestinatio
     if (!Ready.Ok()) return Ready;
     TStrongObjectPtr<UObject> Original(Source);
     TStrongObjectPtr<UObject> Data(EditedData);
+    UObject* DuplicateData = Data.Get();
     if (auto* Material = Cast<UMaterial>(EditedData))
     {
         if (const auto* Resource = Material->GetMaterialResource(GMaxRHIShaderPlatform); Resource && !Resource->GetCompileErrors().IsEmpty())
@@ -93,11 +100,19 @@ GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestinatio
         // Synchronize graph links only after consent and final lock validation.
         // This never applies the preview to the original material or the world.
         if (Material->MaterialGraph) Material->MaterialGraph->LinkMaterialExpressionsFromGraph();
+        if (Source->GetClass() == UMaterialFunction::StaticClass() && Source != EditedData)
+        {
+            // The function preview's collection can lag behind added/deleted
+            // graph nodes. Synchronize it without Apply or source replacement.
+            auto* Function = Material->MaterialGraph->MaterialFunction.Get();
+            Function->AssignExpressionCollection(Material->GetExpressionCollection());
+            DuplicateData = Function;
+        }
     }
     FPreparedScope Prepared(Repository, Permit, Lease, Repository.Refresh().Root);
     UPackage* Package = CreatePackage(*Current.PackageName);
     // A preview material is an editor-only class: the saved copy must be UMaterial.
-    TStrongObjectPtr<UObject> Copy(StaticDuplicateObject(Data.Get(), Package, *FPackageName::GetLongPackageAssetName(Current.PackageName), RF_AllFlags, Original->GetClass()));
+    TStrongObjectPtr<UObject> Copy(StaticDuplicateObject(DuplicateData, Package, *FPackageName::GetLongPackageAssetName(Current.PackageName), RF_AllFlags, Original->GetClass()));
     if (!Copy) return Fail(TEXT("Could not create the asset copy. Its acquired destination lock remains held."));
     Copy->ClearFlags(RF_Transient); Copy->SetFlags(RF_Public | RF_Standalone); Copy->MarkPackageDirty();
     if (Original->GetOutermost()->HasAnyPackageFlags(PKG_DisallowExport)) Package->SetPackageFlags(PKG_DisallowExport);
@@ -110,6 +125,16 @@ GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestinatio
         for (UMaterialExpressionComment* Comment : Material->GetEditorComments()) if (Comment) { Comment->Material = Material; Comment->Function = nullptr; Comment->GraphNode = nullptr; }
         const auto Errors = UMaterialEditingLibrary::RecompileMaterial(Material);
         if (!Errors.IsEmpty()) return Fail(TEXT("The material copy has shader errors and was not saved. Its unsaved copy and destination lock remain held. Open the copy and fix the errors, then use Save to retry."));
+    }
+    else if (auto* Function = Cast<UMaterialFunction>(Copy.Get()))
+    {
+        Function->ParentFunction = nullptr; Function->PreviewMaterial = nullptr; Function->EditorMaterial = nullptr; Function->MaterialGraph = nullptr;
+        // Unreal deliberately clears library exposure when duplicating a
+        // function. Save As, like Apply, must retain the edited value.
+        Function->bExposeToLibrary = CastChecked<UMaterialFunction>(DuplicateData)->bExposeToLibrary;
+        for (UMaterialExpression* Expression : Function->GetExpressions()) if (Expression) { Expression->Material = nullptr; Expression->Function = Function; Expression->GraphNode = nullptr; }
+        for (UMaterialExpressionComment* Comment : Function->GetEditorComments()) if (Comment) { Comment->Material = nullptr; Comment->Function = Function; Comment->GraphNode = nullptr; }
+        UMaterialEditingLibrary::UpdateMaterialFunction(Function, nullptr);
     }
     FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
     if (!UPackage::SavePackage(Package, Copy.Get(), *Current.Filename, Args))
