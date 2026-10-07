@@ -28,7 +28,9 @@ public class GitSourceControl : ModuleRules
 				"Projects",
                 "MainFrame",
                 "EditorFramework",
-                "ContentBrowser"
+                "ContentBrowser",
+                "RHI",
+                "MaterialEditor"
 			}
 		);
 

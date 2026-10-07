@@ -24,6 +24,15 @@
 #include "Engine/BlueprintGeneratedClass.h"
 #include "GameFramework/Actor.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialFunction.h"
+#include "MaterialGraph/MaterialGraph.h"
+#include "MaterialEditorModule.h"
+#include "IMaterialEditor.h"
+#include "MaterialEditingLibrary.h"
+#include "Framework/Commands/InputBindingManager.h"
+#include "Framework/Commands/UICommandList.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
 #include <unistd.h>
@@ -404,6 +413,123 @@ bool FGitSaveAsCopiesTest::RunTest(const FString&)
     const auto FinalLocks = Repo.VerifyLocks(TEXT("origin"));
     TestTrue(TEXT("Original Blueprint lock is unchanged"), FinalLocks.Locks.Contains(SourcePath) && FinalLocks.Locks[SourcePath].Id == OriginalLockId);
     TestFalse(TEXT("Copying an unlocked texture does not acquire its source lock"), FinalLocks.Locks.Contains(TEXT("Content/T_Original.uasset")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMaterialCopyTest, "GitWorkspace.SaveLock.SaveAsMaterialPreview", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitMaterialCopyTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Material copy server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Mount = TEXT("/GitMaterialCopy") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    const FString Content = FPaths::Combine(F.Repo, TEXT("Content/")); IFileManager::Get().MakeDirectory(*Content, true); FPackageName::RegisterMountPoint(Mount, Content);
+    TStrongObjectPtr<UMaterial> Source(NewObject<UMaterial>(CreatePackage(*(Mount + TEXT("M_Original"))), TEXT("M_Original"), RF_Public | RF_Standalone));
+    auto* SavedColor = CastChecked<UMaterialExpressionConstant3Vector>(UMaterialEditingLibrary::CreateMaterialExpression(Source.Get(), UMaterialExpressionConstant3Vector::StaticClass()));
+    SavedColor->Constant = FLinearColor::Red; Source->GetEditorOnlyData()->BaseColor.Connect(0, SavedColor);
+    Source->SetUsageByFlag(MATUSAGE_SkeletalMesh, true); Source->SetUsageByFlag(MATUSAGE_StaticMesh, false);
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    const FString SourcePath = TEXT("Content/M_Original.uasset"), SourceFile = FPaths::Combine(F.Repo, SourcePath);
+    if (!TestTrue(TEXT("Save red material fixture"), UPackage::SavePackage(Source->GetPackage(), Source.Get(), *SourceFile, Args))) return false;
+    F.Call({TEXT("add"), TEXT("Content")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("red material source")});
+    TArray<uint8> SourceBytes; FFileHelper::LoadFileToArray(SourceBytes, *SourceFile);
+    auto Editor = IMaterialEditorModule::Get().CreateMaterialEditor(EToolkitMode::Standalone, nullptr, Source.Get());
+    TArray<UObject*> Copies;
+    ON_SCOPE_EXIT
+    {
+        GitWorkspaceSave::RemoveGuard(); Editor->CloseWindow(EAssetEditorCloseReason::AssetForceDeleted);
+        TArray<UObject*> Objects = Copies; Objects.Add(Source.Get());
+        for (UObject* Object : Objects) if (Object) { Object->GetPackage()->SetDirtyFlag(false); Object->GetPackage()->SetFlags(RF_Transient); Object->ClearFlags(RF_Public | RF_Standalone); }
+        FPackageName::UnRegisterMountPoint(Mount, Content);
+    };
+    auto* Preview = CastChecked<UMaterial>(Editor->GetMaterialInterface());
+    TestEqual(TEXT("Real material editor registers asset, preview and helper"), Editor->GetObjectsCurrentlyBeingEdited()->Num(), 3);
+    TestTrue(TEXT("Save As source adapter selects the single persistent original"), GitWorkspaceSave::GetCopySource(*Editor) == Source.Get());
+    auto* EditedColor = CastChecked<UMaterialExpressionConstant3Vector>(Preview->GetEditorOnlyData()->BaseColor.Expression);
+    EditedColor->Constant = FLinearColor::Green; Preview->TwoSided = true;
+    Preview->MaterialGraph->LinkGraphNodesFromMaterial(); Editor->UpdateMaterialAfterGraphChange();
+    const auto Apply = FInputBindingManager::Get().FindCommandInContext(TEXT("MaterialEditor"), TEXT("Apply"));
+    const auto* ApplyAction = Editor->GetToolkitCommands()->GetActionForCommand(Apply);
+    if (!TestTrue(TEXT("Real material editor has unapplied edits"), ApplyAction && ApplyAction->CanExecuteAction.Execute())) return false;
+    const auto Save = FInputBindingManager::Get().FindCommandInContext(TEXT("AssetEditor"), TEXT("SaveAsset"));
+    const FUIAction OriginalSave = *Editor->GetToolkitCommands()->GetActionForCommand(Save);
+    TestTrue(TEXT("Preview data adapter accepts real editor preview"), GitWorkspaceSave::ReviewCopyData(Source.Get(), Preview).IsEmpty());
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+    FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*SourceFile, true);
+    const bool bSourceDirty = Source->GetPackage()->IsDirty(); const FString SourceName = Source->GetPathName();
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Material copy lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    const auto Destination = GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Mount + TEXT("M_Copy"), F.Repo, Content);
+    const auto Review = Repo.ReviewAssetSave({Destination.Path}, TEXT("origin"), {Destination.Path});
+    TestFalse(TEXT("Cancelled material review issues no permit"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestTrue(TEXT("Cancel keeps Apply enabled"), ApplyAction->CanExecuteAction.Execute());
+    TestEqual(TEXT("Cancel leaves original red"), SavedColor->Constant, FLinearColor::Red);
+    TestNull(TEXT("Cancel creates no material package"), FindPackage(nullptr, *Destination.PackageName));
+    TestTrue(TEXT("Cancel takes no source or destination lock"), Repo.VerifyLocks(TEXT("origin")).Locks.IsEmpty());
+    const auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    if (!TestTrue(TEXT("Material destination reserved: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const FString CopyLock = Repo.VerifyLocks(TEXT("origin")).Locks[Destination.Path].Id;
+    GitWorkspaceSave::InstallGuard(); UObject* Object = nullptr;
+    const auto Result = GitWorkspaceSave::WriteAssetCopy(Source.Get(), Destination, Repo, *Prepared.Permit, Lease, Content, Object, Preview);
+    if (Object) Copies.Add(Object);
+    if (!TestTrue(TEXT("Preview copy written: ") + Result.Error, Result.Ok() && Object)) return false;
+    auto* Copy = CastChecked<UMaterial>(Object);
+    TestTrue(TEXT("Copy is ordinary UMaterial, not editor-only preview"), Copy->GetClass() == UMaterial::StaticClass() && Copy->IsAsset() && !Copy->bIsPreviewMaterial);
+    auto* CopyColor = CastChecked<UMaterialExpressionConstant3Vector>(Copy->GetEditorOnlyData()->BaseColor.Expression);
+    TestEqual(TEXT("Copy contains unapplied green graph edit"), CopyColor->Constant, FLinearColor::Green);
+    TestTrue(TEXT("Copy contains unapplied property edit"), Copy->TwoSided);
+    TestTrue(TEXT("Copied expression belongs to copy"), CopyColor->Material == Copy && CopyColor->GetOutermost() == Copy->GetOutermost() && CopyColor != EditedColor);
+    TestTrue(TEXT("Usage flags retained without forcing preview-only static mesh usage"), Copy->GetUsageByFlag(MATUSAGE_SkeletalMesh) && !Copy->GetUsageByFlag(MATUSAGE_StaticMesh));
+    TestFalse(TEXT("Copy does not gain special engine material status"), Copy->bUsedAsSpecialEngineMaterial);
+    TestFalse(TEXT("Copy is saved clean"), Copy->GetPackage()->IsDirty());
+    TestTrue(TEXT("Original editor retains same preview and Apply state"), Editor->GetMaterialInterface() == Preview && ApplyAction->CanExecuteAction.Execute());
+    TestEqual(TEXT("Source material data is still red"), SavedColor->Constant, FLinearColor::Red);
+    TestFalse(TEXT("Source property is not applied"), Source->TwoSided);
+    TestEqual(TEXT("Original dirty state preserved"), Source->GetPackage()->IsDirty(), bSourceDirty);
+    TestEqual(TEXT("Original asset name preserved"), Source->GetPathName(), SourceName);
+    TArray<uint8> After; FFileHelper::LoadFileToArray(After, *SourceFile); TestEqual(TEXT("Source saved bytes preserved"), After, SourceBytes);
+    TestTrue(TEXT("Source stays read only"), IFileManager::Get().IsReadOnly(*SourceFile));
+    const auto Locks = Repo.VerifyLocks(TEXT("origin"));
+    TestFalse(TEXT("Source is not locked by Save As"), Locks.Locks.Contains(SourcePath));
+    TestTrue(TEXT("Exact destination lock retained"), Locks.Locks.Contains(Destination.Path) && Locks.Locks[Destination.Path].Id == CopyLock);
+    TestEqual(TEXT("Material copy preserves index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("Material copy preserves HEAD"), Repo.Refresh().Head, Before.Head);
+    TestEqual(TEXT("Material copy preserves stashes"), Repo.ListStashes().Fingerprint, Stashes);
+    TestTrue(TEXT("Material copy remains untracked"), Repo.Refresh().Files.ContainsByPredicate([&](const GitWorkspace::FFile& File) { return File.Path == Destination.Path && File.bUntracked; }));
+    // The ordinary Save action still applies and compiles the editor preview.
+    const auto SavePrepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave({SourcePath}, TEXT("origin")), Lease, true);
+    if (!TestTrue(TEXT("Prepare regular material Save"), SavePrepared.Result.Ok() && SavePrepared.Permit)) return false;
+    // Apply reconstructs the original UObject in place. The editor owns it;
+    // a fixture strong reference would prohibit that engine replacement.
+    Source.Reset();
+    {
+        // Match the registered mount's literal /var spelling, as the engine's
+        // native writer derives its filename from that mount.
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *SavePrepared.Permit, Lease, F.Repo);
+        // The unattended harness cancels native checkout dialogs. Unreal's
+        // supported scripted-save path still runs the original material action
+        // and final package writer under the real prepared lock permit.
+        TGuardValue<bool> ScriptMode(GIsRunningUnattendedScript, true);
+        OriginalSave.ExecuteAction.Execute();
+        auto* Current = CastChecked<UMaterial>((*Editor->GetObjectsCurrentlyBeingEdited())[0]);
+        TestFalse(TEXT("Native material writer consumes the prepared one-write permit"), UPackage::SavePackage(Current->GetPackage(), Current, *SourceFile, Args));
+    }
+    Source.Reset(CastChecked<UMaterial>((*Editor->GetObjectsCurrentlyBeingEdited())[0]));
+    TestFalse(TEXT("Regular Save clears Apply state"), ApplyAction->CanExecuteAction.Execute());
+    TestEqual(TEXT("Regular Save applies green edit"), CastChecked<UMaterialExpressionConstant3Vector>(Source->GetEditorOnlyData()->BaseColor.Expression)->Constant, FLinearColor::Green);
+    TestTrue(TEXT("Regular Save applies property edit"), Source->TwoSided);
+    TestFalse(TEXT("Regular Save writes a clean source"), Source->GetPackage()->IsDirty());
+    FFileHelper::LoadFileToArray(After, *SourceFile); TestTrue(TEXT("Regular Save writes changed source bytes"), After != SourceBytes);
+    TestEqual(TEXT("Regular Save still preserves staged snapshot"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMaterialCopyDataTest, "GitWorkspace.SaveLock.MaterialCopyDataBoundaries", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitMaterialCopyDataTest::RunTest(const FString&)
+{
+    TStrongObjectPtr<UMaterial> Source(NewObject<UMaterial>(GetTransientPackage()));
+    TStrongObjectPtr<UMaterial> Other(NewObject<UMaterial>(GetTransientPackage()));
+    TStrongObjectPtr<UMaterialFunction> Function(NewObject<UMaterialFunction>(GetTransientPackage()));
+    TestTrue(TEXT("Ordinary material is supported"), GitWorkspaceSave::SupportsAssetCopy(Source.Get()));
+    TestTrue(TEXT("Direct source copies retain existing behavior"), GitWorkspaceSave::ReviewCopyData(Source.Get(), Source.Get()).IsEmpty());
+    TestFalse(TEXT("Unavailable material preview fails closed"), GitWorkspaceSave::ReviewCopyData(Source.Get(), nullptr).IsEmpty());
+    TestFalse(TEXT("Unrelated normal material cannot supply preview edits"), GitWorkspaceSave::ReviewCopyData(Source.Get(), Other.Get()).IsEmpty());
+    TestFalse(TEXT("Material functions need a separate adapter"), GitWorkspaceSave::SupportsAssetCopy(Function.Get()));
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveAsRefusalTest, "GitWorkspace.SaveLock.SaveAsCancellationAndRefusal", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

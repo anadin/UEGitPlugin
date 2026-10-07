@@ -151,7 +151,7 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
             const FString Path = Relative(File, ProjectRepositoryRoot);
             Result = Async(EAsyncExecution::ThreadPool, [Repo, Path] { return Repo->IsLockableAsset(Path); }).Get();
             if (Result.Code == 1) return true;
-            if (Result.Ok()) Result.Error = TEXT("Use Save, Save All or Git Workspace Save assets to prepare this exact asset destination. Standard Blueprint and Texture2D editors also support reviewed Save As copies. Other naming/custom routes require separate integration; Make Writable cannot grant lock ownership.");
+            if (Result.Ok()) Result.Error = TEXT("Use Save, Save All or Git Workspace Save assets to prepare this exact asset destination. Standard Blueprint, Texture2D and Material editors also support reviewed Save As copies. Other naming/custom routes require separate integration; Make Writable cannot grant lock ownership.");
         }
     }
     if (!Result.Error.IsEmpty() || !Result.Ok())
@@ -190,7 +190,7 @@ bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review, const FString& I
     FSlateApplication::Get().AddModalWindow(Window, FSlateApplication::Get().GetActiveTopLevelWindow());
     return bConfirmed;
 }
-void ExecuteSaveAs(UObject* Source, const FExecuteAction& OriginalAction)
+void ExecuteSaveAs(UObject* Source, UObject* EditedData, const FExecuteAction& OriginalAction)
 {
     if (!UsesWorkspace()) { OriginalAction.ExecuteIfBound(); return; }
     if (bBusy) return;
@@ -200,8 +200,10 @@ void ExecuteSaveAs(UObject* Source, const FExecuteAction& OriginalAction)
     const auto Local = Async(EAsyncExecution::ThreadPool, [Repo] { return Repo->Refresh(); }).Get();
     if (Local.Root.IsEmpty()) { OriginalAction.ExecuteIfBound(); return; }
     if (!Local.bValid) { Blocked(Local.Error); return; }
-    if (!SupportsAssetCopy(Source)) { Blocked(TEXT("Guarded Save As requires one ordinary Blueprint or Texture2D in its standard asset editor.")); return; }
+    const FString DataError = ReviewCopyData(Source, EditedData);
+    if (!DataError.IsEmpty()) { Blocked(DataError); return; }
     TStrongObjectPtr<UObject> HoldSource(Source);
+    TStrongObjectPtr<UObject> HoldData(EditedData);
     const FString Content = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
     FSaveAssetDialogConfig Config; Config.DialogTitleOverride = SaveText(TEXT("Save asset copy as"));
     Config.DefaultPath = FPackageName::GetLongPackagePath(Source->GetOutermost()->GetName());
@@ -232,7 +234,7 @@ void ExecuteSaveAs(UObject* Source, const FExecuteAction& OriginalAction)
     }
     if (!Prepared.Result.Ok() || !Prepared.Permit) { Blocked(Prepared.Result.Error); return; }
     UObject* Copy = nullptr;
-    const auto Written = WriteAssetCopy(Source, Destination, *Repo, *Prepared.Permit, Access.Lease(), Content, Copy);
+    const auto Written = WriteAssetCopy(Source, Destination, *Repo, *Prepared.Permit, Access.Lease(), Content, Copy, HoldData.Get());
     // Keep the original editor and its edits open. A failed copy is also kept
     // in memory and can use the ordinary, already-locked Save retry.
     if (Copy && GEditor) GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Copy);
@@ -353,14 +355,15 @@ void WrapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInf
     Wrapper.ExecuteAction = FExecuteAction::CreateLambda([GetPackages, Execute = Original.ExecuteAction] { ExecuteSave(GetPackages(), Execute); });
     Commands.Add({List, Command, Original, Wrapper.ExecuteAction.GetHandle()}); List->MapAction(Command, Wrapper);
 }
-void WrapSaveAsCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UObject*()> GetSource)
+void WrapSaveAsCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UObject*()> GetSource, TFunction<UObject*()> GetEditedData)
 {
     if (!Command) return;
     const FUIAction* Action = List->GetActionForCommand(Command);
     if (!Action || !Action->ExecuteAction.IsBound()) return;
     for (const auto& Entry : Commands) if (Entry.List.Pin() == List && Entry.Command == Command && Entry.Handle == Action->ExecuteAction.GetHandle()) return;
     const FUIAction Original = *Action; FUIAction Wrapper = Original;
-    Wrapper.ExecuteAction = FExecuteAction::CreateLambda([GetSource, Execute = Original.ExecuteAction] { ExecuteSaveAs(GetSource(), Execute); });
+    Wrapper.ExecuteAction = FExecuteAction::CreateLambda([GetSource, GetEditedData, Execute = Original.ExecuteAction]
+    { UObject* Source = GetSource(); ExecuteSaveAs(Source, GetEditedData ? GetEditedData() : Source, Execute); });
     Commands.Add({List, Command, Original, Wrapper.ExecuteAction.GetHandle()}); List->MapAction(Command, Wrapper);
 }
 void RestoreCommands()

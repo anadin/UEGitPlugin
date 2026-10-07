@@ -7,6 +7,7 @@ class FUICommandList;
 class FUICommandInfo;
 class ISourceControlProvider;
 class UObject;
+class FAssetEditorToolkit;
 
 namespace GitWorkspaceSave
 {
@@ -31,10 +32,13 @@ struct FAssetCopyDestination
     FString PackageName, Path, Filename, Error;
 };
 bool SupportsAssetCopy(const UObject* Source);
+UObject* GetCopySource(const FAssetEditorToolkit& Editor);
+// Material editors hold unapplied graph edits in a separate transient preview.
+FString ReviewCopyData(UObject* Source, UObject* EditedData);
 FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& PackageName, const FString& Root, const FString& Content);
 #if PLATFORM_MAC
 GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestination& Destination, GitWorkspace::FRepository& Repository,
-    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UObject*& OutCopy);
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UObject*& OutCopy, UObject* EditedData = nullptr);
 class FPreparedScope
 {
 public:
@@ -48,6 +52,6 @@ private:
 #endif
 // Retain the original action, including its enable/visibility/check delegates.
 void WrapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<TArray<UPackage*>()> GetPackages);
-void WrapSaveAsCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UObject*()> GetSource);
+void WrapSaveAsCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UObject*()> GetSource, TFunction<UObject*()> GetEditedData = {});
 void RestoreCommands();
 }

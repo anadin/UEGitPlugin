@@ -13,9 +13,22 @@
 #include "ContentBrowserDelegates.h"
 #include "AssetRegistry/AssetData.h"
 #include "Modules/ModuleManager.h"
+#include "IMaterialEditor.h"
+#include "Materials/Material.h"
 
 namespace GitWorkspaceSave
 {
+UObject* GetCopySource(const FAssetEditorToolkit& Editor)
+{
+    // EditingObjects also includes the material preview and helper. Count
+    // persistent assets using the public API; refuse multiple real assets.
+    UObject* Source = nullptr;
+    if (const auto* Objects = Editor.GetObjectsCurrentlyBeingEdited())
+        for (UObject* Object : *Objects)
+            if (Object && Object->IsAsset() && !Object->HasAnyFlags(RF_Transient) && Object->GetOutermost() != GetTransientPackage())
+            { if (Source && Source != Object) return nullptr; Source = Object; }
+    return Source;
+}
 namespace
 {
 FTSTicker::FDelegateHandle TickHandle;
@@ -48,13 +61,21 @@ bool UpdateHooks(float)
                 }
                 return Packages;
             });
-            // These built-in editors use the base Save As action. Editors with
-            // subclass apply/compile/rename behavior need their own integration.
-            if (Editor->GetToolkitFName() == FName(TEXT("BlueprintEditor")) || Editor->GetToolkitFName() == FName(TEXT("TextureEditor")))
+            const bool bMaterialEditor = Editor->GetToolkitFName() == FName(TEXT("MaterialEditor"));
+            // Material copies read the live preview without applying it to the
+            // original. Ordinary Save retains the editor's apply/compile action.
+            if (bMaterialEditor || Editor->GetToolkitFName() == FName(TEXT("BlueprintEditor")) || Editor->GetToolkitFName() == FName(TEXT("TextureEditor")))
                 WrapSaveAsCommand(Editor->GetToolkitCommands(), FInputBindingManager::Get().FindCommandInContext(TEXT("AssetEditor"), TEXT("SaveAssetAs")), [Weak]() -> UObject*
                 {
+                    if (auto Live = Weak.Pin()) return GetCopySource(*Live);
+                    return nullptr;
+                }, [Weak, bMaterialEditor]() -> UObject*
+                {
                     if (auto Live = Weak.Pin())
-                        if (const auto* Objects = Live->GetObjectsCurrentlyBeingEdited(); Objects && Objects->Num() == 1) return (*Objects)[0];
+                    {
+                        if (bMaterialEditor) return StaticCastSharedPtr<IMaterialEditor>(Live)->GetMaterialInterface();
+                        return GetCopySource(*Live);
+                    }
                     return nullptr;
                 });
         }
