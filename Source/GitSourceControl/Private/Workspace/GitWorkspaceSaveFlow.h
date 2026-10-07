@@ -8,6 +8,7 @@ class FUICommandInfo;
 class ISourceControlProvider;
 class UObject;
 class FAssetEditorToolkit;
+class UWorld;
 
 namespace GitWorkspaceSave
 {
@@ -31,6 +32,18 @@ struct FAssetCopyDestination
 {
     FString PackageName, Path, Filename, Error;
 };
+FAssetCopyDestination ReviewAbsentDestination(const FString& PackageName, const FString& SourcePackage, const FString& Root, const FString& Content, bool bMap);
+// Ordinary persistent maps only. First Save names the live world; Save As copies it.
+struct FMapSaveDestination
+{
+    FAssetCopyDestination Map, BuildData;
+    FString SourcePackage, Error;
+    TWeakObjectPtr<UObject> SourceBuildData;
+    bool bNameCurrent = false;
+    TArray<FString> Paths() const { TArray<FString> Out{Map.Path}; if (!BuildData.Path.IsEmpty()) Out.Add(BuildData.Path); return Out; }
+};
+FString ReviewMapSource(UWorld* World);
+FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageName, const FString& Root, const FString& Content);
 bool SupportsAssetCopy(const UObject* Source);
 UObject* GetCopySource(const FAssetEditorToolkit& Editor);
 UObject* GetCopyData(FAssetEditorToolkit& Editor);
@@ -40,6 +53,8 @@ FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& Pack
 #if PLATFORM_MAC
 GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UObject*& OutCopy, UObject* EditedData = nullptr);
+GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
 class FPreparedScope
 {
 public:
@@ -54,5 +69,6 @@ private:
 // Retain the original action, including its enable/visibility/check delegates.
 void WrapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<TArray<UPackage*>()> GetPackages);
 void WrapSaveAsCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UObject*()> GetSource, TFunction<UObject*()> GetEditedData = {});
+void WrapMapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UWorld*()> GetWorld, bool bSaveAs);
 void RestoreCommands();
 }

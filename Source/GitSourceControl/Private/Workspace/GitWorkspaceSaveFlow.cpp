@@ -8,6 +8,8 @@
 #include "IContentBrowserSingleton.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Engine/World.h"
+#include "Engine/Level.h"
+#include "Engine/MapBuildDataRegistry.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "FileHelpers.h"
@@ -245,6 +247,61 @@ void ExecuteSaveAs(UObject* Source, UObject* EditedData, const FExecuteAction& O
     Blocked(TEXT("Guarded Save As is currently available on Mac only."));
 #endif
 }
+void ExecuteMapSaveAs(UWorld* World, const FExecuteAction& Original)
+{
+    if (!UsesWorkspace()) { Original.ExecuteIfBound(); return; }
+    if (bBusy) return;
+    TGuardValue<bool> Busy(bBusy, true);
+    if (!ProjectRepo) { Blocked(TEXT("Git Workspace save protection is not ready.")); return; }
+    auto Repo = ProjectRepo;
+    const auto Local = Async(EAsyncExecution::ThreadPool, [Repo] { return Repo->Refresh(); }).Get();
+    if (Local.Root.IsEmpty()) { Original.ExecuteIfBound(); return; }
+    if (!Local.bValid) { Blocked(Local.Error); return; }
+    const FString Error = ReviewMapSource(World); if (!Error.IsEmpty()) { Blocked(Error); return; }
+    TStrongObjectPtr<UWorld> HoldWorld(World);
+    const bool bNameCurrent = FPackageName::IsTempPackage(World->GetPackage()->GetName());
+    FSaveAssetDialogConfig Config; Config.DialogTitleOverride = SaveText(bNameCurrent ? TEXT("Name and save current map") : TEXT("Save map copy as"));
+    Config.DefaultPath = FPackageName::GetLongPackagePath(World->GetPackage()->GetName());
+    if (!Config.DefaultPath.StartsWith(TEXT("/Game/")) && Config.DefaultPath != TEXT("/Game")) Config.DefaultPath = TEXT("/Game");
+    Config.DefaultAssetName = bNameCurrent ? TEXT("L_NewMap") : World->GetName() + TEXT("_Copy");
+    Config.AssetClassNames.Add(UWorld::StaticClass()->GetClassPathName()); Config.ExistingAssetPolicy = ESaveAssetDialogExistingAssetPolicy::Disallow;
+    const FString ObjectPath = FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get().CreateModalSaveAssetDialog(Config);
+    if (ObjectPath.IsEmpty()) return;
+    const FString Content = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
+    const auto Destination = ReviewMapDestination(World, FPackageName::ObjectPathToPackageName(ObjectPath), Local.Root, Content);
+    if (!Destination.Error.IsEmpty()) { Blocked(Destination.Error); return; }
+    const auto Paths = Destination.Paths(); const FString Remote = LockRemote();
+    GitWorkspace::FAssetSaveReview Review;
+    {
+        FScopedSlowTask Task(1.f, SaveText(TEXT("Verifying the complete map destination and locks…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
+        Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, Remote] { return Repo->ReviewAssetSave(Paths, Remote, Paths); }).Get();
+    }
+    if (!Review.IsFresh()) { Blocked(Review.Error); return; }
+    if (Review.Paths.Num() != Paths.Num()) { Blocked(TEXT("Every map/build-data destination must be LFS and lockable. Review .gitattributes first.")); return; }
+    const FString Introduction = bNameCurrent ? TEXT("This names and saves the current map and its build data. You keep editing this map.\n\n") :
+        TEXT("This saves a new map copy and its build data. The original stays open with its unsaved edits. Open the copy from Content Browser to switch maps.\n\n");
+    if (!ConfirmLocks(Review, Introduction)) return;
+#if PLATFORM_MAC
+    GitWorkspaceSession::FEditorWriteScope Access; FString AccessError;
+    if (!Access.Acquire(Review.Local.Root, AccessError)) { Blocked(AccessError); return; }
+    GitWorkspace::FAssetSavePreparation Prepared;
+    {
+        FScopedSlowTask Task(1.f, SaveText(TEXT("Reserving all map destinations before naming or copying…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
+        Prepared = Async(EAsyncExecution::ThreadPool, [Repo, Review, &Access] { return Repo->PrepareAssetSave(Review, Access.Lease(), true); }).Get();
+    }
+    if (!Prepared.Result.Ok() || !Prepared.Permit)
+    {
+        for (const FString& Path : Prepared.AcquiredPaths) Prepared.Result.Error += TEXT("\nLock retained: ") + Path;
+        Blocked(Prepared.Result.Error); return;
+    }
+    UWorld* WrittenWorld = nullptr;
+    const auto Written = WriteMapDestination(World, Destination, *Repo, *Prepared.Permit, Access.Lease(), Content, WrittenWorld);
+    if (!Written.Ok()) { Blocked(Written.Error); return; }
+    FNotificationInfo Notice(SaveText(Destination.bNameCurrent ? TEXT("Current map named and saved. Locks remain held. Stage the new files when ready.") : TEXT("Map copy saved. The original stays open. Open the copy from Content Browser to switch maps. Locks remain held; stage when ready."))); Notice.ExpireDuration = 12.f; FSlateNotificationManager::Get().AddNotification(Notice);
+#else
+    Blocked(TEXT("Guarded map naming is currently available on Mac only."));
+#endif
+}
 void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Original)
 {
     if (!UsesWorkspace()) { Original.ExecuteIfBound(); return; }
@@ -281,6 +338,9 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
         for (const auto& Path : Prepared.AcquiredPaths) Prepared.Result.Error += TEXT("\nLock retained: ") + Path;
         Blocked(Prepared.Result.Error); return;
     }
+    const auto CurrentDestinations = GatherPackageSavePaths(Packages, Local.Root, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
+    if (!CurrentDestinations.Error.IsEmpty() || CurrentDestinations.Paths != Paths || CurrentDestinations.NewPaths != NewPaths)
+    { Blocked(TEXT("The package set changed after lock review. Review saving again. Locks remain held.")); return; }
     FPreparedScope Permit(*Repo, *Prepared.Permit, Access.Lease(), Review.Local.Root);
     Original.ExecuteIfBound();
     FNotificationInfo Notice(SaveText(TEXT("Asset locks remain held. Saving does not stage files.")));
@@ -297,8 +357,19 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
     for (UPackage* Package : Packages)
     {
         if (!Package) continue;
-        if (UWorld* World = UWorld::FindWorldInPackage(Package); World && World->GetWorldPartition())
-        { Out.Error = TEXT("World Partition saves need a coordinated external actor/object lock workflow. Save cancelled."); return Out; }
+        if (UWorld* World = UWorld::FindWorldInPackage(Package))
+        {
+            const FString Error = ReviewMapSource(World); if (!Error.IsEmpty()) { Out.Error = Error; return Out; }
+            if (FPackageName::IsTempPackage(Package->GetName()))
+            { Out.Error = TEXT("Name the current ordinary map using Save Current Level first, then retry Save All."); return Out; }
+            if (auto* Data = World->PersistentLevel->MapBuildData.Get())
+            {
+                const auto Companion = GatherPackageSavePaths({Data->GetPackage()}, Root, Content);
+                if (!Companion.Error.IsEmpty()) { Out.Error = Companion.Error; return Out; }
+                for (const FString& Path : Companion.Paths) Out.Paths.AddUnique(Path);
+                for (const FString& Path : Companion.NewPaths) Out.NewPaths.AddUnique(Path);
+            }
+        }
         FString Filename;
         const bool bExists = FPackageName::DoesPackageExist(Package->GetName(), &Filename);
         if (!bExists && FPackageName::IsValidLongPackageName(Package->GetName(), false))
@@ -364,6 +435,21 @@ void WrapSaveAsCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUIComm
     const FUIAction Original = *Action; FUIAction Wrapper = Original;
     Wrapper.ExecuteAction = FExecuteAction::CreateLambda([GetSource, GetEditedData, Execute = Original.ExecuteAction]
     { UObject* Source = GetSource(); ExecuteSaveAs(Source, GetEditedData ? GetEditedData() : Source, Execute); });
+    Commands.Add({List, Command, Original, Wrapper.ExecuteAction.GetHandle()}); List->MapAction(Command, Wrapper);
+}
+void WrapMapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UWorld*()> GetWorld, bool bSaveAs)
+{
+    if (!Command) return;
+    const FUIAction* Action = List->GetActionForCommand(Command);
+    if (!Action || !Action->ExecuteAction.IsBound()) return;
+    for (const auto& Entry : Commands) if (Entry.List.Pin() == List && Entry.Command == Command && Entry.Handle == Action->ExecuteAction.GetHandle()) return;
+    const FUIAction Original = *Action; FUIAction Wrapper = Original;
+    Wrapper.ExecuteAction = FExecuteAction::CreateLambda([GetWorld, bSaveAs, Execute = Original.ExecuteAction]
+    {
+        UWorld* World = GetWorld();
+        if (bSaveAs || (World && FPackageName::IsTempPackage(World->GetPackage()->GetName()))) ExecuteMapSaveAs(World, Execute);
+        else ExecuteSave(World ? TArray<UPackage*>{World->GetPackage()} : TArray<UPackage*>{}, Execute);
+    });
     Commands.Add({List, Command, Original, Wrapper.ExecuteAction.GetHandle()}); List->MapAction(Command, Wrapper);
 }
 void RestoreCommands()

@@ -27,6 +27,7 @@ public class GitSourceControl : ModuleRules
 				"SourceControlWindows",
 				"Projects",
                 "MainFrame",
+                "LevelEditor",
                 "EditorFramework",
                 "ContentBrowser",
                 "RHI",

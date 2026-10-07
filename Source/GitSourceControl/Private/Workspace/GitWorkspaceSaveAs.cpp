@@ -43,13 +43,17 @@ FString ReviewCopyData(UObject* Source, UObject* EditedData)
 }
 FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& PackageName, const FString& Root, const FString& Content)
 {
+    if (!SupportsAssetCopy(Source))
+    { FAssetCopyDestination Out; Out.Error = TEXT("Guarded Save As currently supports one ordinary Blueprint, Texture2D, Material, Material Instance or Material Function in its standard asset editor."); return Out; }
+    return ReviewAbsentDestination(PackageName, Source->GetOutermost()->GetName(), Root, Content, false);
+}
+FAssetCopyDestination ReviewAbsentDestination(const FString& PackageName, const FString& SourcePackage, const FString& Root, const FString& Content, bool bMap)
+{
     check(IsInGameThread());
     FAssetCopyDestination Out;
-    if (!SupportsAssetCopy(Source))
-    { Out.Error = TEXT("Guarded Save As currently supports one ordinary Blueprint, Texture2D, Material, Material Instance or Material Function in its standard asset editor."); return Out; }
-    if (!FPackageName::IsValidLongPackageName(PackageName, false) || PackageName == Source->GetOutermost()->GetName() ||
-        !FPackageName::TryConvertLongPackageNameToFilename(PackageName, Out.Filename, FPackageName::GetAssetPackageExtension()))
-    { Out.Error = TEXT("Choose a new valid asset name in game Content. Save As does not overwrite or rename the source."); return Out; }
+    if (!FPackageName::IsValidLongPackageName(PackageName, false) || PackageName == SourcePackage ||
+        !FPackageName::TryConvertLongPackageNameToFilename(PackageName, Out.Filename, bMap ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension()))
+    { Out.Error = TEXT("Choose a fresh valid package name in game Content. Existing destinations are never overwritten."); return Out; }
     Out.Filename = FPaths::ConvertRelativePathToFull(Out.Filename);
     if (!FPaths::IsUnderDirectory(Out.Filename, Content))
     { Out.Error = TEXT("Choose a Save As destination inside this game's Content directory."); return Out; }
@@ -69,8 +73,8 @@ FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& Pack
     { Out.Error = TEXT("Choose a Save As destination inside this checkout."); return Out; }
     Out.Path = Out.Filename; FPaths::MakePathRelativeTo(Out.Path, *(RootSpelling + TEXT("/")));
     Out.Filename = FPaths::Combine(CanonicalRoot, Out.Path);
-    if (FindPackage(nullptr, *PackageName) || IFileManager::Get().FileExists(*Out.Filename) || IFileManager::Get().DirectoryExists(*Out.Filename))
-    { Out.Error = TEXT("This destination already exists on disk or in memory. Choose another name. To retry an unsaved copy, open it and use Save."); return Out; }
+    if (FindPackage(nullptr, *PackageName) || FPackageName::DoesPackageExist(PackageName) || IFileManager::Get().FileExists(*Out.Filename) || IFileManager::Get().DirectoryExists(*Out.Filename))
+    { Out.Error = bMap ? TEXT("This map destination already exists on disk or in memory. Choose another name, or use Save / Save All to review an unsaved named map or copy.") : TEXT("This destination already exists on disk or in memory. Choose another name. To retry an unsaved copy, open it and use Save."); return Out; }
     Out.PackageName = PackageName;
     return Out;
 }

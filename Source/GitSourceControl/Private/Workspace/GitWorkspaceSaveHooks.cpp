@@ -15,6 +15,9 @@
 #include "Modules/ModuleManager.h"
 #include "IMaterialEditor.h"
 #include "Materials/Material.h"
+#include "LevelEditor.h"
+#include "ILevelEditor.h"
+#include "Engine/World.h"
 
 namespace GitWorkspaceSave
 {
@@ -51,6 +54,19 @@ bool UpdateHooks(float)
     if (!bInitialized) { InstallGuard(); bInitialized = true; }
     if (auto* MainFrame = FModuleManager::GetModulePtr<IMainFrameModule>(TEXT("MainFrame")))
         WrapCommand(MainFrame->GetMainFrameCommandBindings(), FInputBindingManager::Get().FindCommandInContext(TEXT("MainFrame"), TEXT("SaveAll")), &DirtyPackages);
+    if (auto* LevelEditor = FModuleManager::GetModulePtr<FLevelEditorModule>(TEXT("LevelEditor")))
+    {
+        auto Hook = [](TSharedRef<FUICommandList> List)
+        {
+            auto CurrentWorld = []() -> UWorld* { return GEditor ? GEditor->GetEditorWorldContext().World() : nullptr; };
+            WrapMapCommand(List, FInputBindingManager::Get().FindCommandInContext(TEXT("LevelEditor"), TEXT("Save")), CurrentWorld, false);
+            WrapMapCommand(List, FInputBindingManager::Get().FindCommandInContext(TEXT("LevelEditor"), TEXT("SaveAs")), CurrentWorld, true);
+            WrapCommand(List, FInputBindingManager::Get().FindCommandInContext(TEXT("LevelEditor"), TEXT("SaveAllLevels")), []
+            { TArray<UPackage*> Packages; FEditorFileUtils::GetDirtyWorldPackages(Packages); return Packages; });
+        };
+        Hook(LevelEditor->GetGlobalLevelEditorActions());
+        if (auto Level = LevelEditor->GetLevelEditorInstance().Pin(); Level && Level->GetLevelEditorActions()) Hook(Level->GetLevelEditorActions().ToSharedRef());
+    }
     if (auto* Editors = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
     {
         for (UObject* Asset : Editors->GetAllEditedAssets())

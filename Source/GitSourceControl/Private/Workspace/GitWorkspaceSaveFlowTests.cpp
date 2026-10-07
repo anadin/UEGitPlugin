@@ -50,6 +50,15 @@ bool FGitSaveCommandTest::RunTest(const FString&)
     TestTrue(TEXT("Save As is only wrapped once"), List->GetActionForCommand(Command)->ExecuteAction.GetHandle() == SaveAs.ExecuteAction.GetHandle());
     GitWorkspaceSave::RestoreCommands();
     TestTrue(TEXT("Save As original action restored on shutdown"), List->GetActionForCommand(Command)->ExecuteAction.GetHandle() == Original.ExecuteAction.GetHandle());
+    List->MapAction(Command, Original);
+    GitWorkspaceSave::WrapMapCommand(List, Command, []() -> UWorld* { return nullptr; }, true);
+    const auto Map = *List->GetActionForCommand(Command);
+    TestTrue(TEXT("Map naming keeps enable/check delegates"), Map.CanExecuteAction.Execute() && Map.GetActionCheckState.Execute() == ECheckBoxState::Checked);
+    TestFalse(TEXT("Map naming keeps visibility"), Map.IsActionVisibleDelegate.Execute());
+    GitWorkspaceSave::WrapMapCommand(List, Command, []() -> UWorld* { return nullptr; }, true);
+    TestTrue(TEXT("Map naming wraps once"), List->GetActionForCommand(Command)->ExecuteAction.GetHandle() == Map.ExecuteAction.GetHandle());
+    GitWorkspaceSave::RestoreCommands();
+    TestTrue(TEXT("Map naming restores original action"), List->GetActionForCommand(Command)->ExecuteAction.GetHandle() == Original.ExecuteAction.GetHandle());
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveGuardChainTest, "GitWorkspace.SaveLock.EditorPermissionChain", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

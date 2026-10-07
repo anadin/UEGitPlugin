@@ -20,6 +20,15 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 #include "Engine/Texture2D.h"
+#include "Engine/World.h"
+#include "FileHelpers.h"
+#include "Engine/Level.h"
+#include "Engine/MapBuildDataRegistry.h"
+#include "PrecomputedLightVolume.h"
+#include "Engine/WorldComposition.h"
+#include "WorldPartition/WorldPartition.h"
+#include "GameFramework/WorldSettings.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "GameFramework/Actor.h"
@@ -78,7 +87,7 @@ struct FLockFixture
     FString Repo = FPaths::Combine(Root, TEXT("repo")), Remote = FPaths::Combine(Root, TEXT("remote.git"));
     FString Git = GitWorkspace::FindGitExecutable(), Endpoint;
     FProcHandle Server;
-    FLockFixture()
+    FLockFixture(bool bMapAttributes = false)
     {
         IFileManager::Get().MakeDirectory(*Repo, true);
         const auto Plugin = IPluginManager::Get().FindPlugin(TEXT("GitSourceControl"));
@@ -100,7 +109,7 @@ struct FLockFixture
         Call({TEXT("lfs"), TEXT("install"), TEXT("--local"), TEXT("--skip-repo")});
         Call({TEXT("config"), TEXT("lfs.url"), Endpoint});
         Call({TEXT("config"), TEXT("lfs.activitytimeout"), TEXT("2")});
-        Write(TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text lockable\n"));
+        Write(TEXT(".gitattributes"), FString(TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text lockable\n")) + (bMapAttributes ? TEXT("*.umap filter=lfs diff=lfs merge=lfs -text lockable\n") : TEXT("")));
         Write(TEXT("asset.uasset"), TEXT("base A\n"));
         Call({TEXT("add"), TEXT(".")}); Call({TEXT("commit"), TEXT("-qm"), TEXT("base")});
         Call({TEXT("init"), TEXT("--bare"), Remote});
@@ -118,6 +127,188 @@ struct FLockFixture
     void Mode(const FString& Mode) { FFileHelper::SaveStringToFile(Mode, *FPaths::Combine(Root, TEXT("mode")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM); }
 };
 }
+namespace
+{
+struct FMapSaveFixture
+{
+    FLockFixture Files{true};
+    FString Content = FPaths::Combine(Files.Repo, TEXT("Content"));
+    FString Mount = TEXT("/GitWorkspaceMap_") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    TArray<TStrongObjectPtr<UWorld>> Worlds;
+    FMapSaveFixture() { IFileManager::Get().MakeDirectory(*Content, true); FPackageName::RegisterMountPoint(Mount, Content + TEXT("/")); GitWorkspaceSave::InstallGuard(); }
+    UWorld* NewWorld(bool bData = true)
+    {
+        const FString Name = TEXT("/Temp/Untitled_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+        UWorld* World = UWorld::CreateWorld(EWorldType::Inactive, false, FPackageName::GetShortFName(*Name), CreatePackage(*Name), false);
+        World->SetFlags(RF_Public | RF_Standalone); World->MarkPackageDirty();
+        if (bData) World->PersistentLevel->GetOrCreateMapBuildData()->MarkPackageDirty();
+        Worlds.Emplace(World); return World;
+    }
+    void Keep(UWorld* World) { if (World) Worlds.Emplace(World); }
+    ~FMapSaveFixture()
+    {
+        for (auto& World : Worlds) if (World)
+        {
+            if (auto* Data = World->PersistentLevel->MapBuildData.Get())
+            { FAssetRegistryModule::AssetDeleted(Data); Data->GetPackage()->SetDirtyFlag(false); Data->ClearFlags(RF_Standalone); }
+            FAssetRegistryModule::AssetDeleted(World.Get()); World->GetPackage()->SetDirtyFlag(false); World->ClearFlags(RF_Standalone); World->DestroyWorld(false);
+        }
+        Worlds.Empty(); GitWorkspaceSave::RemoveGuard(); FPackageName::UnRegisterMountPoint(Mount, Content + TEXT("/"));
+    }
+};
+class FMapFixtureCleanup : public IAutomationLatentCommand
+{
+    TSharedPtr<FMapSaveFixture> Fixture; int32 Ticks = 0;
+public:
+    explicit FMapFixtureCleanup(TSharedPtr<FMapSaveFixture> InFixture) : Fixture(MoveTemp(InFixture)) {}
+    virtual bool Update() override
+    {
+        // Save validation runs on the next editor tick. Keep both the mount
+        // and real assets alive through that callback; do not disable validators.
+        if (++Ticks < 3) return false;
+        Fixture.Reset(); return true;
+    }
+};
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMapNameCopyTest, "GitWorkspace.SaveLock.MapFirstSaveAndCopy", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitMapNameCopyTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Map fixture lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    UWorld* Source = F.NewWorld(); const FString OldName = Source->GetPathName(); UObject* OldData = Source->PersistentLevel->MapBuildData;
+    const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    auto Destination = GitWorkspaceSave::ReviewMapDestination(Source, F.Mount + TEXT("L_Named"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Ordinary map and build data review: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.bNameCurrent && Destination.Paths().Num() == 2)) return false;
+    auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths());
+    if (!TestTrue(TEXT("Both absent paths reviewed: ") + Review.Error, Review.IsFresh() && Review.NeedsLock.Num() == 2)) return false;
+    TestFalse(TEXT("No consent acquires neither lock"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestEqual(TEXT("Cancelled naming preserves map identity"), Source->GetPathName(), OldName);
+    TestTrue(TEXT("Cancelled naming preserves build-data object"), Source->PersistentLevel->MapBuildData == OldData);
+    TestTrue(TEXT("Cancelled naming writes nothing"), !IFileManager::Get().FileExists(*Destination.Map.Filename) && !IFileManager::Get().FileExists(*Destination.BuildData.Filename));
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true); if (!TestTrue(TEXT("Both locks acquired: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    UWorld* Named = nullptr; const auto Saved = GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+    if (!TestTrue(TEXT("First map save: ") + Saved.Error, Saved.Ok())) return false;
+    TestTrue(TEXT("First Save names the same live world"), Named == Source && Source->GetPackage()->GetName() == Destination.Map.PackageName);
+    TestTrue(TEXT("First Save keeps and renames the same build data"), Source->PersistentLevel->MapBuildData == OldData && OldData->GetPackage()->GetName() == Destination.BuildData.PackageName);
+    TestTrue(TEXT("Both first-save files exist"), IFileManager::Get().FileExists(*Destination.Map.Filename) && IFileManager::Get().FileExists(*Destination.BuildData.Filename));
+    const auto SourceBytes = Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Destination.Map.Filename}).Text(); const auto DataBytes = Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Destination.BuildData.Filename}).Text();
+    Source->GetWorldSettings()->KillZ = -65432.f; Source->MarkPackageDirty();
+    const FGuid VolumeId = FGuid::NewGuid(); Source->PersistentLevel->LevelBuildDataId = VolumeId;
+    const FBox VolumeBounds(FVector(-100, -200, -300), FVector(100, 200, 300));
+    auto* SourceRegistry = CastChecked<UMapBuildDataRegistry>(OldData);
+    auto& Volume = SourceRegistry->AllocateLevelPrecomputedLightVolumeBuildData(VolumeId);
+    Volume.Initialize(VolumeBounds);
+    FVolumeLightingSample Sample; Sample.Position = FVector3f(12, 34, 56); Sample.Radius = 42; Sample.DirectionalLightShadowing = .37f;
+    Volume.AddHighQualityLightingSample(Sample); Volume.FinalizeSamples();
+    SourceRegistry->LevelLightingQuality = Quality_Production;
+    TestTrue(TEXT("Fixture build data passes engine lighting validity"), SourceRegistry->IsLightingValid(ERHIFeatureLevel::SM5));
+
+    auto CopyDestination = GitWorkspaceSave::ReviewMapDestination(Source, F.Mount + TEXT("L_Copy"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Saved-map copy review"), CopyDestination.Error.IsEmpty() && !CopyDestination.bNameCurrent)) return false;
+    Review = Repo.ReviewAssetSave(CopyDestination.Paths(), TEXT("origin"), CopyDestination.Paths()); Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    if (!TestTrue(TEXT("Copy locks: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    UWorld* Copy = nullptr; const auto Copied = GitWorkspaceSave::WriteMapDestination(Source, CopyDestination, Repo, *Prepared.Permit, Lease, F.Content, Copy); F.Keep(Copy);
+    if (!TestTrue(TEXT("Map copy saved: ") + Copied.Error, Copied.Ok() && Copy)) return false;
+    TestTrue(TEXT("Copy has independent level and build data"), Copy != Source && Copy->PersistentLevel != Source->PersistentLevel && Copy->PersistentLevel->MapBuildData != OldData);
+    TestEqual(TEXT("Copy contains current unsaved map edits"), Copy->GetWorldSettings()->KillZ, -65432.f);
+    auto* VolumeData = Copy->PersistentLevel->MapBuildData->GetLevelPrecomputedLightVolumeBuildData(VolumeId);
+    TestTrue(TEXT("Copy contains independent initialized lighting volume"), VolumeData && VolumeData != &Volume && VolumeData->IsInitialized());
+    if (VolumeData) TestEqual(TEXT("Copy contains edited light-volume bounds"), VolumeData->GetBounds(), VolumeBounds);
+    TestTrue(TEXT("Copy contains edited lighting-quality metadata"), Copy->PersistentLevel->MapBuildData->LevelLightingQuality == Quality_Production);
+    TestTrue(TEXT("Original build-data edits remain dirty"), SourceRegistry->GetPackage()->IsDirty());
+
+    TestTrue(TEXT("Original remains dirty and at the same name"), Source->GetPackage()->IsDirty() && Source->GetPackage()->GetName() == Destination.Map.PackageName);
+    TestEqual(TEXT("Original map bytes unchanged"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Destination.Map.Filename}).Text(), SourceBytes);
+    TestEqual(TEXT("Original build-data bytes unchanged"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Destination.BuildData.Filename}).Text(), DataBytes);
+    const auto Gathered = GitWorkspaceSave::GatherPackageSavePaths({Source->GetPackage()}, Files.Repo, F.Content);
+    TestTrue(TEXT("Ordinary Save prepares map and separate build data"), Gathered.Error.IsEmpty() && Gathered.Paths.Num() == 2 && Gathered.NewPaths.IsEmpty());
+    TestEqual(TEXT("No implicit staging"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("No implicit commit"), Repo.Refresh().Head, Before.Head);
+    TestEqual(TEXT("No implicit stash"), Repo.ListStashes().Fingerprint, Stashes);
+    const auto Locks = Repo.VerifyLocks(TEXT("origin")); TestTrue(TEXT("All four locks remain verified and owned"), Locks.IsFresh() && Locks.Locks.Num() == 4);
+    for (const FString& Path : Destination.Paths()) TestTrue(TEXT("Original lock retained"), Locks.State(Path, true) == GitWorkspace::ELockState::Ours);
+    for (const FString& Path : CopyDestination.Paths()) TestTrue(TEXT("Copy lock retained"), Locks.State(Path, true) == GitWorkspace::ELockState::Ours);
+    // Exercise Unreal's next ordinary save on the named map. It must resolve
+    // its package filename without entering a naming dialog or changing staging.
+    Source->GetWorldSettings()->KillZ = -12345.f; Source->MarkPackageDirty();
+    auto Again = Repo.ReviewAssetSave(Gathered.Paths, TEXT("origin")); Prepared = Repo.PrepareAssetSave(Again, Lease, true);
+    if (!TestTrue(TEXT("Follow-up ordinary save prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    {
+        GitWorkspaceSave::FPreparedScope Scope(Repo, *Prepared.Permit, Lease, Files.Repo);
+        TestTrue(TEXT("Unreal ordinary Save resolves the newly named map"), FEditorFileUtils::SaveLevel(Source->PersistentLevel));
+    }
+    TestFalse(TEXT("Follow-up Save clears map dirty state"), Source->GetPackage()->IsDirty());
+    TestEqual(TEXT("Follow-up Save preserves index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMapBoundaryTest, "GitWorkspace.SaveLock.MapDestinationsAndDrift", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitMapBoundaryTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); UWorld* World = F.NewWorld(false);
+    const FString PackageName = F.Mount + TEXT("L_Probe");
+    auto ReviewDestination = [&] { return GitWorkspaceSave::ReviewMapDestination(World, PackageName, Files.Repo, F.Content); };
+    TestTrue(TEXT("Ordinary map without build data needs one path"), ReviewDestination().Paths().Num() == 1 && ReviewDestination().Error.IsEmpty());
+    FString DataFile; FPackageName::TryConvertLongPackageNameToFilename(PackageName + TEXT("_BuiltData"), DataFile, TEXT(".uasset"));
+    FFileHelper::SaveStringToFile(TEXT("orphan companion data"), *DataFile);
+    TestFalse(TEXT("Orphan build data refuses even data-free source"), ReviewDestination().Error.IsEmpty());
+    TestTrue(TEXT("Orphan data not removed"), IFileManager::Get().FileExists(*DataFile)); IFileManager::Get().Delete(*DataFile);
+    FString External; FPackageName::TryConvertLongPackageNameToFilename(ULevel::GetExternalActorsPath(PackageName), External);
+    IFileManager::Get().MakeDirectory(*External, true);
+    TestFalse(TEXT("Orphan actor folder refuses destination"), ReviewDestination().Error.IsEmpty()); IFileManager::Get().DeleteDirectory(*External, false, true);
+    World->GetWorldSettings()->SetWorldPartition(NewObject<UWorldPartition>(World));
+    TestFalse(TEXT("World Partition refused before naming and acquisition"), ReviewDestination().Error.IsEmpty());
+    World->GetWorldSettings()->SetWorldPartition(nullptr);
+    World->PersistentLevel->SetUseExternalActors(true);
+    TestFalse(TEXT("OFPA refused before naming"), ReviewDestination().Error.IsEmpty()); World->PersistentLevel->SetUseExternalActors(false);
+    World->WorldComposition = NewObject<UWorldComposition>(World);
+    TestFalse(TEXT("World Composition refused before naming"), ReviewDestination().Error.IsEmpty()); World->WorldComposition = nullptr;
+    TestFalse(TEXT("Save All cannot open an unreviewed temporary-map naming route"), GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content).Error.IsEmpty());
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Boundary fixture lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    const auto Destination = ReviewDestination(); const auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths());
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true); if (!TestTrue(TEXT("Boundary reservation"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    World->PersistentLevel->GetOrCreateMapBuildData();
+    UWorld* Written = nullptr;
+    TestFalse(TEXT("Build-data association drift refuses before mutation"), GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Written).Ok());
+    TestTrue(TEXT("Drift leaves current map unnamed and writes nothing"), !Written && FPackageName::IsTempPackage(World->GetPackage()->GetName()) && !IFileManager::Get().FileExists(*Destination.Map.Filename));
+    TestTrue(TEXT("Reservation remains held for review/recovery"), Repo.VerifyLocks(TEXT("origin")).State(Destination.Map.Path, true) == GitWorkspace::ELockState::Ours);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMapPartialTest, "GitWorkspace.SaveLock.MapPartialFailures", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitMapPartialTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); UWorld* World = F.NewWorld(); const FString SourceName = World->GetPathName();
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Partial fixture lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    const auto Destination = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_Partial"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Partial destination valid"), Destination.Error.IsEmpty())) return false;
+    const auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths());
+    FFileHelper::SaveStringToFile(Destination.BuildData.Path, *FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    TestFalse(TEXT("One failed lock cancels preparation"), Prepared.Result.Ok());
+    TestTrue(TEXT("Partial acquisition retains map lock without renaming or writing"), Prepared.AcquiredPaths.Num() == 1 && World->GetPathName() == SourceName && !IFileManager::Get().FileExists(*Destination.Map.Filename) && !IFileManager::Get().FileExists(*Destination.BuildData.Filename));
+    IFileManager::Get().Delete(*FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+    const auto RetryReview = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths()); Prepared = Repo.PrepareAssetSave(RetryReview, Lease, true);
+    if (!TestTrue(TEXT("Retry completes both reservations"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    auto Guard = FCoreUObjectDelegates::IsPackageOKToSaveDelegate;
+    ON_SCOPE_EXIT { FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard; };
+    FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([Guard](UPackage* Package, const FString& File, FOutputDevice* Output)
+    { return !File.EndsWith(TEXT(".umap")) && (!Guard.IsBound() || Guard.Execute(Package, File, Output)); });
+    UWorld* Named = nullptr; const auto Saved = GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+    TestFalse(TEXT("Map writer failure is reported"), Saved.Ok());
+    TestTrue(TEXT("Named map with unsaved edits remains available"), Named == World && World->GetPackage()->IsDirty() && World->GetPackage()->GetName() == Destination.Map.PackageName);
+    TestTrue(TEXT("Completed dependency retained, map absent"), IFileManager::Get().FileExists(*Destination.BuildData.Filename) && !IFileManager::Get().FileExists(*Destination.Map.Filename));
+    const auto Gathered = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    TestTrue(TEXT("Ordinary Save retry reviews both files and only absent map as new"), Gathered.Error.IsEmpty() && Gathered.Paths.Num() == 2 && Gathered.NewPaths.Num() == 1 && Gathered.NewPaths.Contains(Destination.Map.Path));
+    TestTrue(TEXT("Both locks retained after partial save"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == 2);
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveLockReviewTest, "GitWorkspace.SaveLock.CancelDriftAndOwnership", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitSaveLockReviewTest::RunTest(const FString&)
 {
