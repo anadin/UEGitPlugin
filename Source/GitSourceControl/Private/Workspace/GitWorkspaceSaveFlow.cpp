@@ -4,6 +4,9 @@
 #include "GitSourceControlSettings.h"
 #include "Async/Async.h"
 #include "Editor.h"
+#include "ContentBrowserModule.h"
+#include "IContentBrowserSingleton.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 #include "Engine/World.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
@@ -25,6 +28,7 @@
 #include "HAL/FileManager.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/Package.h"
+#include "UObject/StrongObjectPtr.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
 #endif
@@ -147,7 +151,7 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
             const FString Path = Relative(File, ProjectRepositoryRoot);
             Result = Async(EAsyncExecution::ThreadPool, [Repo, Path] { return Repo->IsLockableAsset(Path); }).Get();
             if (Result.Code == 1) return true;
-            if (Result.Ok()) Result.Error = TEXT("Use Save, Save All or Git Workspace Save assets to prepare this exact asset destination. Name new assets in game Content before saving. Save As destinations need separate integration; Make Writable cannot grant lock ownership.");
+            if (Result.Ok()) Result.Error = TEXT("Use Save, Save All or Git Workspace Save assets to prepare this exact asset destination. Standard Blueprint and Texture2D editors also support reviewed Save As copies. Other naming/custom routes require separate integration; Make Writable cannot grant lock ownership.");
         }
     }
     if (!Result.Error.IsEmpty() || !Result.Ok())
@@ -164,7 +168,7 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
     }
     return true;
 }
-bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review)
+bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review, const FString& Introduction = FString())
 {
     bool bConfirmed = false;
     const auto Window = SNew(SWindow).Title(SaveText(TEXT("Lock assets before saving"))).ClientSize(FVector2D(720, 480)).SupportsMinimize(false).SupportsMaximize(false);
@@ -172,7 +176,7 @@ bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review)
     TSharedPtr<SButton> CancelButton;
     Window->SetContent(SNew(SBorder).Padding(12)[SNew(SVerticalBox)
         + SVerticalBox::Slot().FillHeight(1)
-        [SNew(SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(SaveText(Review.Text()))]
+        [SNew(SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(SaveText(Introduction + Review.Text()))]
         + SVerticalBox::Slot().AutoHeight().Padding(0, 12)
         [SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth()
@@ -185,6 +189,59 @@ bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review)
     Window->SetWidgetToFocusOnActivate(CancelButton);
     FSlateApplication::Get().AddModalWindow(Window, FSlateApplication::Get().GetActiveTopLevelWindow());
     return bConfirmed;
+}
+void ExecuteSaveAs(UObject* Source, const FExecuteAction& OriginalAction)
+{
+    if (!UsesWorkspace()) { OriginalAction.ExecuteIfBound(); return; }
+    if (bBusy) return;
+    TGuardValue<bool> Busy(bBusy, true);
+    if (!ProjectRepo) { Blocked(TEXT("Git Workspace save protection is not ready.")); return; }
+    auto Repo = ProjectRepo;
+    const auto Local = Async(EAsyncExecution::ThreadPool, [Repo] { return Repo->Refresh(); }).Get();
+    if (Local.Root.IsEmpty()) { OriginalAction.ExecuteIfBound(); return; }
+    if (!Local.bValid) { Blocked(Local.Error); return; }
+    if (!SupportsAssetCopy(Source)) { Blocked(TEXT("Guarded Save As requires one ordinary Blueprint or Texture2D in its standard asset editor.")); return; }
+    TStrongObjectPtr<UObject> HoldSource(Source);
+    const FString Content = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
+    FSaveAssetDialogConfig Config; Config.DialogTitleOverride = SaveText(TEXT("Save asset copy as"));
+    Config.DefaultPath = FPackageName::GetLongPackagePath(Source->GetOutermost()->GetName());
+    if (!Config.DefaultPath.StartsWith(TEXT("/Game"))) Config.DefaultPath = TEXT("/Game");
+    Config.DefaultAssetName = Source->GetName() + TEXT("_Copy"); Config.AssetClassNames.Add(Source->GetClass()->GetClassPathName());
+    Config.ExistingAssetPolicy = ESaveAssetDialogExistingAssetPolicy::Disallow;
+    const FString ObjectPath = FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get().CreateModalSaveAssetDialog(Config);
+    if (ObjectPath.IsEmpty()) return;
+    const auto Destination = ReviewCopyDestination(Source, FPackageName::ObjectPathToPackageName(ObjectPath), Local.Root, Content);
+    if (!Destination.Error.IsEmpty()) { Blocked(Destination.Error); return; }
+    const FString Remote = LockRemote(), Path = Destination.Path;
+    GitWorkspace::FAssetSaveReview Review;
+    {
+        FScopedSlowTask Task(1.f, SaveText(TEXT("Verifying the Save As destination and locks…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
+        Review = Async(EAsyncExecution::ThreadPool, [Repo, Path, Remote] { return Repo->ReviewAssetSave({Path}, Remote, {Path}); }).Get();
+    }
+    if (!Review.IsFresh()) { Blocked(Review.Error); return; }
+    if (Review.Paths.IsEmpty()) { Blocked(TEXT("Guarded Save As requires an LFS/lockable destination. Review this project's .gitattributes first.")); return; }
+    // Always review the chosen copy destination, including a held absent-path reservation.
+    if (!ConfirmLocks(Review, TEXT("Save As creates a new copy of ") + Source->GetPathName() + TEXT(".\nThe original stays open; its unsaved edits are not saved.\n\n"))) return;
+#if PLATFORM_MAC
+    GitWorkspaceSession::FEditorWriteScope Access; FString Error;
+    if (!Access.Acquire(Review.Local.Root, Error)) { Blocked(Error); return; }
+    GitWorkspace::FAssetSavePreparation Prepared;
+    {
+        FScopedSlowTask Task(1.f, SaveText(TEXT("Reserving the Save As destination before copying…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
+        Prepared = Async(EAsyncExecution::ThreadPool, [Repo, Review, &Access] { return Repo->PrepareAssetSave(Review, Access.Lease(), true); }).Get();
+    }
+    if (!Prepared.Result.Ok() || !Prepared.Permit) { Blocked(Prepared.Result.Error); return; }
+    UObject* Copy = nullptr;
+    const auto Written = WriteAssetCopy(Source, Destination, *Repo, *Prepared.Permit, Access.Lease(), Content, Copy);
+    // Keep the original editor and its edits open. A failed copy is also kept
+    // in memory and can use the ordinary, already-locked Save retry.
+    if (Copy && GEditor) GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Copy);
+    if (!Written.Ok()) { Blocked(Written.Error); return; }
+    FNotificationInfo Notice(SaveText(TEXT("Asset copy saved and locked. The original stays open. Stage the new file when ready.")));
+    Notice.ExpireDuration = 8.f; FSlateNotificationManager::Get().AddNotification(Notice);
+#else
+    Blocked(TEXT("Guarded Save As is currently available on Mac only."));
+#endif
 }
 void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Original)
 {
@@ -294,6 +351,16 @@ void WrapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInf
     for (const auto& Entry : Commands) if (Entry.List.Pin() == List && Entry.Command == Command && Entry.Handle == Action->ExecuteAction.GetHandle()) return;
     const FUIAction Original = *Action; FUIAction Wrapper = Original;
     Wrapper.ExecuteAction = FExecuteAction::CreateLambda([GetPackages, Execute = Original.ExecuteAction] { ExecuteSave(GetPackages(), Execute); });
+    Commands.Add({List, Command, Original, Wrapper.ExecuteAction.GetHandle()}); List->MapAction(Command, Wrapper);
+}
+void WrapSaveAsCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<UObject*()> GetSource)
+{
+    if (!Command) return;
+    const FUIAction* Action = List->GetActionForCommand(Command);
+    if (!Action || !Action->ExecuteAction.IsBound()) return;
+    for (const auto& Entry : Commands) if (Entry.List.Pin() == List && Entry.Command == Command && Entry.Handle == Action->ExecuteAction.GetHandle()) return;
+    const FUIAction Original = *Action; FUIAction Wrapper = Original;
+    Wrapper.ExecuteAction = FExecuteAction::CreateLambda([GetSource, Execute = Original.ExecuteAction] { ExecuteSaveAs(GetSource(), Execute); });
     Commands.Add({List, Command, Original, Wrapper.ExecuteAction.GetHandle()}); List->MapAction(Command, Wrapper);
 }
 void RestoreCommands()

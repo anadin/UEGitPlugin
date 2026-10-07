@@ -41,6 +41,15 @@ bool FGitSaveCommandTest::RunTest(const FString&)
     FUIAction Replacement(FExecuteAction::CreateLambda([] {})); List->MapAction(Command, Replacement);
     GitWorkspaceSave::RestoreCommands();
     TestTrue(TEXT("Another plugin replacement is preserved"), List->GetActionForCommand(Command)->ExecuteAction.GetHandle() == Replacement.ExecuteAction.GetHandle());
+    List->MapAction(Command, Original);
+    GitWorkspaceSave::WrapSaveAsCommand(List, Command, []() -> UObject* { return nullptr; });
+    const auto SaveAs = *List->GetActionForCommand(Command);
+    TestTrue(TEXT("Save As keeps dynamic enable/check delegates"), SaveAs.CanExecuteAction.Execute() && SaveAs.GetActionCheckState.Execute() == ECheckBoxState::Checked);
+    TestFalse(TEXT("Save As keeps original visibility"), SaveAs.IsActionVisibleDelegate.Execute());
+    GitWorkspaceSave::WrapSaveAsCommand(List, Command, []() -> UObject* { return nullptr; });
+    TestTrue(TEXT("Save As is only wrapped once"), List->GetActionForCommand(Command)->ExecuteAction.GetHandle() == SaveAs.ExecuteAction.GetHandle());
+    GitWorkspaceSave::RestoreCommands();
+    TestTrue(TEXT("Save As original action restored on shutdown"), List->GetActionForCommand(Command)->ExecuteAction.GetHandle() == Original.ExecuteAction.GetHandle());
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveGuardChainTest, "GitWorkspace.SaveLock.EditorPermissionChain", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

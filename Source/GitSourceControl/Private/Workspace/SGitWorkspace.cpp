@@ -535,7 +535,7 @@ FText SGitWorkspace::LockHint() const
     if (State == GitWorkspace::ELockState::Ours) return Text(TEXT("You own this lock. Push keeps it; Unlock is a separate handoff."));
     if (State == GitWorkspace::ELockState::Theirs) return Text(TEXT("Another user owns this lock. Verify locks to refresh ownership."));
     return Text(File.bUntracked
-        ? TEXT("New saved asset: Lock asset verifies the server and reserves this path. It does not stage, commit or push the asset. Automatic locking is not enabled.")
+        ? TEXT("New saved asset: use Save to review locking before the next write, or Lock asset to reserve this path now. Saving and locking retain locks and never stage, commit or push the asset.")
         : TEXT("Lock asset verifies the server and requests a lock. Verify locks only checks ownership; it does not acquire a lock."));
 }
 

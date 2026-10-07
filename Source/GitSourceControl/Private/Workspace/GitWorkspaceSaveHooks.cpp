@@ -48,6 +48,15 @@ bool UpdateHooks(float)
                 }
                 return Packages;
             });
+            // These built-in editors use the base Save As action. Editors with
+            // subclass apply/compile/rename behavior need their own integration.
+            if (Editor->GetToolkitFName() == FName(TEXT("BlueprintEditor")) || Editor->GetToolkitFName() == FName(TEXT("TextureEditor")))
+                WrapSaveAsCommand(Editor->GetToolkitCommands(), FInputBindingManager::Get().FindCommandInContext(TEXT("AssetEditor"), TEXT("SaveAssetAs")), [Weak]() -> UObject*
+                {
+                    if (auto Live = Weak.Pin())
+                        if (const auto* Objects = Live->GetObjectsCurrentlyBeingEdited(); Objects && Objects->Num() == 1) return (*Objects)[0];
+                    return nullptr;
+                });
         }
     }
     return true;

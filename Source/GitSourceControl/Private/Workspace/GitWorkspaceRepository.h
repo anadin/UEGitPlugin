@@ -218,6 +218,7 @@ class FAssetSavePermit
 {
 public:
     bool ContainsPath(const FString& Path) const { return Review.Paths.Contains(Path); }
+    bool ContainsNewPath(const FString& Path) const { return Review.NewPaths.Contains(Path); }
 private:
     friend class FRepository;
     FAssetSaveReview Review;

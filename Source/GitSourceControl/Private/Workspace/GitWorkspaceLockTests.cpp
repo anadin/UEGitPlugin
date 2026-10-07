@@ -317,6 +317,163 @@ bool FGitFirstSavePackageTest::RunTest(const FString&)
     TestTrue(TEXT("Next save uses owned existing assets without acquisition"), Subsequent.IsFresh() && Subsequent.NewPaths.IsEmpty() && Subsequent.NeedsLock.IsEmpty());
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveAsCopiesTest, "GitWorkspace.SaveLock.SaveAsBlueprintAndTexture", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSaveAsCopiesTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Copy server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Mount = TEXT("/GitCopyFixture") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    const FString Content = FPaths::Combine(F.Repo, TEXT("Content/"));
+    FPackageName::RegisterMountPoint(Mount, Content); IFileManager::Get().MakeDirectory(*Content, true);
+    TStrongObjectPtr<UBlueprint> Blueprint(FKismetEditorUtilities::CreateBlueprint(AActor::StaticClass(), CreatePackage(*(Mount + TEXT("BP_Original"))), TEXT("BP_Original"), BPTYPE_Normal, UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass()));
+    TStrongObjectPtr<UTexture2D> Texture(NewObject<UTexture2D>(CreatePackage(*(Mount + TEXT("T_Original"))), TEXT("T_Original"), RF_Public | RF_Standalone));
+    TArray<UObject*> Copies;
+    ON_SCOPE_EXIT
+    {
+        GitWorkspaceSave::RemoveGuard();
+        TArray<UObject*> Objects = Copies; Objects.Add(Blueprint.Get()); Objects.Add(Texture.Get());
+        for (UObject* Object : Objects) if (Object) { Object->GetPackage()->SetDirtyFlag(false); Object->GetPackage()->SetFlags(RF_Transient); Object->ClearFlags(RF_Public | RF_Standalone); }
+        FPackageName::UnRegisterMountPoint(Mount, Content);
+    };
+    if (!TestNotNull(TEXT("Original Blueprint"), Blueprint.Get())) return false;
+    Blueprint->BlueprintDescription = TEXT("saved source A");
+    Blueprint->GeneratedClass->GetDefaultObject<AActor>()->Tags = {FName(TEXT("SavedSourceA"))};
+    const uint8 PixelA[4] = {255, 0, 0, 255}, PixelB[4] = {0, 255, 0, 255}; Texture->Source.Init(1, 1, 1, 1, TSF_BGRA8, PixelA);
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    const TArray<UObject*> Sources {Blueprint.Get(), Texture.Get()}; TArray<TArray<uint8>> SourceBytes;
+    for (UObject* Source : Sources)
+    {
+        const FString Filename = FPaths::Combine(Content, Source->GetName() + TEXT(".uasset"));
+        if (!TestTrue(TEXT("Save source fixture"), UPackage::SavePackage(Source->GetPackage(), Source, *Filename, Args))) return false;
+        TArray<uint8> Bytes; FFileHelper::LoadFileToArray(Bytes, *Filename); SourceBytes.Add(Bytes);
+    }
+    F.Call({TEXT("add"), TEXT("Content")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("copy sources A")});
+    GitWorkspace::FRepository Repo(F.Git, F.Repo);
+    const FString SourcePath = TEXT("Content/BP_Original.uasset");
+    if (!TestTrue(TEXT("Acquire original Blueprint lock"), Repo.ChangeLock(Repo.VerifyLocks(TEXT("origin")), SourcePath, false).Ok())) return false;
+    const FString OriginalLockId = Repo.VerifyLocks(TEXT("origin")).Locks[SourcePath].Id;
+    Blueprint->BlueprintDescription = TEXT("unsaved source B must be copied without saving A"); Blueprint->MarkPackageDirty();
+    Blueprint->GeneratedClass->GetDefaultObject<AActor>()->Tags = {FName(TEXT("UnsavedCopyB"))};
+    Texture->Source.Init(1, 1, 1, 1, TSF_BGRA8, PixelB); Texture->MarkPackageDirty();
+    for (UObject* Source : Sources) FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*FPaths::Combine(Content, Source->GetName() + TEXT(".uasset")), true);
+    const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Copy lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    GitWorkspaceSave::InstallGuard();
+    for (int32 I = 0; I < Sources.Num(); ++I)
+    {
+        UObject* Source = Sources[I]; const FString OriginalName = Source->GetPathName();
+        const auto Destination = GitWorkspaceSave::ReviewCopyDestination(Source, Mount + Source->GetName() + TEXT("_Copy"), F.Repo, Content);
+        if (!TestTrue(TEXT("Absent copy destination: ") + Destination.Error, Destination.Error.IsEmpty())) return false;
+        const auto Review = Repo.ReviewAssetSave({Destination.Path}, TEXT("origin"), {Destination.Path});
+        const auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+        if (!TestTrue(TEXT("Copy reservation prepared: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+        TestNull(TEXT("No copy exists before reservation"), FindPackage(nullptr, *Destination.PackageName));
+        TestFalse(TEXT("No placeholder before copy"), IFileManager::Get().FileExists(*Destination.Filename));
+        const FString CopyLockId = Repo.VerifyLocks(TEXT("origin")).Locks[Destination.Path].Id;
+        UObject* Copy = nullptr;
+        const auto Written = GitWorkspaceSave::WriteAssetCopy(Source, Destination, Repo, *Prepared.Permit, Lease, Content, Copy);
+        if (Copy) Copies.Add(Copy);
+        if (!TestTrue(TEXT("Real copy writer: ") + Written.Error, Written.Ok() && Copy)) return false;
+        TestTrue(TEXT("Copy file saved"), IFileManager::Get().FileSize(*Destination.Filename) > 0);
+        TestFalse(TEXT("Saved copy is clean in memory"), Copy->GetPackage()->IsDirty());
+        TestEqual(TEXT("Original name is not changed"), Source->GetPathName(), OriginalName);
+        TestTrue(TEXT("Original unsaved memory remains dirty"), Source->GetPackage()->IsDirty());
+        if (I == 0)
+        {
+            const auto* BP = CastChecked<UBlueprint>(Copy);
+            TestEqual(TEXT("Copy contains edited Blueprint actor defaults B"), BP->GeneratedClass->GetDefaultObject<AActor>()->Tags, Blueprint->GeneratedClass->GetDefaultObject<AActor>()->Tags);
+            TestEqual(TEXT("Original Blueprint description remains edited"), Blueprint->BlueprintDescription, FString(TEXT("unsaved source B must be copied without saving A")));
+            TestTrue(TEXT("Unreal's DuplicateTransient description rule is retained"), BP->BlueprintDescription.IsEmpty());
+        }
+        else
+        {
+            TArray64<uint8> Pixels;
+            TestTrue(TEXT("Texture copy contains edited green source pixels"), CastChecked<UTexture2D>(Copy)->Source.GetMipData(Pixels, 0) && Pixels.Num() == 4 && FMemory::Memcmp(Pixels.GetData(), PixelB, 4) == 0);
+        }
+        TArray<uint8> After; const FString SourceFile = FPaths::Combine(Content, Source->GetName() + TEXT(".uasset")); FFileHelper::LoadFileToArray(After, *SourceFile);
+        TestEqual(TEXT("Original saved bytes A preserved"), After, SourceBytes[I]);
+        TestTrue(TEXT("Original file stays read only"), IFileManager::Get().IsReadOnly(*SourceFile));
+        const auto Locks = Repo.VerifyLocks(TEXT("origin"));
+        TestTrue(TEXT("Exact copy lock remains owned"), Locks.Locks.Contains(Destination.Path) && Locks.Locks[Destination.Path].Id == CopyLockId && Locks.Locks[Destination.Path].bOurs);
+        const auto State = Repo.Refresh();
+        TestTrue(TEXT("New copy is untracked"), State.Files.ContainsByPredicate([&](const GitWorkspace::FFile& File) { return File.Path == Destination.Path && File.bUntracked; }));
+        TestEqual(TEXT("Save As does not stage"), State.IndexEntries, Before.IndexEntries);
+        TestEqual(TEXT("Save As does not commit"), State.Head, Before.Head);
+        TestEqual(TEXT("Save As preserves stashes"), Repo.ListStashes().Fingerprint, Stashes);
+    }
+    const auto FinalLocks = Repo.VerifyLocks(TEXT("origin"));
+    TestTrue(TEXT("Original Blueprint lock is unchanged"), FinalLocks.Locks.Contains(SourcePath) && FinalLocks.Locks[SourcePath].Id == OriginalLockId);
+    TestFalse(TEXT("Copying an unlocked texture does not acquire its source lock"), FinalLocks.Locks.Contains(TEXT("Content/T_Original.uasset")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveAsRefusalTest, "GitWorkspace.SaveLock.SaveAsCancellationAndRefusal", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitSaveAsRefusalTest::RunTest(const FString&)
+{
+    FLockFixture F; if (!TestFalse(TEXT("Copy refusal server started"), F.Endpoint.IsEmpty())) return false;
+    const FString Mount = TEXT("/GitCopyRefusal") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT("/");
+    const FString Content = FPaths::Combine(F.Repo, TEXT("Content/")); IFileManager::Get().MakeDirectory(*Content, true); FPackageName::RegisterMountPoint(Mount, Content);
+    TStrongObjectPtr<UTexture2D> Source(NewObject<UTexture2D>(CreatePackage(*(Mount + TEXT("T_Original"))), TEXT("T_Original"), RF_Public | RF_Standalone));
+    const uint8 Pixel[4] = {0, 255, 0, 255}; Source->Source.Init(1, 1, 1, 1, TSF_BGRA8, Pixel); Source->MarkPackageDirty();
+    TArray<UObject*> Copies;
+    auto Previous = FCoreUObjectDelegates::IsPackageOKToSaveDelegate;
+    ON_SCOPE_EXIT
+    {
+        GitWorkspaceSave::RemoveGuard(); FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Previous;
+        Copies.Add(Source.Get());
+        for (UObject* Copy : Copies) if (Copy) { Copy->GetPackage()->SetDirtyFlag(false); Copy->GetPackage()->SetFlags(RF_Transient); Copy->ClearFlags(RF_Public | RF_Standalone); }
+        FPackageName::UnRegisterMountPoint(Mount, Content);
+    };
+    GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh();
+    const auto D = GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Mount + TEXT("T_Copy"), F.Repo, Content);
+    if (!TestTrue(TEXT("Copy destination reviewed: ") + D.Error, D.Error.IsEmpty())) return false;
+    TestFalse(TEXT("Same name cannot overwrite source memory"), GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Source->GetPackage()->GetName(), F.Repo, Content).Error.IsEmpty());
+    TestFalse(TEXT("Invalid/escaping package name refused"), GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Mount + TEXT("../T_Copy"), F.Repo, Content).Error.IsEmpty());
+    TestFalse(TEXT("Destination outside game Content refused"), GitWorkspaceSave::ReviewCopyDestination(Source.Get(), TEXT("/Engine/T_Copy"), F.Repo, Content).Error.IsEmpty());
+    const FString LinkTarget = FPaths::Combine(F.Repo, TEXT("OtherFolder")), Link = FPaths::Combine(Content, TEXT("Link"));
+    IFileManager::Get().MakeDirectory(*LinkTarget, true); symlink(TCHAR_TO_UTF8(*LinkTarget), TCHAR_TO_UTF8(*Link));
+    const auto Linked = GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Mount + TEXT("Link/T_Copy"), Repo.Refresh().Root, Content);
+    TestTrue(TEXT("Root normalization keeps an inner symlink literal"), Linked.Error.IsEmpty() && Linked.Path == TEXT("Content/Link/T_Copy.uasset"));
+    TestFalse(TEXT("Service still refuses normalized copy through a symlink"), Repo.ReviewAssetSave({Linked.Path}, TEXT("origin"), {Linked.Path}).IsFresh());
+    FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Copy refusal lease"), Lease.Acquire(F.Repo, true, Error))) return false;
+    const bool bFolderBeforeReview = IFileManager::Get().DirectoryExists(*Content);
+    const auto Review = Repo.ReviewAssetSave({D.Path}, TEXT("origin"), {D.Path});
+    if (!TestTrue(TEXT("New copy review: ") + Review.Error, Review.IsFresh())) return false;
+    TestFalse(TEXT("Cancelled review issues no permit"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestNull(TEXT("Cancelled review creates no copy"), FindPackage(nullptr, *D.PackageName));
+    TestFalse(TEXT("Cancelled review creates no file"), IFileManager::Get().FileExists(*D.Filename));
+    TestEqual(TEXT("Cancelled review preserves existing folder state"), IFileManager::Get().DirectoryExists(*Content), bFolderBeforeReview);
+    TestTrue(TEXT("Cancelled review reserves no server lock"), Repo.VerifyLocks(TEXT("origin")).Locks.IsEmpty());
+    const auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+    if (!TestTrue(TEXT("Copy refusal permit: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    UObject* Copy = nullptr; auto Forged = D; Forged.Filename += TEXT(".wrong");
+    TestFalse(TEXT("Forged destination cannot duplicate"), GitWorkspaceSave::WriteAssetCopy(Source.Get(), Forged, Repo, *Prepared.Permit, Lease, Content, Copy).Ok());
+    TestNull(TEXT("Forged destination leaves copy absent"), Copy);
+    F.Mode(TEXT("offline"));
+    TestFalse(TEXT("Offline verification cancels before duplication"), GitWorkspaceSave::WriteAssetCopy(Source.Get(), D, Repo, *Prepared.Permit, Lease, Content, Copy).Ok());
+    TestNull(TEXT("Offline verification creates no package"), FindPackage(nullptr, *D.PackageName));
+    F.Mode(TEXT("")); IFileManager::Get().MakeDirectory(*Content, true); F.Write(D.Path, TEXT("external occupied bytes\n"));
+    TestFalse(TEXT("Appearing file cancels before duplication"), GitWorkspaceSave::WriteAssetCopy(Source.Get(), D, Repo, *Prepared.Permit, Lease, Content, Copy).Ok());
+    FString External; FFileHelper::LoadFileToString(External, *D.Filename); TestEqual(TEXT("Occupied bytes preserved"), External, FString(TEXT("external occupied bytes\n"))); IFileManager::Get().Delete(*D.Filename);
+    TStrongObjectPtr<UTexture2D> Occupied(NewObject<UTexture2D>(CreatePackage(*D.PackageName), TEXT("T_Copy"), RF_Public | RF_Standalone));
+    TestFalse(TEXT("In-memory destination is refused"), GitWorkspaceSave::WriteAssetCopy(Source.Get(), D, Repo, *Prepared.Permit, Lease, Content, Copy).Ok());
+    TestNull(TEXT("In-memory collision creates no replacement"), Copy);
+    Copies.Add(Occupied.Get());
+    const auto Retry = GitWorkspaceSave::ReviewCopyDestination(Source.Get(), Mount + TEXT("T_Retry"), F.Repo, Content);
+    const auto RetryPrepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave({Retry.Path}, TEXT("origin"), {Retry.Path}), Lease, true);
+    if (!TestTrue(TEXT("Second destination prepared"), RetryPrepared.Result.Ok() && RetryPrepared.Permit)) return false;
+    FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([](UPackage*, const FString&, FOutputDevice*) { return false; }); GitWorkspaceSave::InstallGuard();
+    const auto Failed = GitWorkspaceSave::WriteAssetCopy(Source.Get(), Retry, Repo, *RetryPrepared.Permit, Lease, Content, Copy);
+    if (Copy) Copies.Add(Copy);
+    TestFalse(TEXT("Engine writer veto is retained"), Failed.Ok());
+    TestTrue(TEXT("Failed writer retains unsaved copy for Save retry"), Copy && Copy->GetPackage()->IsDirty() && Failed.Error.Contains(TEXT("use Save to retry")));
+    TestFalse(TEXT("Failed writer creates no saved copy"), IFileManager::Get().FileExists(*Retry.Filename));
+    TestTrue(TEXT("Original unsaved texture survives all refusals"), Source->GetPackage()->IsDirty());
+    TestEqual(TEXT("Refusals preserve original package name"), Source->GetPackage()->GetName(), Mount + TEXT("T_Original"));
+    const auto Locks = Repo.VerifyLocks(TEXT("origin")); TestTrue(TEXT("Failed copy retains reservation"), Locks.Locks.Contains(Retry.Path) && Locks.Locks[Retry.Path].bOurs);
+    TestEqual(TEXT("Refusals preserve HEAD"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Refusals preserve index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    return true;
+}
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSaveLockPackageTest, "GitWorkspace.SaveLock.RealPackageWriteGuard", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitSaveLockPackageTest::RunTest(const FString&)
 {
