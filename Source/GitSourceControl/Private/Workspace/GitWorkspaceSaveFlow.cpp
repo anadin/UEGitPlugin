@@ -10,6 +10,7 @@
 #include "Engine/World.h"
 #include "Engine/Level.h"
 #include "Engine/MapBuildDataRegistry.h"
+#include "GameFramework/Actor.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "FileHelpers.h"
@@ -55,6 +56,8 @@ struct FActiveSave
     const GitWorkspaceSession::FLease* Lease;
     FString Root;
     TSet<FString> Attempted;
+    const FPackageSavePaths* ActorPlan;
+    FString ExpectedWrite;
 };
 TOptional<FActiveSave> ActiveSave;
 #endif
@@ -100,12 +103,6 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
 #else
     if (ProjectRepositoryRoot.IsEmpty()) return true;
 #endif
-    if (Inside(File, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir())) &&
-        (File.Contains(TEXT("/__ExternalActors__/")) || File.Contains(TEXT("/__ExternalObjects__/"))))
-    {
-        UE_LOG(LogGitWorkspaceSave, Warning, TEXT("Git Workspace requires a coordinated external package save workflow."));
-        return false;
-    }
     if (!File.EndsWith(TEXT(".uasset")) && !File.EndsWith(TEXT(".umap"))) return true;
     bool bReviewedExistingFile = false;
 #if PLATFORM_MAC
@@ -120,7 +117,23 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
     if (!bReviewedExistingFile && !bInPreparedRepository && !Inside(File, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()))) return true;
     GitWorkspace::FResult Result; Result.Code = 0;
 #if PLATFORM_MAC
-    if (ActiveSave.IsSet() && Inside(File, ActiveSave->Root))
+    if (ActiveSave.IsSet() && ActiveSave->ActorPlan && Relative(File, ActiveSave->Root) != ActiveSave->ExpectedWrite)
+        Result.Error = TEXT("Only the coordinator's current package write is authorized. A save callback cannot expand this batch.");
+#endif
+    if (File.Contains(TEXT("/__ExternalActors__/")) || File.Contains(TEXT("/__ExternalObjects__/")))
+    {
+#if PLATFORM_MAC
+        const FString Path = ActiveSave.IsSet() ? Relative(File, ActiveSave->Root) : FString();
+        if (!Result.Error.IsEmpty()) { /* Preserve the coordinator's refusal. */ }
+        else if (!ActiveSave.IsSet() || !ActiveSave->ActorPlan || !ActiveSave->Permit->ContainsExternalActorPath(Path))
+            Result.Error = TEXT("External packages require a coordinated, existing-actor save.");
+        else Result.Error = ValidateExternalActorBinding(*ActiveSave->ActorPlan, Path, Package);
+#else
+        Result.Error = TEXT("Coordinated external actor saves are currently available on Mac only.");
+#endif
+    }
+#if PLATFORM_MAC
+    if (Result.Error.IsEmpty() && ActiveSave.IsSet() && Inside(File, ActiveSave->Root))
     {
         const FString Path = Relative(File, ActiveSave->Root);
         auto* Repo = ActiveSave->Repo;
@@ -144,7 +157,7 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
     }
     else
 #endif
-    if (UsesWorkspace() && Inside(File, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir())))
+    if (Result.Error.IsEmpty() && UsesWorkspace() && Inside(File, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir())))
     {
         if (!ProjectRepo) Result.Error = TEXT("Git Workspace save protection is not ready.");
         else
@@ -315,16 +328,23 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     const auto Destinations = GatherPackageSavePaths(Packages, Local.Root, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
     if (!Destinations.Error.IsEmpty()) { Blocked(Destinations.Error); return; }
     const auto& Paths = Destinations.Paths; const auto& NewPaths = Destinations.NewPaths;
-    if (Paths.IsEmpty()) { Original.ExecuteIfBound(); return; }
+    if (Paths.IsEmpty()) { if (!Destinations.bCoordinatedActors) Original.ExecuteIfBound(); return; }
     const FString Remote = LockRemote();
     GitWorkspace::FAssetSaveReview Review;
     {
         FScopedSlowTask Task(1.f, SaveText(TEXT("Verifying asset locks before saving…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
-        Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, NewPaths, Remote] { return Repo->ReviewAssetSave(Paths, Remote, NewPaths); }).Get();
+        Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, NewPaths, Remote, External = Destinations.ExternalActorPaths] { return Repo->ReviewAssetSave(Paths, Remote, NewPaths, External); }).Get();
     }
     if (!Review.IsFresh()) { Blocked(Review.Error); return; }
-    if (Review.Paths.IsEmpty()) { Original.ExecuteIfBound(); return; }
-    if (!Review.NeedsLock.IsEmpty() && !ConfirmLocks(Review)) return;
+    if (Review.Paths.IsEmpty()) { if (!Destinations.bCoordinatedActors) Original.ExecuteIfBound(); return; }
+    FString Introduction;
+    if (Destinations.bCoordinatedActors)
+    {
+        Introduction = TEXT("Saving existing external actors. The owning map stays unchanged and is not locked by this save.\nActor deletion, new actor packages and dirty map/build data are not supported in this save yet.\n\n");
+        for (const auto& Entry : Destinations.Entries)
+            if (Entry.Actor.IsValid() && Entry.World.IsValid()) Introduction += Entry.Actor->GetActorLabel() + TEXT(" — ") + Entry.World->GetName() + TEXT("\n") + Entry.Path + TEXT("\n\n");
+    }
+    if (!Review.NeedsLock.IsEmpty() && !ConfirmLocks(Review, Introduction)) return;
 #if PLATFORM_MAC
     GitWorkspaceSession::FEditorWriteScope Access; FString Error;
     if (!Access.Acquire(Review.Local.Root, Error)) { Blocked(Error); return; }
@@ -341,6 +361,13 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     const auto CurrentDestinations = GatherPackageSavePaths(Packages, Local.Root, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
     if (!CurrentDestinations.Error.IsEmpty() || CurrentDestinations.Paths != Paths || CurrentDestinations.NewPaths != NewPaths)
     { Blocked(TEXT("The package set changed after lock review. Review saving again. Locks remain held.")); return; }
+    if (Destinations.bCoordinatedActors)
+    {
+        const auto Result = WriteExternalActorSave(Destinations, *Repo, *Prepared.Permit, Access.Lease(), FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
+        if (!Result.Ok()) { Blocked(Result.Error); return; }
+        FNotificationInfo Notice(SaveText(TEXT("Reviewed actor edits saved. Locks remain held; stage and commit when ready."))); Notice.ExpireDuration = 8.f;
+        FSlateNotificationManager::Get().AddNotification(Notice); return;
+    }
     FPreparedScope Permit(*Repo, *Prepared.Permit, Access.Lease(), Review.Local.Root);
     Original.ExecuteIfBound();
     FNotificationInfo Notice(SaveText(TEXT("Asset locks remain held. Saving does not stage files.")));
@@ -351,7 +378,7 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
 #endif
 }
 }
-FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content)
+FPackageSavePaths GatherOrdinaryPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content)
 {
     FPackageSavePaths Out;
     for (UPackage* Package : Packages)
@@ -364,7 +391,7 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
             { Out.Error = TEXT("Name the current ordinary map using Save Current Level first, then retry Save All."); return Out; }
             if (auto* Data = World->PersistentLevel->MapBuildData.Get())
             {
-                const auto Companion = GatherPackageSavePaths({Data->GetPackage()}, Root, Content);
+                const auto Companion = GatherOrdinaryPackageSavePaths({Data->GetPackage()}, Root, Content);
                 if (!Companion.Error.IsEmpty()) { Out.Error = Companion.Error; return Out; }
                 for (const FString& Path : Companion.Paths) Out.Paths.AddUnique(Path);
                 for (const FString& Path : Companion.NewPaths) Out.NewPaths.AddUnique(Path);
@@ -409,12 +436,14 @@ void RemoveGuard()
     GuardHandle.Reset(); PreviousGuard.Unbind(); ProjectRepo.Reset(); ProjectRepositoryRoot.Empty();
 }
 #if PLATFORM_MAC
-FPreparedScope::FPreparedScope(GitWorkspace::FRepository& Repo, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root)
+FPreparedScope::FPreparedScope(GitWorkspace::FRepository& Repo, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root, const FPackageSavePaths* ActorPlan)
 {
     check(IsInGameThread()); check(!ActiveSave.IsSet());
-    ActiveSave.Emplace(FActiveSave{&Repo, &Permit, &Lease, FPaths::ConvertRelativePathToFull(Root), {}}); bInstalled = true;
+    ActiveSave.Emplace(FActiveSave{&Repo, &Permit, &Lease, FPaths::ConvertRelativePathToFull(Root), {}, ActorPlan, {}}); bInstalled = true;
 }
 FPreparedScope::~FPreparedScope() { if (bInstalled) ActiveSave.Reset(); }
+void FPreparedScope::ExpectActorBatchWrite(const FString& Path)
+{ check(IsInGameThread()); check(bInstalled && ActiveSave.IsSet() && ActiveSave->ActorPlan); ActiveSave->ExpectedWrite = Path; }
 #endif
 void WrapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<TArray<UPackage*>()> GetPackages)
 {

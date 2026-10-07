@@ -30,6 +30,7 @@ FString SaveFingerprint(const FAssetSaveReview& R)
     {
         Identity += TEXT("|") + Path;
         Identity += R.NewPaths.Contains(Path) ? TEXT("|new") : TEXT("|existing");
+        Identity += R.ExternalActorPaths.Contains(Path) ? TEXT("|external-actor") : TEXT("|ordinary");
         if (const auto* L = R.Locks.Locks.Find(Path)) Identity += TEXT("|") + L->Id + TEXT("|") + L->LockedAt;
     }
     FTCHARToUTF8 Utf8(*Identity); Parts.Out.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
@@ -89,23 +90,31 @@ FResult FRepository::CheckNewAssetPath(const FString& Path, const FSnapshot& Loc
     if (Ignored.Code != 1) return SaveFailure(TEXT("First-save destination is ignored or its ignore rules cannot be verified: ") + Path);
     FResult Result; Result.Code = 0; return Result;
 }
-FAssetSaveReview FRepository::ReviewAssetSave(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths)
-{ FScopeLock Guard(&Mutex); return ReviewAssetSaveInternal(Paths, Remote, NewPaths); }
-FAssetSaveReview FRepository::ReviewAssetSaveInternal(const TArray<FString>& Requested, const FString& Remote, const TArray<FString>& NewPaths)
+FAssetSaveReview FRepository::ReviewAssetSave(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths, const TArray<FString>& ExternalActorPaths)
+{ FScopeLock Guard(&Mutex); return ReviewAssetSaveInternal(Paths, Remote, NewPaths, ExternalActorPaths); }
+FAssetSaveReview FRepository::ReviewAssetSaveInternal(const TArray<FString>& Requested, const FString& Remote, const TArray<FString>& NewPaths, const TArray<FString>& ExternalActorPaths)
 {
     FAssetSaveReview R; R.Local = RefreshInternal(); R.Locks.Remote = Remote;
     if (!R.Local.bValid || R.Local.bOperationInProgress || R.Local.HasConflicts())
     { R.Error = R.Local.Error.IsEmpty() ? TEXT("Resolve the repository operation or conflicts before saving locked assets.") : R.Local.Error; return R; }
     TArray<FString> Paths = Requested; Paths.Sort();
     for (const auto& Path : NewPaths) if (!Paths.Contains(Path)) { R.Error = TEXT("First-save destination was not selected."); return R; }
+    for (const auto& Path : ExternalActorPaths)
+        if (!Paths.Contains(Path) || !Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/")) || NewPaths.Contains(Path))
+        { R.Error = TEXT("Only existing external actors in a coordinated save can be reviewed."); return R; }
     for (const auto& Path : Paths)
     {
+        const bool bExternal = Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/"));
+        if (bExternal && !ExternalActorPaths.Contains(Path))
+        { R.Error = TEXT("External actor/object package saves need a coordinated map save workflow. Save cancelled."); return R; }
         const auto Attribute = IsLockableAssetInternal(Path);
-        if (Attribute.Code == 1) continue;
+        if (Attribute.Code == 1)
+        {
+            if (bExternal) { R.Error = TEXT("External actors must use Git LFS and lockable attributes: ") + Path; return R; }
+            continue;
+        }
         if (!Attribute.Ok()) { R.Error = Attribute.Error; return R; }
         if (!Path.EndsWith(TEXT(".uasset")) && !Path.EndsWith(TEXT(".umap"))) { R.Error = TEXT("Only Unreal packages are supported by Lock and save."); return R; }
-        if (Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/")))
-        { R.Error = TEXT("External actor/object package saves need a coordinated map save workflow. Save cancelled."); return R; }
         if (NewPaths.Contains(Path))
         {
             const auto New = CheckNewAssetPath(Path, R.Local);
@@ -124,6 +133,7 @@ FAssetSaveReview FRepository::ReviewAssetSaveInternal(const TArray<FString>& Req
         const auto Pointer = Lfs(Remote, {TEXT("pointer"), TEXT("--check"), TEXT("--file=") + FPaths::Combine(R.Local.Root, Path)});
         if (Pointer.Code != 1) { R.Error = Pointer.Ok() ? TEXT("Hydrate this LFS pointer before saving: ") + Path : TEXT("Cannot verify hydrated asset bytes: ") + Path + TEXT(". ") + Pointer.Error; return R; }
         R.Paths.AddUnique(Path);
+        if (bExternal) R.ExternalActorPaths.AddUnique(Path);
     }
     if (R.Paths.IsEmpty()) { R.bValid = true; return R; }
     R.Locks = VerifyLocksInternal(Remote);
@@ -165,7 +175,7 @@ FAssetSavePreparation FRepository::PrepareAssetSave(const FAssetSaveReview& Revi
     FString Error;
     if (!Lease.IsExclusiveFor(Reviewed.Local.Root) || !GitWorkspaceSession::NoOtherEditors(0, Error)) return Fail(Error.IsEmpty() ? TEXT("Save requires exclusive access to this editor session.") : Error);
     if (!Reviewed.NeedsLock.IsEmpty() && !bLockConfirmed) return Fail(TEXT("Lock and save was not confirmed. No locks acquired."));
-    auto Current = ReviewAssetSaveInternal(Reviewed.Paths, Reviewed.Locks.Remote, Reviewed.NewPaths);
+    auto Current = ReviewAssetSaveInternal(Reviewed.Paths, Reviewed.Locks.Remote, Reviewed.NewPaths, Reviewed.ExternalActorPaths);
     if (!Current.IsFresh() || Current.Fingerprint != Reviewed.Fingerprint || Current.Paths != Reviewed.Paths || Current.NeedsLock != Reviewed.NeedsLock)
         return Fail(Current.Error.IsEmpty() ? TEXT("Assets, staging or lock ownership changed. Try Save again.") : Current.Error);
     for (const auto& Path : Current.NeedsLock)
@@ -174,7 +184,7 @@ FAssetSavePreparation FRepository::PrepareAssetSave(const FAssetSaveReview& Revi
         if (!Locked.Ok()) return Fail(TEXT("Save cancelled. Any acquired locks remain held; verify locks before retrying.\n") + Path + TEXT(": ") + Locked.Error);
         Out.AcquiredPaths.Add(Path);
     }
-    auto Ready = ReviewAssetSaveInternal(Current.Paths, Current.Locks.Remote, Current.NewPaths);
+    auto Ready = ReviewAssetSaveInternal(Current.Paths, Current.Locks.Remote, Current.NewPaths, Current.ExternalActorPaths);
     if (!Ready.IsFresh() || !Ready.NeedsLock.IsEmpty() || Ready.RawHashes != Current.RawHashes || Ready.Local.Head != Current.Local.Head ||
         Ready.Local.IndexEntries != Current.Local.IndexEntries || Ready.Locks.Context != Current.Locks.Context)
         return Fail(TEXT("Save cancelled after locking; acquired locks remain held. ") + Ready.Error);
@@ -196,7 +206,8 @@ FResult FRepository::ValidateAssetSave(const FAssetSavePermit& Permit, const FSt
     if (!Lease.IsExclusiveFor(Approved.Local.Root) || !Approved.Paths.Contains(Path)) return SaveFailure(TEXT("Asset was not prepared for this save."));
     FString EditorError;
     if (!GitWorkspaceSession::NoOtherEditors(0, EditorError)) return SaveFailure(EditorError);
-    auto Current = ReviewAssetSaveInternal({Path}, Approved.Locks.Remote, Approved.NewPaths.Contains(Path) ? TArray<FString>{Path} : TArray<FString>{});
+    auto Current = ReviewAssetSaveInternal({Path}, Approved.Locks.Remote, Approved.NewPaths.Contains(Path) ? TArray<FString>{Path} : TArray<FString>{},
+        Approved.ExternalActorPaths.Contains(Path) ? TArray<FString>{Path} : TArray<FString>{});
     if (!Current.IsFresh() || !Current.NeedsLock.IsEmpty()) return SaveFailure(Current.Error.IsEmpty() ? TEXT("Lock ownership changed before saving.") : Current.Error);
     const auto* Old = Approved.Locks.Locks.Find(Path); const auto* Now = Current.Locks.Locks.Find(Path);
     TArray<FString> Hashes; FResult Raw; Raw.Out = Approved.RawHashes; Raw.Text().ParseIntoArrayLines(Hashes);

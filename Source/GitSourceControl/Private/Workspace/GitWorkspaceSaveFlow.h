@@ -9,6 +9,7 @@ class ISourceControlProvider;
 class UObject;
 class FAssetEditorToolkit;
 class UWorld;
+class AActor;
 
 namespace GitWorkspaceSave
 {
@@ -23,10 +24,23 @@ void InstallGuard();
 void RemoveGuard();
 struct FPackageSavePaths
 {
-    TArray<FString> Paths, NewPaths;
+    struct FEntry
+    {
+        TWeakObjectPtr<UPackage> Package;
+        TWeakObjectPtr<UWorld> World;
+        TWeakObjectPtr<AActor> Actor;
+        FString PackageName, Path, Filename, WorldName, WorldFilename, WorldHash;
+        FGuid ActorGuid;
+    };
+    TArray<FString> Paths, NewPaths, ExternalActorPaths;
+    TArray<FEntry> Entries;
+    TArray<TWeakObjectPtr<UPackage>> Sources;
     FString Error;
+    bool bCoordinatedActors = false;
 };
 FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content);
+FPackageSavePaths GatherOrdinaryPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content);
+FString ValidateExternalActorBinding(const FPackageSavePaths& Plan, const FString& Path, UPackage* Package);
 // Save As is a copy into an absent destination; the source is never renamed or saved.
 struct FAssetCopyDestination
 {
@@ -51,6 +65,9 @@ UObject* GetCopyData(FAssetEditorToolkit& Editor);
 FString ReviewCopyData(UObject* Source, UObject* EditedData);
 FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& PackageName, const FString& Root, const FString& Content);
 #if PLATFORM_MAC
+// Writes only the reviewed set; never discovers/deletes packages or auto-stages files.
+GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitWorkspace::FRepository& Repository,
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content);
 GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UObject*& OutCopy, UObject* EditedData = nullptr);
 GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
@@ -58,8 +75,9 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
 class FPreparedScope
 {
 public:
-    FPreparedScope(GitWorkspace::FRepository& Repository, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root);
+    FPreparedScope(GitWorkspace::FRepository& Repository, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root, const FPackageSavePaths* ActorPlan = nullptr);
     ~FPreparedScope();
+    void ExpectActorBatchWrite(const FString& Path);
     FPreparedScope(const FPreparedScope&) = delete;
     FPreparedScope& operator=(const FPreparedScope&) = delete;
 private:
