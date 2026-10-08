@@ -14,6 +14,14 @@ class UDeletedObjectPlaceholder;
 
 namespace GitWorkspaceSave
 {
+struct FHLODLayerBinding
+{
+    TWeakObjectPtr<UObject> Layer, Parent;
+    FString PackageName, ObjectName;
+    bool operator==(const FHLODLayerBinding& Other) const
+    { return Layer == Other.Layer && Parent == Other.Parent && PackageName == Other.PackageName && ObjectName == Other.ObjectName; }
+};
+FString CaptureHLODLayerChain(UWorld* World, TArray<FHLODLayerBinding>& Out);
 bool HandlesProvider(const ISourceControlProvider& Provider);
 void Register();
 void Unregister();
@@ -26,7 +34,7 @@ void RemoveGuard();
 void ShowCleanupNotices();
 struct FPackageSavePaths
 {
-    enum class EKind : uint8 { Asset, Actor, BuildData, Map, DeleteActor };
+    enum class EKind : uint8 { Asset, Actor, BuildData, HLODLayer, Map, DeleteActor };
     struct FEntry
     {
         TWeakObjectPtr<UPackage> Package;
@@ -34,6 +42,8 @@ struct FPackageSavePaths
         TWeakObjectPtr<AActor> Actor;
         FString PackageName, Path, Filename, WorldName, WorldFilename, WorldHash;
         FGuid ActorGuid;
+        TWeakObjectPtr<UObject> ActorHLODLayer;
+        int32 CompanionDepth = 0;
         FString ActorPath, ActorLabel;
         EKind Kind = EKind::Asset;
     };
@@ -42,6 +52,7 @@ struct FPackageSavePaths
         TWeakObjectPtr<UWorld> World;
         TWeakObjectPtr<UObject> BuildData;
         FString Name, Filename, Path, Hash, BuildDataName;
+        TArray<FHLODLayerBinding> HLODLayers;
     };
     TArray<FString> Paths, NewPaths, ExternalActorPaths, DeletePaths;
     TArray<FEntry> Entries;
@@ -75,7 +86,14 @@ struct FMapSaveDestination
         TWeakObjectPtr<AActor> Actor;
         FGuid Guid;
         FString SourcePackage, SourcePath, Label;
+        TWeakObjectPtr<UObject> HLODLayer;
         FAssetCopyDestination Target;
+    };
+    struct FHLODCompanion
+    {
+        FHLODLayerBinding Source;
+        FAssetCopyDestination Target;
+        FString ObjectName;
     };
     struct FPartitionDescriptor
     {
@@ -87,6 +105,7 @@ struct FMapSaveDestination
     };
     FAssetCopyDestination Map, BuildData;
     TArray<FActorDestination> Actors;
+    TArray<FHLODCompanion> HLODCompanions;
     TArray<FSourceFile> SourceFiles;
     TArray<TWeakObjectPtr<AActor>> SourceActors;
     TArray<FString> SourceActorFolders, SourceObjectFolders;
@@ -97,8 +116,11 @@ struct FMapSaveDestination
     bool bSourcePartitionInitialized = false;
     bool bNameCurrent = false, bExternalFirstSave = false, bExternalCopy = false;
     TArray<FString> ExternalPaths() const { TArray<FString> Out; for (const auto& Actor : Actors) Out.Add(Actor.Target.Path); Out.Sort(); return Out; }
-    TArray<FString> Paths() const { TArray<FString> Out{Map.Path}; if (!BuildData.Path.IsEmpty()) Out.Add(BuildData.Path); Out.Append(ExternalPaths()); Out.Sort(); return Out; }
+    TArray<FString> Paths() const { TArray<FString> Out{Map.Path}; if (!BuildData.Path.IsEmpty()) Out.Add(BuildData.Path); for (const auto& Layer : HLODCompanions) Out.Add(Layer.Target.Path); Out.Append(ExternalPaths()); Out.Sort(); return Out; }
 };
+void ReviewHLODCompanions(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);
+FString CreateHLODCompanions(UWorld* World, const FMapSaveDestination& Destination);
+FString GatherOwnedHLODCompanions(UWorld* World, const FString& Root, const FString& Content, FPackageSavePaths::FOwner& Owner, FPackageSavePaths& Out, bool& bSaveMap);
 FString ReviewMapSource(UWorld* World);
 FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary, bool bRequireLoaded = true);
 void ReviewExternalFirstMapActors(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);

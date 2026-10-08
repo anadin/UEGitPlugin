@@ -36,12 +36,14 @@ FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary, bool bRequi
     ForEachObjectWithOuter(Level, [&](UObject* Object)
     { bExternalObject |= Object->IsPackageExternal() && !Object->IsA<AActor>(); return !bExternalObject; }, EGetObjectsFlags::IncludeNestedObjects);
     if (bExternalObject) return TEXT("External objects and actor-folder objects need their own first-naming adapter.");
+    TArray<FHLODLayerBinding> Layers;
     if (auto* Partition = World->GetWorldPartition())
     {
         if (Partition->GetActorDescContainerCount() > 1)
             return TEXT("Nested containers and external data layers need a separate map-naming workflow.");
-        if (auto* Layer = Partition->GetDefaultHLODLayer(); Layer && FPackageName::IsTempPackage(Layer->GetPackage()->GetName()))
-            return TEXT("This template has temporary HLOD layers that need companion naming. First naming of those layers is not supported yet.");
+        const FString LayerError = CaptureHLODLayerChain(World, Layers); if (!LayerError.IsEmpty()) return LayerError;
+        if (!bTemporary) for (const auto& Layer : Layers) if (FPackageName::IsTempPackage(Layer.PackageName))
+            return TEXT("Temporary HLOD layers require the first-map companion naming review.");
         for (UWorldPartition::TIterator<> It(Partition); It; ++It)
             // GetActor() can resolve a stale soft path using StaticFindObject,
             // which is illegal in the core save validator after a map rename.
@@ -59,6 +61,9 @@ FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary, bool bRequi
     for (AActor* Actor : Level->Actors)
     {
         if (!Actor) continue;
+        if (auto* ActorLayer = Actor->GetHLODLayer(); ActorLayer && FPackageName::IsTempPackage(ActorLayer->GetPackage()->GetName()) &&
+            !Layers.ContainsByPredicate([&](const auto& Layer) { return Layer.Layer.Get() == ActorLayer; }))
+            return TEXT("An actor-specific temporary HLOD layer is outside the reviewed default/parent chain. It needs separate companion naming.");
         if (!IsValid(Actor) || Actor->IsA<ALODActor>() || Actor->IsA<AWorldPartitionHLOD>() || Actor->GetExternalDataLayerAsset() ||
             Actor->GetClass()->ImplementsInterface(ULevelInstanceInterface::StaticClass()))
             return TEXT("HLOD, external data-layer actors, level instances and pending actor deletions need separate first-naming adapters.");
@@ -117,6 +122,7 @@ void ReviewExternalFirstMapActors(UWorld* World, const FString& Root, const FStr
         FMapSaveDestination::FActorDestination Entry;
         Entry.Actor = Actor; Entry.Guid = Actor->GetActorGuid(); Entry.SourcePackage = Actor->GetExternalPackage()->GetName();
         Entry.SourcePath = Actor->GetPathName(); Entry.Label = Actor->GetActorLabel();
+        Entry.HLODLayer = Actor->GetHLODLayer();
         const FString Name = ULevel::GetActorPackageName(Base, Level->GetActorPackagingScheme(), NewLevelPath + TEXT(".") + Actor->GetName());
         Entry.Target = ReviewAbsentDestination(Name, Entry.SourcePackage, Root, Content, false);
         if (!Entry.Target.Error.IsEmpty()) { Destination.Error = TEXT("Actor destination: ") + Entry.Target.Error; return; }
@@ -132,6 +138,8 @@ GitWorkspace::FResult WriteExternalFirstMapDestination(UWorld* Source, const FMa
     check(IsInGameThread()); OutWorld = nullptr;
     auto Fail = [](const FString& Message) { GitWorkspace::FResult R; R.Error = Message + TEXT("\nThe current world and destination locks remain. Use Save on the named map to review and retry remaining files; nothing was staged or unlocked."); return R; };
     TStrongObjectPtr<UWorld> HoldSource(Source);
+    TArray<TStrongObjectPtr<UObject>> HoldLayers;
+    for (const auto& Layer : Destination.HLODCompanions) HoldLayers.Emplace(Layer.Source.Layer.Get());
     const bool bDisallowExport = Source->GetPackage()->HasAnyPackageFlags(PKG_DisallowExport);
     const auto AccessSpecifier = Source->GetPackage()->GetAssetAccessSpecifier();
     UPackage* Package = CreatePackage(*Destination.Map.PackageName);
@@ -143,6 +151,8 @@ GitWorkspace::FResult WriteExternalFirstMapDestination(UWorld* Source, const FMa
         !Source->Rename(*FPackageName::GetLongPackageAssetName(Destination.Map.PackageName), Package, Flags))
         return Fail(TEXT("Could not name this external-actor map. Inspect its current package name before retrying."));
     OutWorld = Source; Package->ThisContainsMap(); Package->MarkAsFullyLoaded();
+    const FString LayerError = CreateHLODCompanions(Source, Destination);
+    if (!LayerError.IsEmpty()) return Fail(LayerError);
     if (bDisallowExport) Package->SetPackageFlags(PKG_DisallowExport);
     Package->SetAssetAccessSpecifier(AccessSpecifier);
     Source->ClearFlags(RF_Transient); Source->SetFlags(RF_Public | RF_Standalone); Source->MarkPackageDirty();

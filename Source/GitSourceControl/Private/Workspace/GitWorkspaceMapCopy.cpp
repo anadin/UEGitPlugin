@@ -78,6 +78,9 @@ FString ReviewExternalMapCopySource(UWorld* World, bool bAllowUnloaded)
 {
     const FString Error = ReviewExternalFirstMapSource(World, false, !bAllowUnloaded);
     if (!Error.IsEmpty()) return TEXT("WP/OFPA copy requires a fully loaded persistent map with canonical main actors and modern build data.\n") + Error;
+    TArray<FHLODLayerBinding> Layers; const FString LayerError = CaptureHLODLayerChain(World, Layers); if (!LayerError.IsEmpty()) return LayerError;
+    for (const auto& Layer : Layers) if (Layer.PackageName.StartsWith(World->GetPackage()->GetName() + TEXT("_")))
+        return TEXT("Save As copies of map-owned HLOD companions require a separate companion-copy review. The original map can still use Save.");
     if (FPackageName::IsTempPackage(World->GetPackage()->GetName()) || World->GetPackage()->HasAnyPackageFlags(PKG_NewlyCreated) ||
         World->GetName() != FPackageName::GetShortName(World->GetPackage()->GetName()))
         return TEXT("Save and name this WP/OFPA map before making a copy.");

@@ -1,5 +1,6 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitWorkspaceSaveFlow.h"
+#include "WorldPartition/HLOD/HLODLayer.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceFileGuard.h"
 #endif
@@ -41,6 +42,15 @@ UWorld* BuildDataWorld(UPackage* Package)
 {
     for (TObjectIterator<UWorld> It; It; ++It)
         if (ExternalWorld(*It) && It->PersistentLevel->MapBuildData && It->PersistentLevel->MapBuildData->GetPackage() == Package) return *It;
+    return nullptr;
+}
+UWorld* HLODLayerWorld(UPackage* Package)
+{
+    for (TObjectIterator<UWorld> It; It; ++It) if (ExternalWorld(*It) && Package->GetName().StartsWith(It->GetPackage()->GetName() + TEXT("_")))
+    {
+        TArray<FHLODLayerBinding> Layers;
+        if (CaptureHLODLayerChain(*It, Layers).IsEmpty() && Layers.ContainsByPredicate([&](const auto& Layer) { return Layer.Layer.IsValid() && Layer.Layer->GetPackage() == Package; })) return *It;
+    }
     return nullptr;
 }
 FString FileHash(const FString& Filename)
@@ -137,7 +147,7 @@ FString PlanDrift(const FPackageSavePaths& Plan, const FPackageSavePaths& Curren
         const auto* Now = Current.Owners.FindByPredicate([&](const auto& O) { return O.World == Owner.World; });
         const FString* SavedHash = SavedMaps.Find(Owner.Path);
         if (!Now || Now->Name != Owner.Name || Now->Filename != Owner.Filename || Now->Path != Owner.Path ||
-            Now->Hash != (SavedHash ? *SavedHash : Owner.Hash) || Now->BuildData != Owner.BuildData || Now->BuildDataName != Owner.BuildDataName)
+            Now->Hash != (SavedHash ? *SavedHash : Owner.Hash) || Now->BuildData != Owner.BuildData || Now->BuildDataName != Owner.BuildDataName || Now->HLODLayers != Owner.HLODLayers)
             return TEXT("The owning map or its build-data association changed after review: ") + Owner.Name;
     }
     TArray<FString> ExpectedNew, ActualNew;
@@ -159,14 +169,14 @@ FString PlanDrift(const FPackageSavePaths& Plan, const FPackageSavePaths& Curren
         if (!Now || Now->Package != Entry.Package || Now->PackageName != Entry.PackageName || Now->Filename != Entry.Filename ||
             Now->Actor != Entry.Actor || Now->ActorGuid != Entry.ActorGuid || Now->World != Entry.World || Now->WorldName != Entry.WorldName ||
             Now->WorldFilename != Entry.WorldFilename || Now->WorldHash != Entry.WorldHash || Now->Kind != Entry.Kind ||
-            Now->ActorPath != Entry.ActorPath || Now->ActorLabel != Entry.ActorLabel)
+            Now->ActorPath != Entry.ActorPath || Now->ActorLabel != Entry.ActorLabel || Now->ActorHLODLayer != Entry.ActorHLODLayer || Now->CompanionDepth != Entry.CompanionDepth)
             return TEXT("A reviewed package or its owning map changed before writing: ") + Entry.Path;
     }
     return FString();
 }
 }
 bool NeedsCoordinatedWorldSave(UPackage* Package)
-{ return Package && (ExternalWorld(UWorld::FindWorldInPackage(Package)) || BuildDataWorld(Package)); }
+{ return Package && (ExternalWorld(UWorld::FindWorldInPackage(Package)) || BuildDataWorld(Package) || HLODLayerWorld(Package)); }
 FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content)
 {
     check(IsInGameThread());
@@ -187,6 +197,7 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
             Worlds.AddUnique(Owner);
         }
         else if (UWorld* DataOwner = BuildDataWorld(Package)) Worlds.AddUnique(DataOwner);
+        else if (UWorld* LayerOwner = HLODLayerWorld(Package)) Worlds.AddUnique(LayerOwner);
         else Ordinary.AddUnique(Package);
     }
     if (Worlds.IsEmpty()) return GatherOrdinaryPackageSavePaths(Ordinary, Root, Content);
@@ -202,8 +213,9 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
         FPackageSavePaths::FOwner Owner; Owner.World = World; Owner.Name = World->GetPackage()->GetName(); Owner.Filename = MapFile;
         Owner.Path = RelativeFile(MapFile, Root); Owner.Hash = Hash; Owner.BuildData = World->PersistentLevel->MapBuildData.Get();
         if (Owner.BuildData.IsValid()) Owner.BuildDataName = Owner.BuildData->GetPackage()->GetName();
-        Out.Owners.Add(Owner);
         bool bSaveMap = bFirstMap || World->GetPackage()->IsDirty();
+        Out.Error = GatherOwnedHLODCompanions(World, Root, Content, Owner, Out, bSaveMap); if (!Out.Error.IsEmpty()) return Out;
+        Out.Owners.Add(Owner);
         if (UMapBuildDataRegistry* Data = World->PersistentLevel->MapBuildData)
         {
             UPackage* Package = Data->GetPackage(); FString Filename;
@@ -256,6 +268,7 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
             Entry.Package = Package; Entry.PackageName = Package->GetName(); Entry.Path = RelativeFile(Filename, Root); Entry.Filename = Filename;
             Entry.World = World; Entry.WorldName = World->GetPackage()->GetName(); Entry.WorldFilename = MapFile; Entry.WorldHash = Hash;
             Entry.Actor = AActor::FindActorInPackage(Package); if (Entry.Actor.IsValid()) Entry.ActorGuid = Entry.Actor->GetActorGuid();
+            if (Entry.Actor.IsValid()) Entry.ActorHLODLayer = Entry.Actor->GetHLODLayer();
             Entry.Kind = bDelete ? FPackageSavePaths::EKind::DeleteActor : FPackageSavePaths::EKind::Actor;
             if (bDelete)
             { Out.Error = DeletedActorDescription(Package, World, Entry); if (!Out.Error.IsEmpty()) return Out; Out.DeletePaths.AddUnique(Entry.Path); }
@@ -285,7 +298,8 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
     Out.Paths.Sort(); Out.NewPaths.Sort(); Out.ExternalActorPaths.Sort(); Out.DeletePaths.Sort();
     Out.Entries.Sort([](const FPackageSavePaths::FEntry& A, const FPackageSavePaths::FEntry& B)
     {
-        auto Rank = [](FPackageSavePaths::EKind Kind) { return Kind == FPackageSavePaths::EKind::DeleteActor ? -1 : Kind == FPackageSavePaths::EKind::BuildData ? 0 : Kind == FPackageSavePaths::EKind::Actor ? 1 : Kind == FPackageSavePaths::EKind::Asset ? 2 : 3; };
+        auto Rank = [](FPackageSavePaths::EKind Kind) { return Kind == FPackageSavePaths::EKind::DeleteActor ? -2 : Kind == FPackageSavePaths::EKind::HLODLayer ? -1 : Kind == FPackageSavePaths::EKind::BuildData ? 0 : Kind == FPackageSavePaths::EKind::Actor ? 1 : Kind == FPackageSavePaths::EKind::Asset ? 2 : 3; };
+        if (A.Kind == FPackageSavePaths::EKind::HLODLayer && B.Kind == A.Kind && A.CompanionDepth != B.CompanionDepth) return A.CompanionDepth > B.CompanionDepth;
         return Rank(A.Kind) == Rank(B.Kind) ? A.Path < B.Path : Rank(A.Kind) < Rank(B.Kind);
     });
     return Out;

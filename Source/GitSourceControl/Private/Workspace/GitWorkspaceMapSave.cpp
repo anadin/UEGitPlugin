@@ -70,6 +70,7 @@ FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageNa
         { Out.Error = TEXT("The destination has an external-package directory or cannot be resolved. Choose a fresh map destination."); return Out; }
     }
     if (Out.bExternalFirstSave || Out.bExternalCopy) ReviewExternalFirstMapActors(World, Root, Content, Out);
+    if (Out.Error.IsEmpty() && Out.bExternalFirstSave) ReviewHLODCompanions(World, Root, Content, Out);
     return Out;
 }
 #if PLATFORM_MAC
@@ -89,14 +90,21 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
         Current.SourceActorFolders != Destination.SourceActorFolders || Current.SourceObjectFolders != Destination.SourceObjectFolders ||
         Current.SourceContainer != Destination.SourceContainer || Current.bSourcePartitionInitialized != Destination.bSourcePartitionInitialized ||
         Current.SourceDescriptors != Destination.SourceDescriptors ||
-        Current.Map.Filename != Destination.Map.Filename || Current.Paths() != Destination.Paths() || Current.Actors.Num() != Destination.Actors.Num())
+        Current.Map.Filename != Destination.Map.Filename || Current.Paths() != Destination.Paths() || Current.Actors.Num() != Destination.Actors.Num() ||
+        Current.HLODCompanions.Num() != Destination.HLODCompanions.Num())
         return Fail(TEXT("The map or its build-data package changed after review. Review the complete package set again."));
     for (int32 I = 0; I < Current.Actors.Num(); ++I)
     {
         const auto& A = Current.Actors[I]; const auto& B = Destination.Actors[I];
-        if (A.Actor != B.Actor || A.Guid != B.Guid || A.SourcePackage != B.SourcePackage || A.SourcePath != B.SourcePath || A.Label != B.Label || A.Target.PackageName != B.Target.PackageName)
+        if (A.Actor != B.Actor || A.Guid != B.Guid || A.SourcePackage != B.SourcePackage || A.SourcePath != B.SourcePath || A.Label != B.Label || A.HLODLayer != B.HLODLayer || A.Target.PackageName != B.Target.PackageName)
             return Fail(TEXT("An actor or its package identity changed after map naming review. Review all destinations again."));
         if (!Permit.ContainsExternalActorPath(A.Target.Path)) return Fail(TEXT("Actor destinations require an explicit coordinated first-save permit."));
+    }
+    for (int32 I = 0; I < Current.HLODCompanions.Num(); ++I)
+    {
+        const auto& A = Current.HLODCompanions[I]; const auto& B = Destination.HLODCompanions[I];
+        if (!(A.Source == B.Source) || A.Target.PackageName != B.Target.PackageName || A.ObjectName != B.ObjectName)
+            return Fail(TEXT("The default/parent HLOD companion chain changed after review."));
     }
     for (const FString& Path : Current.Paths())
     {

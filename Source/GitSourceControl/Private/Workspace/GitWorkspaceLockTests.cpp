@@ -35,6 +35,7 @@
 #include "PrecomputedLightVolume.h"
 #include "Engine/WorldComposition.h"
 #include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/HLOD/HLODLayer.h"
 #include "WorldPartition/WorldPartitionActorDescUtils.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "GameFramework/WorldSettings.h"
@@ -1115,7 +1116,7 @@ bool FGitExternalMapNameTest::RunTest(const FString&)
         const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
         const auto Destination = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_First"), Files.Repo, F.Content);
         const int32 ExternalCount = World->PersistentLevel->Actors.FilterByPredicate([](AActor* A) { return A && A->IsPackageExternal(); }).Num();
-        if (!TestTrue(TEXT("Complete first-map review: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.bExternalFirstSave && Destination.Actors.Num() == ExternalCount && ExternalCount >= 2 && Destination.Paths().Num() == ExternalCount + 2)) return false;
+        if (!TestTrue(TEXT("Complete first-map review: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.bExternalFirstSave && Destination.Actors.Num() == ExternalCount && ExternalCount >= 2 && Destination.Paths().Num() == ExternalCount + 2 + Destination.HLODCompanions.Num())) return false;
         const FString Source = World->GetPathName(); UObject* Data = World->PersistentLevel->MapBuildData.Get();
         const auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths());
         TestTrue(TEXT("All map/actor/data paths explicitly first-save"), Review.IsFresh() && Review.NeedsLock.Num() == Destination.Paths().Num() && Review.ExternalActorPaths.Num() == ExternalCount);
@@ -1144,7 +1145,9 @@ bool FGitExternalMapNameTest::RunTest(const FString&)
         }
         for (const FString& Path : Destination.Paths()) TestTrue(TEXT("Every reviewed output exists"), IFileManager::Get().FileExists(*FPaths::Combine(Files.Repo, Path)));
         TestFalse(TEXT("Newly named map is saved"), World->GetPackage()->IsDirty());
-        TestFalse(TEXT("Named external map Save As remains explicitly unsupported"), GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_Copy"), Files.Repo, F.Content).Error.IsEmpty());
+        const auto CopyReview = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_Copy"), Files.Repo, F.Content);
+        if (Destination.HLODCompanions.IsEmpty()) TestTrue(TEXT("Named fully loaded external maps support reviewed copies: ") + CopyReview.Error, CopyReview.Error.IsEmpty());
+        else TestTrue(TEXT("Map-owned HLOD copies remain explicitly bounded"), CopyReview.Error.Contains(TEXT("map-owned HLOD")));
         Actors[0]->SetActorLabel(TEXT("First actor A edited")); Actors[0]->MarkPackageDirty(); World->GetWorldSettings()->KillZ = -45678.f; World->MarkPackageDirty();
         const auto Again = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
         if (!TestTrue(TEXT("Subsequent Save uses existing coordinated actor/map flow: ") + Again.Error, Again.Error.IsEmpty() && Again.NewPaths.IsEmpty() && Again.Paths.Num() == (World->GetWorldSettings()->IsPackageExternal() ? 3 : 2))) return false;
@@ -1275,6 +1278,142 @@ bool FGitExternalMapCallbackTest::RunTest(const FString&)
     TestEqual(TEXT("Callback drift and retry preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries);
     TestEqual(TEXT("Callback drift and retry preserve HEAD"), Repo.Refresh().Head, Before.Head);
     TestEqual(TEXT("Callback drift and retry preserve stashes"), Repo.ListStashes().Fingerprint, Stashes);
+    return true;
+}
+
+namespace
+{
+TArray<TStrongObjectPtr<UHLODLayer>> AddHLODTemplate(FMapSaveFixture& F, UWorld* World, bool bSaved)
+{
+    TArray<TStrongObjectPtr<UHLODLayer>> Layers;
+    for (const FString& Name : {FString(TEXT("TemplateChild")), FString(TEXT("TemplateParent"))})
+    {
+        const FString Package = bSaved ? F.Mount + Name : World->GetPackage()->GetName() + TEXT("_") + Name;
+        Layers.Emplace(NewObject<UHLODLayer>(CreatePackage(*Package), *Name, RF_Public | RF_Standalone));
+    }
+    Layers[0]->SetParentLayer(Layers[1].Get()); World->GetWorldPartition()->SetDefaultHLODLayer(Layers[0].Get());
+    if (bSaved)
+    {
+        FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+        for (int32 I : {1, 0})
+        {
+            FString File; FPackageName::TryConvertLongPackageNameToFilename(Layers[I]->GetPackage()->GetName(), File, TEXT(".uasset"));
+            if (!UPackage::SavePackage(Layers[I]->GetPackage(), Layers[I].Get(), *File, Args)) return {};
+        }
+        UPackage::WaitForAsyncFileWrites();
+        if (!F.Files.Call({TEXT("add"), TEXT("Content")}).Ok() || !F.Files.Call({TEXT("commit"), TEXT("-qm"), TEXT("HLOD template inputs")}).Ok()) return {};
+    }
+    return Layers;
+}
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitHLODNameTest, "GitWorkspace.SaveLock.HLODTemplateFirstNaming", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitHLODNameTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); TArray<AActor*> Actors; UWorld* World = F.NewExternalWorld(true, Actors);
+    auto Layers = AddHLODTemplate(F, World, true); if (!TestEqual(TEXT("Saved template layer chain"), Layers.Num(), 2)) return false;
+    TArray<FString> SourceHashes; TArray<bool> SourceReadOnly;
+    for (auto& Layer : Layers) { FString File; FPackageName::DoesPackageExist(Layer->GetPackage()->GetName(), &File); SourceHashes.Add(Files.Call({TEXT("hash-object"), TEXT("--no-filters"), File}).Text()); SourceReadOnly.Add(IFileManager::Get().IsReadOnly(*File)); }
+    Layers[0]->SetLayerType(EHLODLayerType::MeshMerge); Layers[0]->MarkPackageDirty(); Actors[0]->SetHLODLayer(Layers[0].Get()); Actors[0]->MarkPackageDirty();
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("HLOD naming lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    const auto Destination = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_HLOD"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("HLOD companions join exact naming review: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.HLODCompanions.Num() == 2 && Destination.Paths().Num() == Destination.Actors.Num() + 4)) return false;
+    const auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths());
+    TestFalse(TEXT("Cancel reserves nothing"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+    TestTrue(TEXT("Cancel retains original default and parent"), World->GetWorldPartition()->GetDefaultHLODLayer() == Layers[0].Get() && Layers[0]->GetParentLayer() == Layers[1].Get());
+    TestEqual(TEXT("Cancel has zero locks"), Repo.VerifyLocks(TEXT("origin")).Locks.Num(), 0);
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true); if (!TestTrue(TEXT("All companions reserved"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    TArray<FString> Order;
+    const auto SaveHook = FCoreUObjectDelegates::OnObjectPreSave.AddLambda([&](UObject* Object, FObjectPreSaveContext) { if (Object->IsA<UHLODLayer>()) Order.Add(Object->GetPackage()->GetName()); });
+    ON_SCOPE_EXIT { FCoreUObjectDelegates::OnObjectPreSave.Remove(SaveHook); for (auto& Layer : Layers) Layer->GetPackage()->SetDirtyFlag(false); };
+    UWorld* Named = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+    if (!TestTrue(TEXT("Map and HLOD companions saved: ") + Written.Error, Written.Ok() && Named == World)) return false;
+    auto* Child = World->GetWorldPartition()->GetDefaultHLODLayer(); auto* Parent = Child->GetParentLayer();
+    TestTrue(TEXT("Independent child and parent with current settings"), Child != Layers[0].Get() && Parent != Layers[1].Get() && Child->GetLayerType() == EHLODLayerType::MeshMerge);
+    TestTrue(TEXT("Actor override remapped to named companion"), Actors[0]->GetHLODLayer() == Child);
+    TestTrue(TEXT("Parent saved before child"), Order.IndexOfByKey(Parent->GetPackage()->GetName()) != INDEX_NONE && Order.IndexOfByKey(Parent->GetPackage()->GetName()) < Order.IndexOfByKey(Child->GetPackage()->GetName()));
+    TestTrue(TEXT("Original edited layer and parent remain unchanged"), Layers[0]->GetPackage()->IsDirty() && Layers[0]->GetParentLayer() == Layers[1].Get());
+    for (int32 I = 0; I < Layers.Num(); ++I)
+    {
+        FString File; FPackageName::DoesPackageExist(Layers[I]->GetPackage()->GetName(), &File);
+        TestEqual(TEXT("Template bytes unchanged"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), File}).Text(), SourceHashes[I]);
+        TestEqual(TEXT("Template permissions unchanged"), IFileManager::Get().IsReadOnly(*File), SourceReadOnly[I]);
+    }
+    for (const auto& Layer : Destination.HLODCompanions) TestTrue(TEXT("Reviewed HLOD destination exists"), IFileManager::Get().FileExists(*Layer.Target.Filename));
+    TestFalse(TEXT("Map-owned companion copying is still explicitly refused"), GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_Copy"), Files.Repo, F.Content).Error.IsEmpty());
+    Child->SetLayerType(EHLODLayerType::MeshSimplify); Child->MarkPackageDirty();
+    const auto Again = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage(), Child->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Follow-up map/selected-layer save gathers exactly one companion: ") + Again.Error, Again.Error.IsEmpty() && Again.Paths.Num() == 1 && Again.NewPaths.IsEmpty())) return false;
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Again.Paths, TEXT("origin")), Lease, true);
+    if (!TestTrue(TEXT("Follow-up layer save prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    TestTrue(TEXT("Follow-up layer uses coordinated writer"), GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content).Ok());
+    TestEqual(TEXT("Staging retained"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("HEAD retained"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Stashes retained"), Repo.ListStashes().Fingerprint, Stashes);
+    const auto Locks = Repo.VerifyLocks(TEXT("origin")); TestTrue(TEXT("Exact full destination lock set retained"), Locks.IsFresh() && Locks.Locks.Num() == Destination.Paths().Num());
+    for (const auto& Path : Destination.Paths()) TestTrue(TEXT("Destination remains owned"), Locks.State(Path, true) == GitWorkspace::ELockState::Ours);
+    F.Export(FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Automation/HLODNameFixtures"))));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitHLODNameBoundaryTest, "GitWorkspace.SaveLock.HLODTemplateBoundariesAndCallbacks", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitHLODNameBoundaryTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); TArray<AActor*> Actors; UWorld* World = F.NewExternalWorld(true, Actors);
+    auto Layers = AddHLODTemplate(F, World, false); GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content);
+    auto Review = [&] { return GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_HLOD"), Files.Repo, F.Content); };
+    Layers[1]->SetParentLayer(Layers[0].Get()); TestFalse(TEXT("Cycle refused before duplication"), Review().Error.IsEmpty()); Layers[1]->SetParentLayer(nullptr);
+    Layers[0]->SetLayerType(EHLODLayerType::CustomHLODActor); TestFalse(TEXT("Custom linked HLOD family remains refused"), Review().Error.IsEmpty()); Layers[0]->SetLayerType(EHLODLayerType::Instancing);
+    const auto Destination = Review(); if (!TestTrue(TEXT("Temporary chain supported: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.HLODCompanions.Num() == 2)) return false;
+    const FString Occupied = Destination.HLODCompanions[0].Target.Filename; FFileHelper::SaveStringToFile(TEXT("do not replace"), *Occupied);
+    TestFalse(TEXT("Occupied companion refused"), Review().Error.IsEmpty()); FString Bytes; FFileHelper::LoadFileToString(Bytes, *Occupied); TestEqual(TEXT("Occupied data preserved"), Bytes, FString(TEXT("do not replace"))); IFileManager::Get().Delete(*Occupied);
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease; if (!Lease.Acquire(Files.Repo, true, Error)) return false;
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+    if (!TestTrue(TEXT("Boundary destinations prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    Layers[0]->SetParentLayer(nullptr); UWorld* Named = nullptr;
+    TestFalse(TEXT("Parent drift refuses before naming"), GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named).Ok());
+    TestTrue(TEXT("Drift leaves unnamed source"), !Named && FPackageName::IsTempPackage(World->GetPackage()->GetName())); Layers[0]->SetParentLayer(Layers[1].Get());
+    const auto Hook = FCoreUObjectDelegates::OnObjectPreSave.AddLambda([&](UObject* Object, FObjectPreSaveContext)
+    { if (Object->GetPackage()->GetName() == Destination.HLODCompanions[1].Target.PackageName) { World->GetWorldPartition()->GetDefaultHLODLayer()->SetParentLayer(Layers[1].Get()); World->GetWorldPartition()->GetDefaultHLODLayer()->MarkPackageDirty(); } });
+    ON_SCOPE_EXIT { FCoreUObjectDelegates::OnObjectPreSave.Remove(Hook); };
+    const auto Saved = GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+    TestFalse(TEXT("Core callback cannot rebind companion to temporary input"), Saved.Ok());
+    TestTrue(TEXT("Callback work and named world retained"), Named == World && World->GetWorldPartition()->GetDefaultHLODLayer()->GetParentLayer() == Layers[1].Get() && World->GetPackage()->IsDirty());
+    for (const auto& Path : Destination.Paths()) TestFalse(TEXT("Late drift writes no destination"), IFileManager::Get().FileExists(*FPaths::Combine(Files.Repo, Path)));
+    TestEqual(TEXT("Late refusal retains exact reservations"), Repo.VerifyLocks(TEXT("origin")).Locks.Num(), Destination.Paths().Num());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitHLODNamePartialTest, "GitWorkspace.SaveLock.HLODTemplatePartialAndRetry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitHLODNamePartialTest::RunTest(const FString&)
+{
+    for (bool bMapFailure : {false, true})
+    {
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+        ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); TArray<AActor*> Actors; UWorld* World = F.NewExternalWorld(true, Actors);
+        auto Layers = AddHLODTemplate(F, World, false); GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content);
+        GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease; if (!Lease.Acquire(Files.Repo, true, Error)) return false;
+        const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+        const auto Destination = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_HLOD"), Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Partial HLOD naming plan"), Destination.Error.IsEmpty() && Destination.HLODCompanions.Num() == 2)) return false;
+        FFileHelper::SaveStringToFile(Destination.HLODCompanions[0].Target.Path, *FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+        auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+        TestFalse(TEXT("Incomplete companion reservation stops naming"), Prepared.Result.Ok()); TestTrue(TEXT("No mutation after incomplete acquisition"), FPackageName::IsTempPackage(World->GetPackage()->GetName()) && World->GetWorldPartition()->GetDefaultHLODLayer() == Layers[0].Get());
+        IFileManager::Get().Delete(*FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+        Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true); if (!TestTrue(TEXT("Retry reserves whole set"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+        const FString Failed = bMapFailure ? Destination.Map.Filename : Destination.HLODCompanions[0].Target.Filename;
+        auto Guard = FCoreUObjectDelegates::IsPackageOKToSaveDelegate; ON_SCOPE_EXIT { FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard; };
+        FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([Guard, Failed](UPackage* Package, const FString& File, FOutputDevice* Output) { return FPaths::ConvertRelativePathToFull(File) != Failed && (!Guard.IsBound() || Guard.Execute(Package, File, Output)); });
+        UWorld* Named = nullptr; const auto Saved = GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+        TestFalse(TEXT("Partial write failure reported"), Saved.Ok()); TestTrue(TEXT("Named world stays available"), Named == World && World->GetPackage()->IsDirty());
+        TestTrue(TEXT("Completed parent retained"), IFileManager::Get().FileExists(*Destination.HLODCompanions[1].Target.Filename)); TestFalse(TEXT("Map waits for all companions"), IFileManager::Get().FileExists(*Destination.Map.Filename));
+        FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard;
+        const auto Again = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Retry gathers unfinished companion set: ") + Again.Error, Again.Error.IsEmpty() && Again.Paths.Num() == (bMapFailure ? 1 : Destination.Paths().Num() - 1) && Again.NewPaths == Again.Paths)) return false;
+        Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Again.Paths, TEXT("origin"), Again.NewPaths, Again.ExternalActorPaths), Lease, true); if (!TestTrue(TEXT("Reviewed partial retry prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+        TestTrue(TEXT("Partial HLOD save retry succeeds"), GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content).Ok());
+        TestEqual(TEXT("Retry preserves staging"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("Retry preserves HEAD"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Retry preserves stashes"), Repo.ListStashes().Fingerprint, Stashes);
+        TestEqual(TEXT("All locks retained after retry"), Repo.VerifyLocks(TEXT("origin")).Locks.Num(), Destination.Paths().Num());
+    }
     return true;
 }
 
