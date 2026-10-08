@@ -50,6 +50,7 @@ TArray<UPackage*> DirtyPackages()
 }
 bool UpdateHooks(float)
 {
+    ShowCleanupNotices();
     if (!GEditor) return true;
     if (!bInitialized) { InstallGuard(); bInitialized = true; }
     if (auto* MainFrame = FModuleManager::GetModulePtr<IMainFrameModule>(TEXT("MainFrame")))

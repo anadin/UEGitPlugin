@@ -5,5 +5,6 @@ public class GitWorkspaceSession : ModuleRules
     public GitWorkspaceSession(ReadOnlyTargetRules Target) : base(Target)
     {
         PublicDependencyModuleNames.Add("Core");
+        PrivateDependencyModuleNames.Add("Json");
     }
 }

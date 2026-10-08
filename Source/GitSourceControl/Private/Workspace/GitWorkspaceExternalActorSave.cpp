@@ -1,5 +1,8 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitWorkspaceSaveFlow.h"
+#if PLATFORM_MAC
+#include "GitWorkspaceFileGuard.h"
+#endif
 #include "Editor.h"
 #include "DeletedObjectPlaceholder.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -427,6 +430,8 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
                 const auto Ready = Async(EAsyncExecution::ThreadPool, [&] { return Repository.ValidateAssetSave(Permit, Entry.Path, Lease); }).Get();
                 if (!Ready.Ok()) LateError = Ready.Error;
             }
+            if (LateError.IsEmpty() && Permit.ContainsExternalActorPath(Entry.Path))
+                GitWorkspaceSession::AllowVerifiedExternalReplacement(Entry.Filename);
             return LateError.IsEmpty() ? ESavePackageResult::Success : ESavePackageResult::Error;
         });
         FSavePackageContext Context(nullptr, nullptr, MoveTemp(Settings)); Args.SavePackageContext = &Context;
@@ -434,8 +439,7 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
         UObject* Asset = Entry.Kind == FPackageSavePaths::EKind::Map ? static_cast<UObject*>(Entry.World.Get()) : nullptr;
         if (!UPackage::SavePackage(Entry.Package.Get(), Asset, *Entry.Filename, Args))
         { Entry.Package->SetDirtyFlag(true); return Fail(TEXT("Package write failed or was refused: ") + Entry.Path + (LateError.IsEmpty() ? FString() : TEXT("\n") + LateError)); }
-        Prepared.ExpectActorBatchWrite(FString());
-        UPackage::WaitForAsyncFileWrites(); Saved.Add(Entry.Path);
+        UPackage::WaitForAsyncFileWrites(); Prepared.ExpectActorBatchWrite(FString()); Saved.Add(Entry.Path);
         if (Entry.Kind == FPackageSavePaths::EKind::Map)
         {
             SavedMaps.Add(Entry.Path, FileHash(Entry.Filename));

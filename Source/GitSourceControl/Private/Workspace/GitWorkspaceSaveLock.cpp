@@ -7,6 +7,7 @@
 #include "Misc/SecureHash.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
+#include "GitWorkspaceFileGuard.h"
 #endif
 
 namespace GitWorkspace
@@ -198,6 +199,7 @@ FAssetSavePreparation FRepository::PrepareAssetSave(const FAssetSaveReview& Revi
         // Only locally recorded, freshly verified owned files become writable.
         const FString Full = FPaths::Combine(Ready.Local.Root, Path);
         const auto Check = CheckStashPaths({Path}, true);
+        GitWorkspaceSession::FVerifiedExternalPermissionScope Permission(Full);
         if (!Check.Ok() || !FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*Full, false))
             return Fail(TEXT("Save cancelled; cannot make the verified owned asset writable: ") + Path);
     }

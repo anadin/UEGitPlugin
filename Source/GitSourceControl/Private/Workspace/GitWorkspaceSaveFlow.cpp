@@ -34,6 +34,7 @@
 #include "UObject/StrongObjectPtr.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
+#include "GitWorkspaceFileGuard.h"
 #endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogGitWorkspaceSave, Log, All);
@@ -45,6 +46,9 @@ namespace
 bool bBusy = false;
 FCoreUObjectDelegates::FIsPackageOKToSaveDelegate PreviousGuard;
 FDelegateHandle GuardHandle;
+#if PLATFORM_MAC
+FDelegateHandle CleanupHandle, ProviderHandle;
+#endif
 TSharedPtr<GitWorkspace::FRepository, ESPMode::ThreadSafe> ProjectRepo;
 FString ProjectRepositoryRoot;
 FText SaveText(const FString& S) { return FText::FromString(S); }
@@ -87,8 +91,17 @@ void Blocked(const FString& Error)
 bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output)
 {
     if (PreviousGuard.IsBound() && !PreviousGuard.Execute(Package, Filename, Output)) return false;
-    if (!UsesWorkspace()) return true;
     const FString File = FPaths::ConvertRelativePathToFull(Filename);
+#if PLATFORM_MAC
+    // Changing providers cannot turn a known unsafe editor state into a save permit.
+    if (Inside(File, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir())) &&
+        GitWorkspaceSession::HasBlockedExternalCleanup(FPaths::ConvertRelativePathToFull(FPaths::ProjectDir())))
+    {
+        UE_LOG(LogGitWorkspaceSave, Warning, TEXT("Native cleanup recovery must be resolved with the editor closed before saving %s."), *Filename);
+        return false;
+    }
+#endif
+    if (!UsesWorkspace()) return true;
     // Never read the game-thread prepared scope from a background save.
     if (!IsInGameThread())
     {
@@ -120,6 +133,8 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
 #if PLATFORM_MAC
     FString RecoveryRoot, RecoveryGitDir;
     const FString SaveRoot = ActiveSave.IsSet() ? ActiveSave->Root : ProjectRepositoryRoot;
+    if (GitWorkspaceSession::HasBlockedExternalCleanup(SaveRoot))
+        Result.Error = TEXT("Native cleanup changed editor package state. Keep unsaved work in memory and resolve its recovery report with the editor closed before saving.");
     if (!SaveRoot.IsEmpty() && GitWorkspaceSession::FindRepository(SaveRoot, RecoveryRoot, RecoveryGitDir) &&
         IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(RecoveryGitDir)))
         Result.Error = TEXT("Resolve active asset/repository recovery before saving. Your unsaved edits remain in the editor.");
@@ -442,6 +457,13 @@ FString LockRemote()
 }
 void SetLockRemote(const FString& Remote)
 { GConfig->SetString(TEXT("GitWorkspace"), TEXT("LockRemote"), *Remote, GEditorPerProjectIni); }
+void ShowCleanupNotices()
+{
+#if PLATFORM_MAC
+    for (const auto& Message : GitWorkspaceSession::TakeBlockedCleanupNotices())
+        if (!IsRunningCommandlet()) FMessageDialog::Open(EAppMsgType::Ok, SaveText(Message), SaveText(TEXT("Git Workspace — native cleanup blocked")));
+#endif
+}
 void InstallGuard()
 {
     if (GuardHandle.IsValid()) return;
@@ -450,12 +472,29 @@ void InstallGuard()
     GuardHandle = FCoreUObjectDelegates::IsPackageOKToSaveDelegate.GetHandle();
     ProjectRepo = MakeShared<GitWorkspace::FRepository, ESPMode::ThreadSafe>(GitWorkspace::FindGitExecutable(FGitSourceControlModule::Get().AccessSettings().GetBinaryPath()), FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
     auto Repo = ProjectRepo; ProjectRepositoryRoot = Async(EAsyncExecution::ThreadPool, [Repo] { return Repo->Refresh(); }).Get().Root;
+#if PLATFORM_MAC
+    GitWorkspaceSession::EnableExternalCleanupGuard(UsesWorkspace());
+    ProviderHandle = ISourceControlModule::Get().RegisterProviderChanged(FSourceControlProviderChanged::FDelegate::CreateLambda([](ISourceControlProvider&, ISourceControlProvider& New)
+    { GitWorkspaceSession::EnableExternalCleanupGuard(HandlesProvider(New)); }));
+    CleanupHandle = FEditorDelegates::OnPackageDeleted.AddLambda([](UPackage* Package)
+    {
+        if (!UsesWorkspace() || !Package) return;
+        FString File;
+        if (FPackageName::DoesPackageExist(Package->GetName(), &File) && GitWorkspaceSession::IsExternalCleanupProtected(File))
+            GitWorkspaceSession::RecordBlockedExternalCleanup(File, TEXT("Unreviewed native package cleanup has already notified the registry; editor state needs reopening"));
+    });
+#endif
 }
 void RemoveGuard()
 {
     if (!GuardHandle.IsValid()) return;
     if (FCoreUObjectDelegates::IsPackageOKToSaveDelegate.GetHandle() == GuardHandle) FCoreUObjectDelegates::IsPackageOKToSaveDelegate = PreviousGuard;
     GuardHandle.Reset(); PreviousGuard.Unbind(); ProjectRepo.Reset(); ProjectRepositoryRoot.Empty();
+#if PLATFORM_MAC
+    FEditorDelegates::OnPackageDeleted.Remove(CleanupHandle); CleanupHandle.Reset();
+    ISourceControlModule::Get().UnregisterProviderChanged(ProviderHandle); ProviderHandle.Reset();
+    GitWorkspaceSession::ClearVerifiedExternalReplacement();
+#endif
 }
 #if PLATFORM_MAC
 FPreparedScope::FPreparedScope(GitWorkspace::FRepository& Repo, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root,
@@ -464,9 +503,9 @@ FPreparedScope::FPreparedScope(GitWorkspace::FRepository& Repo, const GitWorkspa
     check(IsInGameThread()); check(!ActiveSave.IsSet());
     ActiveSave.Emplace(FActiveSave{&Repo, &Permit, &Lease, FPaths::ConvertRelativePathToFull(Root), {}, ActorPlan, {}, MoveTemp(ValidateBatch)}); bInstalled = true;
 }
-FPreparedScope::~FPreparedScope() { if (bInstalled) ActiveSave.Reset(); }
+FPreparedScope::~FPreparedScope() { if (bInstalled) { GitWorkspaceSession::ClearVerifiedExternalReplacement(); ActiveSave.Reset(); } }
 void FPreparedScope::ExpectActorBatchWrite(const FString& Path)
-{ check(IsInGameThread()); check(bInstalled && ActiveSave.IsSet() && ActiveSave->ActorPlan); ActiveSave->ExpectedWrite = Path; }
+{ check(IsInGameThread()); check(bInstalled && ActiveSave.IsSet() && ActiveSave->ActorPlan); GitWorkspaceSession::ClearVerifiedExternalReplacement(); ActiveSave->ExpectedWrite = Path; }
 #endif
 void WrapCommand(TSharedRef<FUICommandList> List, TSharedPtr<const FUICommandInfo> Command, TFunction<TArray<UPackage*>()> GetPackages)
 {

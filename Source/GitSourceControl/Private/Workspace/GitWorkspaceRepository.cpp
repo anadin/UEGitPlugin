@@ -9,6 +9,7 @@
 #include "Misc/ScopeLock.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
+#include "GitWorkspaceFileGuard.h"
 #include "Serialization/JsonSerializer.h"
 #include <spawn.h>
 #include <sys/wait.h>
@@ -329,6 +330,8 @@ FSnapshot FRepository::RefreshInternal()
     FString RecoveryRoot, GitDir;
     if (GitWorkspaceSession::FindRepository(Root, RecoveryRoot, GitDir))
     {
+        if (GitWorkspaceSession::HasBlockedExternalCleanup(Root))
+        { Snapshot.bOperationInProgress = true; Snapshot.Error = TEXT("Resolve blocked native external-package cleanup with the editor closed before changing this checkout: ") + FPaths::Combine(GitDir, TEXT("uegit/native-cleanup")); }
         const FString Marker = GitWorkspaceSession::RecoveryFile(GitDir);
         if (IFileManager::Get().FileExists(*Marker))
         {

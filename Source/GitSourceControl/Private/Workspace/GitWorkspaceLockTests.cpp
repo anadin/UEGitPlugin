@@ -57,6 +57,9 @@
 #include "Framework/Commands/UICommandList.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
+#include "GitWorkspaceFileGuard.h"
+#include "ObjectTools.h"
+#include "Async/Async.h"
 #include <unistd.h>
 #include <sys/stat.h>
 #endif
@@ -406,6 +409,7 @@ bool FGitNewExternalActorTest::RunTest(const FString&)
         const bool bPartitioned = Case != 0, bMixed = Case == 2;
         auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
         TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(bPartitioned, Actors, bMixed); if (!TestNotNull(TEXT("New-actor owner"), World)) return false;
+        GitWorkspaceSession::FExternalCleanupTestScope CleanupProtection(F.Content);
         GitWorkspace::FRepository Repo(Files.Git, Files.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
         AActor* Actor = F.NewActor(World, TEXT("FirstSavedActor"), TEXT("First saved actor")); UPackage* Package = Actor->GetPackage(); const FGuid Guid = Actor->GetActorGuid();
         World->GetPackage()->SetDirtyFlag(bMixed);
@@ -539,6 +543,7 @@ bool FGitActorDeletionWritesTest::RunTest(const FString&)
     {
         auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
         TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(bPartitioned, Actors); if (!TestNotNull(TEXT("Deletion map"), World)) return false;
+        GitWorkspaceSession::FExternalCleanupTestScope CleanupProtection(F.Content);
         GitWorkspace::FRepository Repo(Files.Git, Files.Repo); GitWorkspaceSession::FLease Lease; FString Error;
         if (!TestTrue(TEXT("Deletion lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
         // Staged A and newer saved working B must survive independently.
@@ -592,6 +597,104 @@ bool FGitActorDeletionWritesTest::RunTest(const FString&)
         TestEqual(TEXT("Restored B exact"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Filename}).Text(), Bytes);
         TestEqual(TEXT("Restore leaves staged A"), Repo.Refresh().IndexEntries, Before.IndexEntries);
         F.Export(Export + TEXT("/Recovered"));
+    }
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalCleanupFileTest, "GitWorkspace.SaveLock.ExternalCleanupFileBoundary", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalCleanupFileTest::RunTest(const FString&)
+{
+    for (int32 Kind = 0; Kind < 5; ++Kind)
+    {
+        FLockFixture F; const FString Content = FPaths::Combine(F.Repo, TEXT("Content"));
+        const FString Path = TEXT("Content/__ExternalActors__/Probe/actor.uasset"), File = FPaths::Combine(F.Repo, Path);
+        IFileManager::Get().MakeDirectory(*FPaths::GetPath(File), true); F.Write(Path, TEXT("saved working bytes"));
+        const FString Other = FPaths::Combine(Content, TEXT("keep.txt")); F.Write(TEXT("Content/keep.txt"), TEXT("ordinary sentinel"));
+        F.Call({TEXT("add"), TEXT("Content")}); F.Call({TEXT("commit"), TEXT("-qm"), TEXT("cleanup boundary")});
+        GitWorkspace::FRepository Repo(F.Git, F.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+        FString GitRoot, GitDir; GitWorkspaceSession::FindRepository(F.Repo, GitRoot, GitDir);
+        const FString Marker = GitWorkspaceSession::RecoveryFile(GitDir);
+        // A previous stash/pull report must never be overwritten by this guard.
+        IFileManager::Get().MakeDirectory(*FPaths::GetPath(Marker), true);
+        FFileHelper::SaveStringToFile(TEXT("unrelated recovery marker"), *Marker, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        GitWorkspaceSession::FExternalCleanupTestScope Protection(Content);
+        auto& Platform = FPlatformFileManager::Get().GetPlatformFile();
+        if (Kind == 1) Platform.SetReadOnly(*File, true);
+        struct stat Original; stat(TCHAR_TO_UTF8(*File), &Original);
+        const FString Hash = F.Call({TEXT("hash-object"), TEXT("--no-filters"), File}).Text();
+        bool Result = true;
+        if (Kind == 0) Result = Async(EAsyncExecution::ThreadPool, [File] { return FPlatformFileManager::Get().GetPlatformFile().DeleteFile(*File); }).Get();
+        if (Kind == 1) Result = Platform.SetReadOnly(*File, false);
+        if (Kind == 2) Result = Platform.MoveFile(*FPaths::Combine(Content, TEXT("moved.uasset")), *File);
+        if (Kind == 3) { const TCHAR* Files[]{*Other, *File}; Result = Platform.DeleteFiles(MakeArrayView(Files)); }
+        if (Kind == 4) Result = Platform.DeleteDirectoryRecursively(*Content);
+        TestFalse(TEXT("Native destructive operation refused"), Result);
+        TestTrue(TEXT("Ordinary sentinel preserved in mixed batch/tree"), Platform.FileExists(*Other));
+        TestEqual(TEXT("Saved external bytes preserved"), F.Call({TEXT("hash-object"), TEXT("--no-filters"), File}).Text(), Hash);
+        struct stat After; stat(TCHAR_TO_UTF8(*File), &After); TestTrue(TEXT("Original inode and mode preserved"), Original.st_ino == After.st_ino && Original.st_mode == After.st_mode);
+        FString MarkerAfter; FFileHelper::LoadFileToString(MarkerAfter, *Marker); TestEqual(TEXT("Unrelated marker retained"), MarkerAfter, FString(TEXT("unrelated recovery marker")));
+        TestTrue(TEXT("Live recovery latched"), GitWorkspaceSession::HasBlockedExternalCleanup(F.Repo));
+        const auto State = Repo.Refresh(); TestTrue(TEXT("Workspace refuses more mutations"), State.bOperationInProgress && !Repo.Stage({Path}).Ok());
+        TestEqual(TEXT("Index preserved"), State.IndexEntries, Before.IndexEntries); TestEqual(TEXT("HEAD preserved"), State.Head, Before.Head);
+        TestEqual(TEXT("Stashes preserved"), Repo.ListStashes().Fingerprint, Stashes);
+        TArray<FString> Reports; IFileManager::Get().FindFiles(Reports, *FPaths::Combine(GitDir, TEXT("uegit/native-cleanup/*")), false, true);
+        TestTrue(TEXT("Durable report created"), Reports.Num() == 1 && IFileManager::Get().FileExists(*FPaths::Combine(GitDir, TEXT("uegit/native-cleanup"), Reports[0], TEXT("report.json"))));
+        IFileManager::Get().Delete(*Marker, false, false, true);
+        TestTrue(TEXT("Missing shared marker cannot bypass recovery"), GitWorkspaceSession::HasBlockedExternalCleanup(F.Repo));
+    }
+    // A different provider and storage outside the protected Content retain normal IO.
+    FLockFixture F; const FString Content = FPaths::Combine(F.Repo, TEXT("Content")); IFileManager::Get().MakeDirectory(*Content, true);
+    IFileManager::Get().MakeDirectory(*FPaths::Combine(Content, TEXT("__ExternalActors__")), true);
+    F.Write(TEXT("Content/__ExternalActors__/actor.uasset"), TEXT("other provider"));
+    GitWorkspaceSession::FExternalCleanupTestScope Protection(Content); GitWorkspaceSession::EnableExternalCleanupGuard(false);
+    ON_SCOPE_EXIT { GitWorkspaceSession::EnableExternalCleanupGuard(true); };
+    TestTrue(TEXT("Other provider retains normal deletion"), FPlatformFileManager::Get().GetPlatformFile().DeleteFile(*FPaths::Combine(Content, TEXT("__ExternalActors__/actor.uasset"))));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitNativeExternalCleanupTest, "GitWorkspace.SaveLock.ExternalCleanupNativeFileHelpers", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitNativeExternalCleanupTest::RunTest(const FString&)
+{
+    for (bool Partitioned : {false, true})
+    {
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+        ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(Partitioned, Actors);
+        if (!TestNotNull(TEXT("Native cleanup real map"), World)) return false;
+        GitWorkspaceSession::FExternalCleanupTestScope Protection(F.Content);
+        GitWorkspace::FRepository Repo(Files.Git, Files.Repo); GitWorkspaceSession::FLease Lease; FString Error;
+        if (!TestTrue(TEXT("Native fixture lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        TSharedPtr<const GitWorkspace::FAssetSavePermit, ESPMode::ThreadSafe> LastPermit;
+        auto Save = [&](const FString& Label)
+        {
+            Actors[0]->SetActorLabel(Label); const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+            const auto Ready = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), Plan.NewPaths, Plan.ExternalActorPaths), Lease, true);
+            LastPermit = Ready.Permit;
+            return Ready.Permit && GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content).Ok();
+        };
+        if (!TestTrue(TEXT("Protected existing actor write"), Save(TEXT("Staged actor A")))) return false;
+        UPackage* Package = Actors[0]->GetPackage(); FString File; FPackageName::DoesPackageExist(Package->GetName(), &File); File = FPaths::ConvertRelativePathToFull(File);
+        FString Path = File; FPaths::MakePathRelativeTo(Path, *(Files.Repo + TEXT("/")));
+        if (!TestTrue(TEXT("Stage saved A"), Repo.Stage({Path}).Ok()) || !TestTrue(TEXT("Protected repeat replacement"), Save(TEXT("Native cleanup actor B")))) return false;
+        const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint; const auto Locks = Repo.VerifyLocks(TEXT("origin"));
+        const FString Bytes = Files.Call({TEXT("hash-object"), TEXT("--no-filters"), File}).Text(); struct stat Mode; stat(TCHAR_TO_UTF8(*File), &Mode);
+        const FString Export = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Automation/NativeCleanupFixtures"), Partitioned ? TEXT("WorldPartition") : TEXT("OFPA")); F.Export(Export);
+        World->EditorDestroyActor(Actors[0], false); Actors[0] = nullptr; World->GetPackage()->SetDirtyFlag(false);
+        TestTrue(TEXT("Pending empty actor package"), Package->IsDirty() && UPackage::IsEmptyPackage(Package));
+        // This actual engine route cleans empty packages without consulting the save delegate.
+        // Native PR_Success is not proof of a disk deletion; CleanupAfterSuccessfulDelete is void.
+        FEditorFileUtils::PromptForCheckoutAndSave({Package}, false, false, nullptr, true, false);
+        TestEqual(TEXT("Native cleanup cannot remove saved B"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), File}).Text(), Bytes);
+        struct stat After; stat(TCHAR_TO_UTF8(*File), &After); TestTrue(TEXT("Native cleanup preserves mode/inode"), Mode.st_mode == After.st_mode && Mode.st_ino == After.st_ino);
+        const auto State = Repo.Refresh(); TestTrue(TEXT("Native engine state requires explicit recovery"), State.bOperationInProgress);
+        TestFalse(TEXT("Further stage refused"), Repo.Stage({Path}).Ok()); TestFalse(TEXT("Further save review refused"), Repo.ReviewAssetSave({Path}, TEXT("origin")).IsFresh());
+        TestEqual(TEXT("Staged A preserved"), State.IndexEntries, Before.IndexEntries); TestEqual(TEXT("HEAD preserved"), State.Head, Before.Head);
+        TestEqual(TEXT("Stashes preserved"), Repo.ListStashes().Fingerprint, Stashes);
+        TestEqual(TEXT("Owned lock retained"), Repo.VerifyLocks(TEXT("origin")).Locks.FindChecked(Path).Id, Locks.Locks.FindChecked(Path).Id);
+        {
+            // This inactive fixture mount is outside game Content, so explicitly
+            // enter its prepared repository scope. Never use the fatal default save error device.
+            GitWorkspaceSave::FPreparedScope Scope(Repo, *LastPermit, Lease, Files.Repo);
+            FSavePackageArgs Args; Args.SaveFlags = SAVE_NoError;
+            TestTrue(TEXT("Package-save guard blocks other writes after native state change"), !UPackage::SavePackage(World->GetPackage(), World, *FPaths::Combine(F.Content, TEXT("L_Actors.umap")), Args));
+        }
     }
     return true;
 }

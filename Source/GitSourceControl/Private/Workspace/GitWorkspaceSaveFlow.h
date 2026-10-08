@@ -23,6 +23,7 @@ void SetLockRemote(const FString& Remote);
 // Public in this private module for fixture acceptance tests and lifecycle checks.
 void InstallGuard();
 void RemoveGuard();
+void ShowCleanupNotices();
 struct FPackageSavePaths
 {
     enum class EKind : uint8 { Asset, Actor, BuildData, Map, DeleteActor };

@@ -1,5 +1,6 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitWorkspaceSession.h"
+#include "GitWorkspaceFileGuard.h"
 #include "Modules/ModuleManager.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
@@ -150,10 +151,11 @@ public:
         const double Deadline = FPlatformTime::Seconds() + 180;
         while (!GitWorkspaceSession::EditorLease.Acquire(Root, false, Error) && FPlatformTime::Seconds() < Deadline)
             FPlatformProcess::Sleep(0.1f);
-        const bool bRecovery = IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(GitDir));
+        const bool bMarker = IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(GitDir));
+        const bool bRecovery = bMarker || GitWorkspaceSession::HasBlockedExternalCleanup(Root);
         if (!Error.IsEmpty() || bRecovery)
         {
-            const FString Message = bRecovery ? TEXT("Git Workspace stopped an incomplete repository/asset operation. Project loading is blocked to protect assets. Review the recovery report at:\n") + GitWorkspaceSession::RecoveryFile(GitDir)
+            const FString Message = bRecovery ? TEXT("Git Workspace stopped an incomplete repository/asset operation. Project loading is blocked to protect assets. Review the recovery report at:\n") + (bMarker ? GitWorkspaceSession::RecoveryFile(GitDir) : FPaths::Combine(GitDir, TEXT("uegit/native-cleanup")))
                 : Error + TEXT("\nReopen the project when the operation finishes.");
             UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
             if (!IsRunningCommandlet()) FPlatformMisc::MessageBoxExt(EAppMsgType::Ok, *Message, TEXT("Git Workspace recovery"));
@@ -164,7 +166,9 @@ public:
             _exit(1);
         }
         GitWorkspaceSession::EditorRoot = Root;
+        GitWorkspaceSession::InstallExternalCleanupGuard(FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
     }
-    virtual void ShutdownModule() override { GitWorkspaceSession::EditorRoot.Empty(); GitWorkspaceSession::EditorLease.Release(); }
+    virtual void ShutdownModule() override { GitWorkspaceSession::RemoveExternalCleanupGuard(); GitWorkspaceSession::EditorRoot.Empty(); GitWorkspaceSession::EditorLease.Release(); }
+    virtual bool SupportsDynamicReloading() override { return false; }
 };
 IMPLEMENT_MODULE(FGitWorkspaceSessionModule, GitWorkspaceSession)
