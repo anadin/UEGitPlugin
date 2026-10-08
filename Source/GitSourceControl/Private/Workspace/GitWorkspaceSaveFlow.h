@@ -24,6 +24,7 @@ void InstallGuard();
 void RemoveGuard();
 struct FPackageSavePaths
 {
+    enum class EKind : uint8 { Asset, Actor, BuildData, Map };
     struct FEntry
     {
         TWeakObjectPtr<UPackage> Package;
@@ -31,9 +32,17 @@ struct FPackageSavePaths
         TWeakObjectPtr<AActor> Actor;
         FString PackageName, Path, Filename, WorldName, WorldFilename, WorldHash;
         FGuid ActorGuid;
+        EKind Kind = EKind::Asset;
+    };
+    struct FOwner
+    {
+        TWeakObjectPtr<UWorld> World;
+        TWeakObjectPtr<UObject> BuildData;
+        FString Name, Filename, Path, Hash, BuildDataName;
     };
     TArray<FString> Paths, NewPaths, ExternalActorPaths;
     TArray<FEntry> Entries;
+    TArray<FOwner> Owners;
     TArray<TWeakObjectPtr<UPackage>> Sources;
     FString Error;
     bool bCoordinatedActors = false;
@@ -41,6 +50,7 @@ struct FPackageSavePaths
 FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content);
 FPackageSavePaths GatherOrdinaryPackageSavePaths(const TArray<UPackage*>& Packages, const FString& Root, const FString& Content);
 FString ValidateExternalActorBinding(const FPackageSavePaths& Plan, const FString& Path, UPackage* Package);
+bool NeedsCoordinatedWorldSave(UPackage* Package);
 // Save As is a copy into an absent destination; the source is never renamed or saved.
 struct FAssetCopyDestination
 {
@@ -75,7 +85,8 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
 class FPreparedScope
 {
 public:
-    FPreparedScope(GitWorkspace::FRepository& Repository, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root, const FPackageSavePaths* ActorPlan = nullptr);
+    FPreparedScope(GitWorkspace::FRepository& Repository, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root,
+        const FPackageSavePaths* ActorPlan = nullptr, TFunction<FString(const FString&, UPackage*)> ValidateBatch = {});
     ~FPreparedScope();
     void ExpectActorBatchWrite(const FString& Path);
     FPreparedScope(const FPreparedScope&) = delete;

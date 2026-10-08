@@ -58,6 +58,7 @@ struct FActiveSave
     TSet<FString> Attempted;
     const FPackageSavePaths* ActorPlan;
     FString ExpectedWrite;
+    TFunction<FString(const FString&, UPackage*)> ValidateBatch;
 };
 TOptional<FActiveSave> ActiveSave;
 #endif
@@ -120,19 +121,21 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
     if (ActiveSave.IsSet() && ActiveSave->ActorPlan && Relative(File, ActiveSave->Root) != ActiveSave->ExpectedWrite)
         Result.Error = TEXT("Only the coordinator's current package write is authorized. A save callback cannot expand this batch.");
 #endif
-    if (File.Contains(TEXT("/__ExternalActors__/")) || File.Contains(TEXT("/__ExternalObjects__/")))
+    const bool bExternal = File.Contains(TEXT("/__ExternalActors__/")) || File.Contains(TEXT("/__ExternalObjects__/"));
+    if (Result.Error.IsEmpty() && (bExternal || NeedsCoordinatedWorldSave(Package)))
     {
 #if PLATFORM_MAC
         const FString Path = ActiveSave.IsSet() ? Relative(File, ActiveSave->Root) : FString();
-        if (!Result.Error.IsEmpty()) { /* Preserve the coordinator's refusal. */ }
-        else if (!ActiveSave.IsSet() || !ActiveSave->ActorPlan || !ActiveSave->Permit->ContainsExternalActorPath(Path))
-            Result.Error = TEXT("External packages require a coordinated, existing-actor save.");
-        else Result.Error = ValidateExternalActorBinding(*ActiveSave->ActorPlan, Path, Package);
+        if (!ActiveSave.IsSet() || !ActiveSave->ActorPlan || !ActiveSave->ValidateBatch || !ActiveSave->Permit->ContainsPath(Path) ||
+            (bExternal && !ActiveSave->Permit->ContainsExternalActorPath(Path)))
+            Result.Error = TEXT("External actors, their maps and build data require a coordinated save.");
 #else
         Result.Error = TEXT("Coordinated external actor saves are currently available on Mac only.");
 #endif
     }
 #if PLATFORM_MAC
+    if (Result.Error.IsEmpty() && ActiveSave.IsSet() && ActiveSave->ValidateBatch)
+        Result.Error = ActiveSave->ValidateBatch(Relative(File, ActiveSave->Root), Package);
     if (Result.Error.IsEmpty() && ActiveSave.IsSet() && Inside(File, ActiveSave->Root))
     {
         const FString Path = Relative(File, ActiveSave->Root);
@@ -336,13 +339,18 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
         Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, NewPaths, Remote, External = Destinations.ExternalActorPaths] { return Repo->ReviewAssetSave(Paths, Remote, NewPaths, External); }).Get();
     }
     if (!Review.IsFresh()) { Blocked(Review.Error); return; }
-    if (Review.Paths.IsEmpty()) { if (!Destinations.bCoordinatedActors) Original.ExecuteIfBound(); return; }
+    if (Review.Paths.IsEmpty())
+    { if (Destinations.bCoordinatedActors) Blocked(TEXT("Every package in a coordinated map save must use LFS and lockable attributes.")); else Original.ExecuteIfBound(); return; }
     FString Introduction;
     if (Destinations.bCoordinatedActors)
     {
-        Introduction = TEXT("Saving existing external actors. The owning map stays unchanged and is not locked by this save.\nActor deletion, new actor packages and dirty map/build data are not supported in this save yet.\n\n");
+        Introduction = TEXT("Saving the reviewed map, build data and actor edits. Clean files are not locked by this save.\nBuild data and actors save before their map. New actors, deletion and external objects are not supported yet.\n\n");
         for (const auto& Entry : Destinations.Entries)
+        {
             if (Entry.Actor.IsValid() && Entry.World.IsValid()) Introduction += Entry.Actor->GetActorLabel() + TEXT(" — ") + Entry.World->GetName() + TEXT("\n") + Entry.Path + TEXT("\n\n");
+            else if (Entry.Kind == FPackageSavePaths::EKind::Map || Entry.Kind == FPackageSavePaths::EKind::BuildData)
+                Introduction += FString(Entry.Kind == FPackageSavePaths::EKind::Map ? TEXT("Map: ") : TEXT("Build data: ")) + Entry.Path + TEXT("\n\n");
+        }
     }
     if (!Review.NeedsLock.IsEmpty() && !ConfirmLocks(Review, Introduction)) return;
 #if PLATFORM_MAC
@@ -365,7 +373,7 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     {
         const auto Result = WriteExternalActorSave(Destinations, *Repo, *Prepared.Permit, Access.Lease(), FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
         if (!Result.Ok()) { Blocked(Result.Error); return; }
-        FNotificationInfo Notice(SaveText(TEXT("Reviewed actor edits saved. Locks remain held; stage and commit when ready."))); Notice.ExpireDuration = 8.f;
+        FNotificationInfo Notice(SaveText(TEXT("Reviewed map/asset edits saved. Locks remain held; stage and commit when ready."))); Notice.ExpireDuration = 8.f;
         FSlateNotificationManager::Get().AddNotification(Notice); return;
     }
     FPreparedScope Permit(*Repo, *Prepared.Permit, Access.Lease(), Review.Local.Root);
@@ -436,10 +444,11 @@ void RemoveGuard()
     GuardHandle.Reset(); PreviousGuard.Unbind(); ProjectRepo.Reset(); ProjectRepositoryRoot.Empty();
 }
 #if PLATFORM_MAC
-FPreparedScope::FPreparedScope(GitWorkspace::FRepository& Repo, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root, const FPackageSavePaths* ActorPlan)
+FPreparedScope::FPreparedScope(GitWorkspace::FRepository& Repo, const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Root,
+    const FPackageSavePaths* ActorPlan, TFunction<FString(const FString&, UPackage*)> ValidateBatch)
 {
     check(IsInGameThread()); check(!ActiveSave.IsSet());
-    ActiveSave.Emplace(FActiveSave{&Repo, &Permit, &Lease, FPaths::ConvertRelativePathToFull(Root), {}, ActorPlan, {}}); bInstalled = true;
+    ActiveSave.Emplace(FActiveSave{&Repo, &Permit, &Lease, FPaths::ConvertRelativePathToFull(Root), {}, ActorPlan, {}, MoveTemp(ValidateBatch)}); bInstalled = true;
 }
 FPreparedScope::~FPreparedScope() { if (bInstalled) ActiveSave.Reset(); }
 void FPreparedScope::ExpectActorBatchWrite(const FString& Path)

@@ -5,6 +5,7 @@
 #include "Misc/PackageName.h"
 #include "Misc/ScopeExit.h"
 #include "UObject/SavePackage.h"
+#include "UObject/ObjectSaveContext.h"
 #include "UObject/StrongObjectPtr.h"
 #include "SGitWorkspace.h"
 #include "Misc/AutomationTest.h"
@@ -153,7 +154,14 @@ struct FMapSaveFixture
         Worlds.Emplace(World); return World;
     }
     void Keep(UWorld* World) { if (World) Worlds.Emplace(World); }
-    UWorld* ExistingActorWorld(bool bPartitioned, TArray<AActor*>& Actors)
+    void AddValidBuildData(UWorld* World)
+    {
+        auto* Data = World->PersistentLevel->GetOrCreateMapBuildData(); const FGuid Id = FGuid::NewGuid(); World->PersistentLevel->LevelBuildDataId = Id;
+        auto& Volume = Data->AllocateLevelPrecomputedLightVolumeBuildData(Id); Volume.Initialize(FBox(FVector(-100), FVector(100)));
+        FVolumeLightingSample Sample; Sample.Position = FVector3f(1, 2, 3); Sample.Radius = 10; Volume.AddHighQualityLightingSample(Sample); Volume.FinalizeSamples();
+        Data->LevelLightingQuality = Quality_Production; Data->MarkPackageDirty(); World->MarkPackageDirty();
+    }
+    UWorld* ExistingActorWorld(bool bPartitioned, TArray<AActor*>& Actors, bool bData = false)
     {
         const FString Name = Mount + TEXT("L_Actors");
         UWorld::InitializationValues Init; Init.CreateWorldPartition(bPartitioned).EnableWorldPartitionStreaming(false).CreateNavigation(false).CreateAISystem(false);
@@ -169,6 +177,12 @@ struct FMapSaveFixture
         // Bootstrap real fixtures in an isolated mount outside game Content.
         // This does not call the production first-save flow or acquire hosted locks.
         FSavePackageArgs Args; Args.TopLevelFlags = RF_Standalone; Args.SaveFlags = SAVE_NoError;
+        if (bData)
+        {
+            AddValidBuildData(World); auto* Data = World->PersistentLevel->MapBuildData.Get(); FString Filename;
+            FPackageName::TryConvertLongPackageNameToFilename(Data->GetPackage()->GetName(), Filename, TEXT(".uasset"));
+            if (!UPackage::SavePackage(Data->GetPackage(), Data, *Filename, Args)) return nullptr;
+        }
         for (UPackage* Package : World->PersistentLevel->GetLoadedExternalObjectPackages())
         {
             FString Filename; FPackageName::TryConvertLongPackageNameToFilename(Package->GetName(), Filename, TEXT(".uasset"));
@@ -179,6 +193,18 @@ struct FMapSaveFixture
         UPackage::WaitForAsyncFileWrites();
         if (!Files.Call({TEXT("add"), TEXT("Content")}).Ok() || !Files.Call({TEXT("commit"), TEXT("-qm"), TEXT("real external actor baseline")}).Ok()) return nullptr;
         return World;
+    }
+    void Export(const FString& Folder)
+    {
+        IFileManager::Get().DeleteDirectory(*Folder, false, true); IFileManager::Get().MakeDirectory(*Folder, true);
+        FFileHelper::SaveStringToFile(Mount, *FPaths::Combine(Folder, TEXT("mount.txt")));
+        TArray<FString> FilesToCopy; IFileManager::Get().FindFilesRecursive(FilesToCopy, *Content, TEXT("*"), true, false);
+        for (const auto& File : FilesToCopy)
+        {
+            FString Relative = File; FPaths::MakePathRelativeTo(Relative, *(Content + TEXT("/")));
+            const FString Target = FPaths::Combine(Folder, TEXT("Content"), Relative); IFileManager::Get().MakeDirectory(*FPaths::GetPath(Target), true);
+            IFileManager::Get().Copy(*Target, *File);
+        }
     }
     ~FMapSaveFixture()
     {
@@ -315,9 +341,11 @@ bool FGitActorSaveBoundariesTest::RunTest(const FString&)
     TestFalse(TEXT("World callback drift refuses before writing"), CallbackResult.Ok());
     TestFalse(TEXT("Pre-save callback cannot write even a reviewed actor"), bCallbackWrite);
     World->GetPackage()->SetDirtyFlag(true);
-    TestFalse(TEXT("Dirty map writes remain blocked"), GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content).Error.IsEmpty()); World->GetPackage()->SetDirtyFlag(false);
+    const auto DirtyMap = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    TestTrue(TEXT("Dirty map joins the reviewed actor set"), DirtyMap.Error.IsEmpty() && DirtyMap.Paths.Num() == 2); World->GetPackage()->SetDirtyFlag(false);
     World->PersistentLevel->GetOrCreateMapBuildData()->MarkPackageDirty();
-    TestFalse(TEXT("Dirty build data remains blocked"), GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content).Error.IsEmpty()); World->PersistentLevel->MapBuildData->GetPackage()->SetDirtyFlag(false);
+    const auto NewData = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    TestTrue(TEXT("New build data includes its existing map"), NewData.Error.IsEmpty() && NewData.Paths.Num() == 3 && NewData.NewPaths.Num() == 1); World->PersistentLevel->MapBuildData->GetPackage()->SetDirtyFlag(false);
     FActorSpawnParameters Params; Params.OverrideLevel = World->PersistentLevel;
     AActor* NewActor = World->SpawnActor<AActor>(AActor::StaticClass(), FTransform::Identity, Params); NewActor->SetPackageExternal(true); World->GetPackage()->SetDirtyFlag(false);
     TestFalse(TEXT("New actor first writes remain blocked"), GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content).Error.IsEmpty());
@@ -360,6 +388,129 @@ bool FGitActorPartialTest::RunTest(const FString&)
     TestTrue(TEXT("Both actor locks remain held"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == 2);
     TestEqual(TEXT("Partial write preserves index"), Repo.Refresh().IndexEntries, Before.IndexEntries);
     TestEqual(TEXT("Partial write preserves HEAD"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Partial write preserves stashes"), Repo.ListStashes().Fingerprint, Stashes);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalWorldWriteTest, "GitWorkspace.SaveLock.ExternalWorldMapAndBuildData", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalWorldWriteTest::RunTest(const FString&)
+{
+    for (int32 Case = 0; Case < 3; ++Case)
+    {
+        const bool bPartitioned = Case != 0, bExistingData = Case != 2;
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+        TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(bPartitioned, Actors, bExistingData);
+        if (!TestNotNull(TEXT("External world fixture"), World)) return false;
+        GitWorkspace::FRepository Repo(Files.Git, Files.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+        if (!bExistingData) F.AddValidBuildData(World);
+        UMapBuildDataRegistry* Data = World->PersistentLevel->MapBuildData;
+        Data->LevelLightingQuality = Quality_High; Data->MarkPackageDirty();
+        World->GetWorldSettings()->Modify(); World->GetWorldSettings()->KillZ = -34567.f;
+        Actors[0]->Modify(); Actors[0]->SetActorLabel(TEXT("Coordinated actor edit"));
+        const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Map, build data and one actor reviewed: ") + Plan.Error, Plan.Error.IsEmpty() && Plan.Paths.Num() == 3 && Plan.ExternalActorPaths.Num() == 1 && Plan.NewPaths.Num() == (bExistingData ? 0 : 1))) return false;
+        TestTrue(TEXT("Dependency writes precede the map"), Plan.Entries[0].Kind == GitWorkspaceSave::FPackageSavePaths::EKind::BuildData && Plan.Entries.Last().Kind == GitWorkspaceSave::FPackageSavePaths::EKind::Map);
+        const auto FromData = GitWorkspaceSave::GatherPackageSavePaths({Data->GetPackage()}, Files.Repo, F.Content);
+        TestEqual(TEXT("Save All resolves exact map owner from build data alone"), FromData.Paths, Plan.Paths);
+        GitWorkspaceSession::FLease Lease; FString Error; if (!TestTrue(TEXT("World-save lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        auto Review = Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), Plan.NewPaths, Plan.ExternalActorPaths);
+        TestFalse(TEXT("Cancellation acquires no map/data/actor locks"), Repo.PrepareAssetSave(Review, Lease, false).Result.Ok());
+        TestTrue(TEXT("Cancellation leaves all edits dirty"), World->GetPackage()->IsDirty() && Data->GetPackage()->IsDirty() && Actors[0]->GetPackage()->IsDirty());
+        auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+        if (!TestTrue(TEXT("World-save locks: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+        TArray<FString> Written;
+        const auto Track = UPackage::PackageSavedWithContextEvent.AddLambda([&](const FString&, UPackage* Package, FObjectPostSaveContext Context)
+        { if (Context.SaveSucceeded()) for (const auto& Entry : Plan.Entries) if (Entry.Package.Get() == Package) Written.Add(Entry.Path); });
+        const auto Result = GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Prepared.Permit, Lease, F.Content);
+        UPackage::PackageSavedWithContextEvent.Remove(Track);
+        if (!TestTrue(TEXT("Coordinated world save: ") + Result.Error, Result.Ok())) return false;
+        TestTrue(TEXT("Map saved after its dependency and actor"), Written.Num() == 3 && Written[0] == Plan.Entries[0].Path && Written.Last() == Plan.Entries.Last().Path);
+        TestTrue(TEXT("Written map/data/actor are clean"), !World->GetPackage()->IsDirty() && !Data->GetPackage()->IsDirty() && !Actors[0]->GetPackage()->IsDirty());
+        TestEqual(TEXT("Edited map value retained"), World->GetWorldSettings()->KillZ, -34567.f);
+        TestTrue(TEXT("Same modern registry and valid volume retained"), World->PersistentLevel->MapBuildData == Data && Data->LevelLightingQuality == Quality_High && Data->IsLightingValid(ERHIFeatureLevel::SM5));
+        const auto Locks = Repo.VerifyLocks(TEXT("origin"));
+        bool bExactLocks = Locks.IsFresh() && Locks.Locks.Num() == Plan.Paths.Num();
+        for (const FString& Path : Plan.Paths) bExactLocks &= Locks.Locks.Contains(Path) && Locks.Locks[Path].bOurs;
+        TestTrue(TEXT("Exactly the reviewed map/data/dirty actor locks are owned; clean actors stay unlocked"), bExactLocks);
+        TestEqual(TEXT("World save preserves staging"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("World save preserves HEAD"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("World save preserves stashes"), Repo.ListStashes().Fingerprint, Stashes);
+        if (bExistingData) F.Export(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Automation/ExternalWorldFixtures"), bPartitioned ? TEXT("WorldPartition") : TEXT("OFPA")));
+    }
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalWorldCallbackTest, "GitWorkspace.SaveLock.ExternalWorldCallbacksAndBinding", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalWorldCallbackTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(true, Actors, true); if (!TestNotNull(TEXT("Callback world fixture"), World)) return false;
+    auto* Data = World->PersistentLevel->MapBuildData.Get();
+    World->GetWorldSettings()->Modify(); World->GetWorldSettings()->KillZ = -123456.f; Data->LevelLightingQuality = Quality_High; Data->MarkPackageDirty();
+    Actors[0]->Modify(); Actors[0]->SetActorLabel(TEXT("Callback reviewed edit"));
+    const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Callback plan: ") + Plan.Error, Plan.Error.IsEmpty() && Plan.Paths.Num() == 3)) return false;
+    TMap<FString, FString> Bytes; for (const auto& Entry : Plan.Entries) Bytes.Add(Entry.Path, Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Entry.Filename}).Text());
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); const auto Before = Repo.Refresh();
+    GitWorkspaceSession::FLease Lease; FString Error; if (!TestTrue(TEXT("Callback lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths), Lease, true);
+    if (!TestTrue(TEXT("Callback permits"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    {
+        GitWorkspaceSave::FPreparedScope NoPlan(Repo, *Prepared.Permit, Lease, Files.Repo); FSavePackageArgs Args; Args.TopLevelFlags = RF_Standalone; Args.SaveFlags = SAVE_NoError;
+        TestFalse(TEXT("Permit without map plan cannot write external world"), UPackage::SavePackage(World->GetPackage(), World, *Plan.Owners[0].Filename, Args));
+        TestFalse(TEXT("Permit without map plan cannot write its build data"), UPackage::SavePackage(Data->GetPackage(), Data, *Plan.Entries[0].Filename, Args));
+    }
+    const auto Pre = FEditorDelegates::PreSaveWorldWithContext.AddLambda([&](UWorld* W, FObjectPreSaveContext)
+    { if (W == World) { Actors[1]->Modify(); Actors[1]->SetActorLabel(TEXT("Unreviewed pre-world actor")); } });
+    TestFalse(TEXT("Editor world callback cannot expand dirty set"), GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Prepared.Permit, Lease, F.Content).Ok());
+    FEditorDelegates::PreSaveWorldWithContext.Remove(Pre); Actors[1]->GetPackage()->SetDirtyFlag(false);
+    const auto Late = FCoreUObjectDelegates::OnObjectPreSave.AddLambda([&](UObject* Object, FObjectPreSaveContext)
+    { if (Object == Data) { Actors[1]->Modify(); Actors[1]->SetActorLabel(TEXT("Unreviewed core-presave actor")); } });
+    const auto LateResult = GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Prepared.Permit, Lease, F.Content);
+    FCoreUObjectDelegates::OnObjectPreSave.Remove(Late); Actors[1]->GetPackage()->SetDirtyFlag(false);
+    TestTrue(TEXT("Late validator refuses core PreSave drift before dependency file write"), !LateResult.Ok() && LateResult.Error.Contains(TEXT("Dirty packages changed")));
+    const auto Association = UPackage::PreSavePackageWithContextEvent.AddLambda([&](UPackage* P, FObjectPreSaveContext)
+    { if (P == Data->GetPackage()) World->PersistentLevel->MapBuildData = nullptr; });
+    TestFalse(TEXT("Registry association drift refuses before writing"), GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Prepared.Permit, Lease, F.Content).Ok());
+    UPackage::PreSavePackageWithContextEvent.Remove(Association); World->PersistentLevel->MapBuildData = Data;
+    for (const auto& Entry : Plan.Entries) TestEqual(TEXT("Refusals preserve package bytes: ") + Entry.Path, Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Entry.Filename}).Text(), Bytes[Entry.Path]);
+    const auto Post = FEditorDelegates::PostSaveWorldWithContext.AddLambda([&](UWorld* W, FObjectPostSaveContext Context)
+    { if (W == World && Context.SaveSucceeded()) { Actors[0]->Modify(); Actors[0]->SetActorLabel(TEXT("New post-save edit")); } });
+    const auto PostResult = GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Prepared.Permit, Lease, F.Content);
+    FEditorDelegates::PostSaveWorldWithContext.Remove(Post);
+    TestTrue(TEXT("New post-save edits are reported and stay unsaved"), !PostResult.Ok() && PostResult.Error.Contains(TEXT("new unsaved edits")) && Actors[0]->GetPackage()->IsDirty());
+    TestTrue(TEXT("All locks remain held"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == 3); TestEqual(TEXT("Callbacks preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalWorldPartialTest, "GitWorkspace.SaveLock.ExternalWorldPartialAndRetry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalWorldPartialTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(false, Actors, true); if (!TestNotNull(TEXT("Partial world fixture"), World)) return false;
+    auto* Data = World->PersistentLevel->MapBuildData.Get(); World->GetWorldSettings()->Modify(); World->GetWorldSettings()->KillZ = -67890.f;
+    Data->LevelLightingQuality = Quality_High; Data->MarkPackageDirty(); Actors[0]->Modify(); Actors[0]->SetActorLabel(TEXT("Partial world edit"));
+    const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Partial world plan: ") + Plan.Error, Plan.Error.IsEmpty() && Plan.Paths.Num() == 3)) return false;
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+    TMap<FString, FString> Bytes; for (const auto& Entry : Plan.Entries) Bytes.Add(Entry.Path, Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Entry.Filename}).Text());
+    GitWorkspaceSession::FLease Lease; FString Error; if (!TestTrue(TEXT("Partial world lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    FFileHelper::SaveStringToFile(Plan.Paths.Last(), *FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths), Lease, true);
+    TestTrue(TEXT("Partial reservation retains acquired map/data locks"), !Prepared.Result.Ok() && Prepared.AcquiredPaths.Num() == 2);
+    for (const auto& Entry : Plan.Entries) TestEqual(TEXT("Partial acquisition writes no package"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Entry.Filename}).Text(), Bytes[Entry.Path]);
+    IFileManager::Get().Delete(*FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths), Lease, true);
+    if (!TestTrue(TEXT("Retry reservations"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    GitWorkspaceSave::RemoveGuard(); const auto Previous = FCoreUObjectDelegates::IsPackageOKToSaveDelegate;
+    FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([Map = Plan.Owners[0].Filename](UPackage*, const FString& File, FOutputDevice*) { return FPaths::ConvertRelativePathToFull(File) != Map; });
+    GitWorkspaceSave::InstallGuard(); const auto Partial = GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Prepared.Permit, Lease, F.Content);
+    GitWorkspaceSave::RemoveGuard(); FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Previous; GitWorkspaceSave::InstallGuard();
+    TestTrue(TEXT("Failed map reports completed data/actor and pending map"), !Partial.Ok() && Partial.Error.Contains(TEXT("Saved: ") + Plan.Entries[0].Path) && Partial.Error.Contains(TEXT("Not completed: ") + Plan.Owners[0].Path));
+    TestEqual(TEXT("Failed map bytes stay unchanged"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Plan.Owners[0].Filename}).Text(), Bytes[Plan.Owners[0].Path]);
+    TestTrue(TEXT("Pending map stays dirty, completed dependency/actor clean"), World->GetPackage()->IsDirty() && !Data->GetPackage()->IsDirty() && !Actors[0]->GetPackage()->IsDirty());
+    const auto Retry = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    TestTrue(TEXT("Retry reviews only the remaining map"), Retry.Error.IsEmpty() && Retry.Paths == TArray<FString>{Plan.Owners[0].Path} && Retry.ExternalActorPaths.IsEmpty());
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Retry.Paths, TEXT("origin")), Lease, true);
+    if (!TestTrue(TEXT("Map-only retry permit"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const auto Result = GitWorkspaceSave::WriteExternalActorSave(Retry, Repo, *Prepared.Permit, Lease, F.Content);
+    TestTrue(TEXT("Map-only retry completes: ") + Result.Error, Result.Ok()); TestFalse(TEXT("Successful retry clears map dirty state"), World->GetPackage()->IsDirty());
+    TestTrue(TEXT("Retry retains all map/data/actor locks"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == 3);
+    TestEqual(TEXT("Partial and retry preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("Partial and retry preserve HEAD"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Partial and retry preserve stashes"), Repo.ListStashes().Fingerprint, Stashes);
     return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitMapNameCopyTest, "GitWorkspace.SaveLock.MapFirstSaveAndCopy", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
