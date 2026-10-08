@@ -57,7 +57,7 @@ FString ExistingWorldError(UWorld* World, const FString& Root, const FString& Co
         return TEXT("External actor saves currently support one persistent editor map. Stop Play/Simulate; sublevels and level instances need a separate save adapter.");
     UPackage* Map = World->GetPackage();
     if (FPackageName::IsTempPackage(Map->GetName()))
-        return TEXT("Name this WP/OFPA map using Save Current Level first, then retry Save All. Save As copies of named external maps are not supported yet.");
+        return TEXT("Name this WP/OFPA map using Save Current Level first, then retry Save All.");
     const bool bExists = FPackageName::DoesPackageExist(Map->GetName(), &Filename);
     const bool bFirst = Map->HasAnyPackageFlags(PKG_NewlyCreated) && !bExists;
     if (bFirst)
@@ -329,7 +329,7 @@ FString ValidateExternalActorBinding(const FPackageSavePaths& Plan, const FStrin
 }
 #if PLATFORM_MAC
 GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitWorkspace::FRepository& Repository,
-    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content)
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, TFunction<FString()> ValidateContext)
 {
     check(IsInGameThread());
     const FString Root = Repository.Refresh().Root;
@@ -355,6 +355,7 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
     for (const auto& Owner : Plan.Owners) if (Owner.World.IsValid()) Worlds.Emplace(Owner.World.Get()); else return Fail(TEXT("An owning world is no longer loaded."));
     auto CheckBatch = [&]() -> FString
     {
+        if (ValidateContext) { const FString Error = ValidateContext(); if (!Error.IsEmpty()) return Error; }
         for (const auto& Entry : Plan.Entries)
             if (Saved.Contains(Entry.Path) && Entry.Package.IsValid() && Entry.Package->IsDirty())
                 return TEXT("A completed package has new unsaved edits from a save callback: ") + Entry.Path;

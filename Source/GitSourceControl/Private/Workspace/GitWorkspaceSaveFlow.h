@@ -60,9 +60,16 @@ struct FAssetCopyDestination
     FString PackageName, Path, Filename, Error;
 };
 FAssetCopyDestination ReviewAbsentDestination(const FString& PackageName, const FString& SourcePackage, const FString& Root, const FString& Content, bool bMap);
-// First Save names the live world; ordinary-map Save As copies it.
+// First Save names the live world; Save As preserves its source packages.
 struct FMapSaveDestination
 {
+    struct FSourceFile
+    {
+        TWeakObjectPtr<UPackage> Package;
+        FString Name, Filename, Hash;
+        uint32 Mode = 0;
+        bool bDirty = false, bExists = false, bReadOnly = false;
+    };
     struct FActorDestination
     {
         TWeakObjectPtr<AActor> Actor;
@@ -72,15 +79,21 @@ struct FMapSaveDestination
     };
     FAssetCopyDestination Map, BuildData;
     TArray<FActorDestination> Actors;
+    TArray<FSourceFile> SourceFiles;
+    TArray<TWeakObjectPtr<AActor>> SourceActors;
+    TArray<FString> SourceActorFolders, SourceObjectFolders;
     FString SourcePackage, Error;
     TWeakObjectPtr<UObject> SourceBuildData, SourceLevel, SourcePartition;
-    bool bNameCurrent = false, bExternalFirstSave = false;
+    bool bNameCurrent = false, bExternalFirstSave = false, bExternalCopy = false;
     TArray<FString> ExternalPaths() const { TArray<FString> Out; for (const auto& Actor : Actors) Out.Add(Actor.Target.Path); Out.Sort(); return Out; }
     TArray<FString> Paths() const { TArray<FString> Out{Map.Path}; if (!BuildData.Path.IsEmpty()) Out.Add(BuildData.Path); Out.Append(ExternalPaths()); Out.Sort(); return Out; }
 };
 FString ReviewMapSource(UWorld* World);
 FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary);
 void ReviewExternalFirstMapActors(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);
+FString ReviewOFPACopySource(UWorld* World);
+FString CaptureOFPACopySource(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);
+FString ValidateOFPACopySource(UWorld* World, const FMapSaveDestination& Destination);
 FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageName, const FString& Root, const FString& Content);
 bool SupportsAssetCopy(const UObject* Source);
 UObject* GetCopySource(const FAssetEditorToolkit& Editor);
@@ -91,7 +104,7 @@ FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& Pack
 #if PLATFORM_MAC
 // Writes/deletes only the reviewed set, preserving deletion recovery and staging.
 GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitWorkspace::FRepository& Repository,
-    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content);
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, TFunction<FString()> ValidateContext = {});
 struct FActorDeletionRecovery { FString Folder, Marker, Manifest, Path, Hash, Head, Branch, Stashes; TArray<uint8> IndexEntries; bool bActive = false; };
 GitWorkspace::FResult RemoveExternalActorFile(const FPackageSavePaths& Plan, const FPackageSavePaths::FEntry& Entry, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, FActorDeletionRecovery& Recovery);
@@ -102,6 +115,8 @@ GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestinatio
 GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
 GitWorkspace::FResult WriteExternalFirstMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
+GitWorkspace::FResult WriteOFPACopyDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
 class FPreparedScope
 {

@@ -30,7 +30,7 @@ FString ReviewMapSource(UWorld* World)
     if (World->GetWorldPartition() || Level->IsUsingExternalActors() || Level->IsUsingExternalObjects() || !World->GetPackage()->GetExternalPackages().IsEmpty())
     {
         if (FPackageName::IsTempPackage(World->GetPackage()->GetName())) return ReviewExternalFirstMapSource(World, true);
-        return TEXT("Save As copies for World Partition / OFPA maps need unloaded-actor and companion remapping. Use Save for the current map; map copies are not supported yet.");
+        return ReviewOFPACopySource(World);
     }
     if (World->GetCurrentLevel() != Level || World->GetLevels().Num() != 1 || !World->GetStreamingLevels().IsEmpty() || World->WorldComposition)
         return TEXT("Streaming, sublevel and World Composition saves need a separate map workflow. Save an ordinary persistent map here.");
@@ -51,6 +51,9 @@ FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageNa
     Out.SourceLevel = World->PersistentLevel; Out.SourcePartition = World->GetWorldPartition();
     Out.bNameCurrent = FPackageName::IsTempPackage(Out.SourcePackage);
     Out.bExternalFirstSave = Out.bNameCurrent && World->PersistentLevel->IsUsingExternalActors();
+    Out.bExternalCopy = !Out.bNameCurrent && World->PersistentLevel->IsUsingExternalActors();
+    if (Out.bExternalCopy)
+    { Out.Error = CaptureOFPACopySource(World, Root, Content, Out); if (!Out.Error.IsEmpty()) return Out; }
     Out.Map = ReviewAbsentDestination(PackageName, Out.SourcePackage, Root, Content, true);
     if (!Out.Map.Error.IsEmpty()) { Out.Error = Out.Map.Error; return Out; }
     // Refuse orphan companion data even when the source has none. Never delete
@@ -66,7 +69,7 @@ FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageNa
         if (!FPackageName::TryConvertLongPackageNameToFilename(Path, Filename) || IFileManager::Get().DirectoryExists(*Filename) || IFileManager::Get().FileExists(*Filename))
         { Out.Error = TEXT("The destination has an external-package directory or cannot be resolved. Choose a fresh map destination."); return Out; }
     }
-    if (Out.bExternalFirstSave) ReviewExternalFirstMapActors(World, Root, Content, Out);
+    if (Out.bExternalFirstSave || Out.bExternalCopy) ReviewExternalFirstMapActors(World, Root, Content, Out);
     return Out;
 }
 #if PLATFORM_MAC
@@ -81,6 +84,8 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
     if (Current.SourcePackage != Destination.SourcePackage || Current.SourceBuildData != Destination.SourceBuildData ||
         Current.SourceLevel != Destination.SourceLevel || Current.SourcePartition != Destination.SourcePartition ||
         Current.bNameCurrent != Destination.bNameCurrent || Current.bExternalFirstSave != Destination.bExternalFirstSave ||
+        Current.bExternalCopy != Destination.bExternalCopy ||
+        Current.SourceActorFolders != Destination.SourceActorFolders || Current.SourceObjectFolders != Destination.SourceObjectFolders ||
         Current.Map.Filename != Destination.Map.Filename || Current.Paths() != Destination.Paths() || Current.Actors.Num() != Destination.Actors.Num())
         return Fail(TEXT("The map or its build-data package changed after review. Review the complete package set again."));
     for (int32 I = 0; I < Current.Actors.Num(); ++I)
@@ -88,7 +93,7 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
         const auto& A = Current.Actors[I]; const auto& B = Destination.Actors[I];
         if (A.Actor != B.Actor || A.Guid != B.Guid || A.SourcePackage != B.SourcePackage || A.SourcePath != B.SourcePath || A.Label != B.Label || A.Target.PackageName != B.Target.PackageName)
             return Fail(TEXT("An actor or its package identity changed after map naming review. Review all destinations again."));
-        if (!Permit.ContainsExternalActorPath(A.Target.Path)) return Fail(TEXT("Actor naming requires an explicit coordinated first-save permit."));
+        if (!Permit.ContainsExternalActorPath(A.Target.Path)) return Fail(TEXT("Actor destinations require an explicit coordinated first-save permit."));
     }
     for (const FString& Path : Current.Paths())
     {
@@ -96,6 +101,11 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
         const auto Ready = Repository.ValidateAssetSave(Permit, Path, Lease); if (!Ready.Ok()) return Ready;
     }
     if (Current.bExternalFirstSave) return WriteExternalFirstMapDestination(Source, Current, Repository, Permit, Lease, Content, OutWorld);
+    if (Current.bExternalCopy)
+    {
+        const FString Error = ValidateOFPACopySource(Source, Destination); if (!Error.IsEmpty()) return Fail(Error);
+        return WriteOFPACopyDestination(Source, Destination, Repository, Permit, Lease, Content, OutWorld);
+    }
     TStrongObjectPtr<UWorld> HoldSource(Source);
     FPreparedScope Prepared(Repository, Permit, Lease, Root);
     UPackage* Package = CreatePackage(*Current.Map.PackageName);

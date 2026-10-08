@@ -316,9 +316,11 @@ void ExecuteMapSaveAs(UWorld* World, const FExecuteAction& Original)
     if (Review.Paths.Num() != Paths.Num()) { Blocked(TEXT("Every map/actor/build-data destination must be LFS and lockable. Review .gitattributes first.")); return; }
     FString Introduction = bNameCurrent ? TEXT("This names and saves the current map and its build data. You keep editing this map.\n\n") :
         TEXT("This saves a new map copy and its build data. The original stays open with its unsaved edits. Open the copy from Content Browser to switch maps.\n\n");
-    if (Destination.bExternalFirstSave)
+    if (Destination.bExternalFirstSave || Destination.bExternalCopy)
     {
-        Introduction = TEXT("This names the current WP/OFPA map and remaps its external actors. Every new file is locked before naming; actors and build data are saved before the map. You keep editing this map. Locks remain held.\n\n");
+        Introduction = Destination.bExternalCopy ?
+            TEXT("This copies the current OFPA map, external actors and modern build data into new locked files. Copied actors receive new identities. The original stays open with its unsaved edits; its files and locks are preserved. Open the copy from Content Browser to switch maps. Locks remain held.\n\n") :
+            TEXT("This names the current WP/OFPA map and remaps its external actors. Every new file is locked before naming; actors and build data are saved before the map. You keep editing this map. Locks remain held.\n\n");
         for (const auto& Actor : Destination.Actors) Introduction += TEXT("New actor: ") + Actor.Label + TEXT("\n") + Actor.Target.Path + TEXT("\n\n");
     }
     if (!ConfirmLocks(Review, Introduction)) return;
