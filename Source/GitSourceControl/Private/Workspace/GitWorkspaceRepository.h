@@ -206,7 +206,7 @@ struct FAssetSaveReview
 {
     FSnapshot Local;
     FLockSnapshot Locks;
-    TArray<FString> Paths, NeedsLock, NewPaths, ExternalActorPaths;
+    TArray<FString> Paths, NeedsLock, NewPaths, ExternalActorPaths, DeletePaths;
     TArray<uint8> RawHashes;
     FString Fingerprint, Error;
     bool bValid = false;
@@ -220,6 +220,7 @@ public:
     bool ContainsPath(const FString& Path) const { return Review.Paths.Contains(Path); }
     bool ContainsNewPath(const FString& Path) const { return Review.NewPaths.Contains(Path); }
     bool ContainsExternalActorPath(const FString& Path) const { return Review.ExternalActorPaths.Contains(Path); }
+    bool ContainsDeletePath(const FString& Path) const { return Review.DeletePaths.Contains(Path); }
 private:
     friend class FRepository;
     FAssetSaveReview Review;
@@ -237,7 +238,7 @@ public:
     FRepository(FString InGit, FString InDirectory);
     FSnapshot Refresh();
     // External actors require a game-thread package/owning-map plan as well as this permit.
-    FAssetSaveReview ReviewAssetSave(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths = {}, const TArray<FString>& ExternalActorPaths = {});
+    FAssetSaveReview ReviewAssetSave(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths = {}, const TArray<FString>& ExternalActorPaths = {}, const TArray<FString>& DeletePaths = {});
 #if PLATFORM_MAC
     FAssetSavePreparation PrepareAssetSave(const FAssetSaveReview& Reviewed, const GitWorkspaceSession::FLease& Lease, bool bLockConfirmed = false);
     FResult ValidateAssetSave(const FAssetSavePermit& Permit, const FString& Path, const GitWorkspaceSession::FLease& Lease);
@@ -280,7 +281,7 @@ public:
     const FString& GitExecutable() const { return GitBinary; }
     const FString& Directory() const { return RequestedDirectory; }
 private:
-    FAssetSaveReview ReviewAssetSaveInternal(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths = {}, const TArray<FString>& ExternalActorPaths = {});
+    FAssetSaveReview ReviewAssetSaveInternal(const TArray<FString>& Paths, const FString& Remote, const TArray<FString>& NewPaths = {}, const TArray<FString>& ExternalActorPaths = {}, const TArray<FString>& DeletePaths = {});
     FResult CheckNewAssetPath(const FString& Path, const FSnapshot& Local) const;
     FResult IsLockableAssetInternal(const FString& Path) const;
     FDiscardReview ReviewDiscardInternal(const TArray<FString>& Paths);

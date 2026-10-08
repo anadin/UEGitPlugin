@@ -8,6 +8,8 @@
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #if PLATFORM_MAC
+#include "GitWorkspaceSession.h"
+#include "Serialization/JsonSerializer.h"
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -323,6 +325,33 @@ FSnapshot FRepository::RefreshInternal()
         const FString StatePath = R.Text().TrimEnd();
         Snapshot.bOperationInProgress |= IFileManager::Get().FileExists(*StatePath) || IFileManager::Get().DirectoryExists(*StatePath);
     }
+#if PLATFORM_MAC
+    FString RecoveryRoot, GitDir;
+    if (GitWorkspaceSession::FindRepository(Root, RecoveryRoot, GitDir))
+    {
+        const FString Marker = GitWorkspaceSession::RecoveryFile(GitDir);
+        if (IFileManager::Get().FileExists(*Marker))
+        {
+            FString Text, Operation; TSharedPtr<FJsonObject> Json;
+            const bool bKnown = FFileHelper::LoadFileToString(Text, *Marker) && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Json) &&
+                Json && Json->TryGetStringField(TEXT("operation"), Operation);
+            // The other asset operations clear their own marker only after
+            // repository verification. Deletion also needs a live-editor gate:
+            // retain unsaved work while incomplete recovery is inspected.
+            if (bKnown && Operation == TEXT("external-actor-delete"))
+            { Snapshot.bOperationInProgress = true; Snapshot.Error = TEXT("Resolve active actor deletion recovery before changing this checkout: ") + Marker; }
+        }
+        // A changed/missing shared marker must not hide an unfinished removal.
+        // Failed backups with no moved file and completed retained backups do
+        // not block; legacy stash/pull recovery formats keep their own checks.
+        const FString Store = FPaths::Combine(GitDir, TEXT("uegit/actor-delete")); TArray<FString> Folders;
+        IFileManager::Get().FindFiles(Folders, *FPaths::Combine(Store, TEXT("*")), false, true);
+        for (const auto& Folder : Folders)
+            if (IFileManager::Get().FileExists(*FPaths::Combine(Store, Folder, TEXT("removed.uasset"))) &&
+                !IFileManager::Get().FileExists(*FPaths::Combine(Store, Folder, TEXT("complete.json"))))
+            { Snapshot.bOperationInProgress = true; Snapshot.Error = TEXT("Resolve unfinished actor deletion recovery before changing this checkout: ") + FPaths::Combine(Store, Folder); break; }
+    }
+#endif
     R = Git({TEXT("ls-files"), TEXT("--stage"), TEXT("-z")});
     if (!R.Ok() || R.Out != Snapshot.IndexEntries) { Snapshot.Error = TEXT("The index changed during refresh. Refresh again."); return Snapshot; }
     const FResult Head = Git({TEXT("rev-parse"), TEXT("--verify"), TEXT("HEAD")});

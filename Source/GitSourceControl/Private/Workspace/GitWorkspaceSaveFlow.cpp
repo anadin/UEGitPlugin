@@ -118,7 +118,12 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
     if (!bReviewedExistingFile && !bInPreparedRepository && !Inside(File, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()))) return true;
     GitWorkspace::FResult Result; Result.Code = 0;
 #if PLATFORM_MAC
-    if (ActiveSave.IsSet() && ActiveSave->ActorPlan && Relative(File, ActiveSave->Root) != ActiveSave->ExpectedWrite)
+    FString RecoveryRoot, RecoveryGitDir;
+    const FString SaveRoot = ActiveSave.IsSet() ? ActiveSave->Root : ProjectRepositoryRoot;
+    if (!SaveRoot.IsEmpty() && GitWorkspaceSession::FindRepository(SaveRoot, RecoveryRoot, RecoveryGitDir) &&
+        IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(RecoveryGitDir)))
+        Result.Error = TEXT("Resolve active asset/repository recovery before saving. Your unsaved edits remain in the editor.");
+    if (Result.Error.IsEmpty() && ActiveSave.IsSet() && ActiveSave->ActorPlan && Relative(File, ActiveSave->Root) != ActiveSave->ExpectedWrite)
         Result.Error = TEXT("Only the coordinator's current package write is authorized. A save callback cannot expand this batch.");
 #endif
     const bool bExternal = File.Contains(TEXT("/__ExternalActors__/")) || File.Contains(TEXT("/__ExternalObjects__/"));
@@ -189,7 +194,7 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
 bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review, const FString& Introduction = FString())
 {
     bool bConfirmed = false;
-    const auto Window = SNew(SWindow).Title(SaveText(TEXT("Lock assets before saving"))).ClientSize(FVector2D(720, 480)).SupportsMinimize(false).SupportsMaximize(false);
+    const auto Window = SNew(SWindow).Title(SaveText(Review.DeletePaths.IsEmpty() ? TEXT("Lock assets before saving") : TEXT("Review actor deletions and saves"))).ClientSize(FVector2D(720, 480)).SupportsMinimize(false).SupportsMaximize(false);
     TWeakPtr<SWindow> Weak = Window;
     TSharedPtr<SButton> CancelButton;
     Window->SetContent(SNew(SBorder).Padding(12)[SNew(SVerticalBox)
@@ -198,7 +203,7 @@ bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review, const FString& I
         + SVerticalBox::Slot().AutoHeight().Padding(0, 12)
         [SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth()
-            [SNew(SButton).Text(SaveText(TEXT("Lock and save"))).IsEnabled_Lambda([Review] { return Review.IsFresh(); })
+            [SNew(SButton).Text(SaveText(Review.DeletePaths.IsEmpty() ? TEXT("Lock and save") : TEXT("Save and delete reviewed actors"))).IsEnabled_Lambda([Review] { return Review.IsFresh(); })
                 .OnClicked_Lambda([&bConfirmed, Weak] { bConfirmed = true; if (auto W = Weak.Pin()) W->RequestDestroyWindow(); return FReply::Handled(); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(12, 0)
             [SAssignNew(CancelButton, SButton).Text(SaveText(TEXT("Cancel"))).OnClicked_Lambda([Weak] { if (auto W = Weak.Pin()) W->RequestDestroyWindow(); return FReply::Handled(); })]
@@ -336,7 +341,7 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     GitWorkspace::FAssetSaveReview Review;
     {
         FScopedSlowTask Task(1.f, SaveText(TEXT("Verifying asset locks before saving…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f); Task.ForceRefresh();
-        Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, NewPaths, Remote, External = Destinations.ExternalActorPaths] { return Repo->ReviewAssetSave(Paths, Remote, NewPaths, External); }).Get();
+        Review = Async(EAsyncExecution::ThreadPool, [Repo, Paths, NewPaths, Remote, External = Destinations.ExternalActorPaths, Delete = Destinations.DeletePaths] { return Repo->ReviewAssetSave(Paths, Remote, NewPaths, External, Delete); }).Get();
     }
     if (!Review.IsFresh()) { Blocked(Review.Error); return; }
     if (Review.Paths.IsEmpty())
@@ -344,15 +349,16 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     FString Introduction;
     if (Destinations.bCoordinatedActors)
     {
-        Introduction = TEXT("Saving the reviewed map, build data and actor edits. Clean files are not locked by this save.\nNew actor files are locked before their first save. Deleted actors and external objects are not supported yet.\n\n");
+        Introduction = TEXT("Saving the reviewed map, build data and actor edits. Clean files are not locked by this save.\nNew actor files are locked before their first save. Reviewed deleted actors get a durable recovery copy before removal. Locks remain held. External objects are not supported yet.\n\n");
         for (const auto& Entry : Destinations.Entries)
         {
-            if (Entry.Actor.IsValid() && Entry.World.IsValid()) Introduction += (Destinations.NewPaths.Contains(Entry.Path) ? FString(TEXT("New actor: ")) : FString()) + Entry.Actor->GetActorLabel() + TEXT(" — ") + Entry.World->GetName() + TEXT("\n") + Entry.Path + TEXT("\n\n");
+            if (Entry.Kind == FPackageSavePaths::EKind::DeleteActor) Introduction += TEXT("DELETE actor: ") + Entry.ActorLabel + TEXT(" — ") + Entry.World->GetName() + TEXT("\n") + Entry.Path + TEXT("\nSaved working bytes will be backed up; staged versions remain unchanged.\n\n");
+            else if (Entry.Actor.IsValid() && Entry.World.IsValid()) Introduction += (Destinations.NewPaths.Contains(Entry.Path) ? FString(TEXT("New actor: ")) : FString()) + Entry.Actor->GetActorLabel() + TEXT(" — ") + Entry.World->GetName() + TEXT("\n") + Entry.Path + TEXT("\n\n");
             else if (Entry.Kind == FPackageSavePaths::EKind::Map || Entry.Kind == FPackageSavePaths::EKind::BuildData)
                 Introduction += FString(Entry.Kind == FPackageSavePaths::EKind::Map ? TEXT("Map: ") : TEXT("Build data: ")) + Entry.Path + TEXT("\n\n");
         }
     }
-    if (!Review.NeedsLock.IsEmpty() && !ConfirmLocks(Review, Introduction)) return;
+    if ((!Review.NeedsLock.IsEmpty() || !Review.DeletePaths.IsEmpty()) && !ConfirmLocks(Review, Introduction)) return;
 #if PLATFORM_MAC
     GitWorkspaceSession::FEditorWriteScope Access; FString Error;
     if (!Access.Acquire(Review.Local.Root, Error)) { Blocked(Error); return; }
@@ -367,12 +373,20 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
         Blocked(Prepared.Result.Error); return;
     }
     const auto CurrentDestinations = GatherPackageSavePaths(Packages, Local.Root, FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
-    if (!CurrentDestinations.Error.IsEmpty() || CurrentDestinations.Paths != Paths || CurrentDestinations.NewPaths != NewPaths)
+    if (!CurrentDestinations.Error.IsEmpty() || CurrentDestinations.Paths != Paths || CurrentDestinations.NewPaths != NewPaths || CurrentDestinations.DeletePaths != Destinations.DeletePaths)
     { Blocked(TEXT("The package set changed after lock review. Review saving again. Locks remain held.")); return; }
     if (Destinations.bCoordinatedActors)
     {
         const auto Result = WriteExternalActorSave(Destinations, *Repo, *Prepared.Permit, Access.Lease(), FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()));
-        if (!Result.Ok()) { Blocked(Result.Error); return; }
+        if (!Result.Ok())
+        {
+            FString Root, GitDir;
+            if (GitWorkspaceSession::FindRepository(Local.Root, Root, GitDir) && IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(GitDir)))
+                Blocked(Result.Error + TEXT("\nThe editor stays open to preserve other unsaved edits. Saving and workspace changes are blocked until this recovery report is resolved: ") + GitWorkspaceSession::RecoveryFile(GitDir));
+            else Blocked(Result.Error);
+            return;
+        }
+        if (!Result.Text().IsEmpty()) FMessageDialog::Open(EAppMsgType::Ok, SaveText(Result.Text()), SaveText(TEXT("Actor deletion recovery")));
         FNotificationInfo Notice(SaveText(TEXT("Reviewed map/asset edits saved. Locks remain held; stage and commit when ready."))); Notice.ExpireDuration = 8.f;
         FSlateNotificationManager::Get().AddNotification(Notice); return;
     }

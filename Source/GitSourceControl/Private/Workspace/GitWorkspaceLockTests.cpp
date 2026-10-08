@@ -532,6 +532,190 @@ bool FGitNewExternalActorPartialTest::RunTest(const FString&)
     }
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitActorDeletionWritesTest, "GitWorkspace.SaveLock.ExternalActorDeletionRecovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitActorDeletionWritesTest::RunTest(const FString&)
+{
+    for (bool bPartitioned : {false, true})
+    {
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+        TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(bPartitioned, Actors); if (!TestNotNull(TEXT("Deletion map"), World)) return false;
+        GitWorkspace::FRepository Repo(Files.Git, Files.Repo); GitWorkspaceSession::FLease Lease; FString Error;
+        if (!TestTrue(TEXT("Deletion lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        // Staged A and newer saved working B must survive independently.
+        auto SaveActor = [&](const FString& Label)
+        {
+            Actors[0]->Modify(); Actors[0]->SetActorLabel(Label);
+            const auto P = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+            const auto Ready = Repo.PrepareAssetSave(Repo.ReviewAssetSave(P.Paths, TEXT("origin"), P.NewPaths, P.ExternalActorPaths), Lease, true);
+            return Ready.Permit && Ready.Result.Ok() && GitWorkspaceSave::WriteExternalActorSave(P, Repo, *Ready.Permit, Lease, F.Content).Ok();
+        };
+        if (!TestTrue(TEXT("Saved staged version"), SaveActor(TEXT("Staged actor A")))) return false;
+        UPackage* Package = Actors[0]->GetPackage(); FString Filename; FPackageName::DoesPackageExist(Package->GetName(), &Filename); Filename = FPaths::ConvertRelativePathToFull(Filename);
+        FString Path = Filename; FPaths::MakePathRelativeTo(Path, *(Files.Repo + TEXT("/")));
+        if (!TestTrue(TEXT("Stage version A"), Repo.Stage({Path}).Ok()) || !TestTrue(TEXT("Saved working version B"), SaveActor(TEXT("Recovery actor B")))) return false;
+        const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+        const FString Bytes = Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Filename}).Text();
+        FString MapFile; FPackageName::DoesPackageExist(World->GetPackage()->GetName(), &MapFile);
+        const FString MapBytes = Files.Call({TEXT("hash-object"), TEXT("--no-filters"), MapFile}).Text();
+        const FString Export = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Automation/ActorDeletionFixtures"), bPartitioned ? TEXT("WorldPartition") : TEXT("OFPA"));
+        F.Export(Export + TEXT("/Before"));
+        Actors[0]->Modify(); if (!TestTrue(TEXT("Real editor actor destruction"), World->EditorDestroyActor(Actors[0], false))) return false;
+        World->GetPackage()->SetDirtyFlag(false);
+        const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+        if (!TestTrue(TEXT("One exact actor deletion: ") + Plan.Error, Plan.Error.IsEmpty() && Plan.Paths == TArray<FString>{Path} && Plan.DeletePaths == Plan.Paths && Plan.NewPaths.IsEmpty())) return false;
+        TestEqual(TEXT("Save All resolves empty package owner"), GitWorkspaceSave::GatherPackageSavePaths({Package}, Files.Repo, F.Content).Paths, Plan.Paths);
+        const auto Review = Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths, Plan.DeletePaths);
+        TestTrue(TEXT("Deletion review is explicit even with owned lock"), Review.IsFresh() && Review.NeedsLock.IsEmpty() && Review.Text().Contains(TEXT("DELETE after recovery backup")));
+        TestFalse(TEXT("Deletion requires confirmation even without new locks"), Repo.PrepareAssetSave(Review, Lease, false).Result.Ok());
+        TestEqual(TEXT("Cancel retains saved bytes"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Filename}).Text(), Bytes);
+        TestTrue(TEXT("Cancel retains empty dirty package"), UPackage::IsEmptyPackage(Package) && Package->IsDirty());
+        auto Ready = Repo.PrepareAssetSave(Review, Lease, true); if (!TestTrue(TEXT("Deletion permit"), Ready.Result.Ok() && Ready.Permit)) return false;
+        const auto Result = GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content);
+        if (!TestTrue(TEXT("Deletion completed: ") + Result.Error, Result.Ok())) return false;
+        TestFalse(TEXT("Actor working file absent"), IFileManager::Get().FileExists(*Filename));
+        TestTrue(TEXT("Deleted package clean and marked new for native Undo"), !Package->IsDirty() && Package->HasAnyPackageFlags(PKG_NewlyCreated));
+        TestTrue(TEXT("No pending repeated deletion"), GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content).Paths.IsEmpty());
+        FString Folder = Result.Text(); Folder.RemoveFromStart(TEXT("Recovery backup: ")); Folder = Folder.Left(Folder.Find(TEXT("\n")));
+        TestEqual(TEXT("Payload preserves saved working B"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), FPaths::Combine(Folder, TEXT("payload.uasset"))}).Text(), Bytes);
+        TestEqual(TEXT("Moved original also preserves B"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), FPaths::Combine(Folder, TEXT("removed.uasset"))}).Text(), Bytes);
+        FString Manifest; TestTrue(TEXT("Manifest restore instructions identify exact actor/path"), FFileHelper::LoadFileToString(Manifest, *FPaths::Combine(Folder, TEXT("manifest.json"))) && Manifest.Contains(Path) && Manifest.Contains(TEXT("Recovery actor B")) && Manifest.Contains(TEXT("original_mode")));
+        TestTrue(TEXT("Durable completion report exists"), IFileManager::Get().FileExists(*FPaths::Combine(Folder, TEXT("complete.json"))));
+        FString Root, GitDir; GitWorkspaceSession::FindRepository(Files.Repo, Root, GitDir);
+        TestFalse(TEXT("Successful deletion clears active recovery"), IFileManager::Get().FileExists(*GitWorkspaceSession::RecoveryFile(GitDir)));
+        TestEqual(TEXT("Clean map bytes preserved"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), MapFile}).Text(), MapBytes);
+        TestEqual(TEXT("Staged A preserved"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("HEAD preserved"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Stashes preserved"), Repo.ListStashes().Fingerprint, Stashes);
+        TestTrue(TEXT("Deletion retains exact owned lock"), Repo.VerifyLocks(TEXT("origin")).Locks.Contains(Path));
+        F.Export(Export + TEXT("/Deleted"));
+        // Disk-only recovery rehearsal. Independent editor reload proves the
+        // restored package reintroduces the saved actor, rather than reusing it.
+        TestTrue(TEXT("Recovery payload restores saved bytes"), IFileManager::Get().Copy(*Filename, *FPaths::Combine(Folder, TEXT("payload.uasset")), false, true) == COPY_OK);
+        TestEqual(TEXT("Restored B exact"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Filename}).Text(), Bytes);
+        TestEqual(TEXT("Restore leaves staged A"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+        F.Export(Export + TEXT("/Recovered"));
+    }
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitActorDeletionBoundariesTest, "GitWorkspace.SaveLock.ExternalActorDeletionBoundaries", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitActorDeletionBoundariesTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(true, Actors); if (!TestNotNull(TEXT("Boundary map"), World)) return false;
+    UPackage* Package = Actors[0]->GetPackage(); FString Filename; FPackageName::DoesPackageExist(Package->GetName(), &Filename);
+    const FString Bytes = Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Filename}).Text();
+    Actors[0]->Modify(); World->EditorDestroyActor(Actors[0], false); World->GetPackage()->SetDirtyFlag(false);
+    const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Boundary deletion plan: ") + Plan.Error, Plan.Error.IsEmpty() && Plan.DeletePaths.Num() == 1)) return false;
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); const auto Before = Repo.Refresh(); GitWorkspaceSession::FLease Lease; FString Error;
+    if (!TestTrue(TEXT("Boundary lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    TestFalse(TEXT("New/deletion overlap refused"), Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), Plan.Paths, Plan.ExternalActorPaths, Plan.Paths).IsFresh());
+    auto Unmarked = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths), Lease, true);
+    if (!TestTrue(TEXT("Save-only control permit"), Unmarked.Result.Ok() && Unmarked.Permit)) return false;
+    TestFalse(TEXT("Save-only permit cannot delete"), GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Unmarked.Permit, Lease, F.Content).Ok());
+    auto Ready = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths, Plan.DeletePaths), Lease, true);
+    if (!TestTrue(TEXT("Marked permit"), Ready.Result.Ok() && Ready.Permit)) return false;
+    TestFalse(TEXT("Deletion package substitution refused"), GitWorkspaceSave::ValidateExternalActorBinding(Plan, Plan.Paths[0], Actors[1]->GetPackage()).IsEmpty());
+    const auto Callback = FEditorDelegates::PreSaveExternalActors.AddLambda([&](UWorld* W) { if (W == World) Actors[1]->MarkPackageDirty(); });
+    TestFalse(TEXT("Callback expansion refuses before deletion"), GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content).Ok());
+    FEditorDelegates::PreSaveExternalActors.Remove(Callback); Actors[1]->GetPackage()->SetDirtyFlag(false);
+    FString Root, GitDir; GitWorkspaceSession::FindRepository(Files.Repo, Root, GitDir); const FString Marker = GitWorkspaceSession::RecoveryFile(GitDir);
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Marker), true); FFileHelper::SaveStringToFile(TEXT("Unrelated active recovery"), *Marker);
+    const auto Blocked = GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content);
+    TestFalse(TEXT("Existing recovery marker refuses mutation"), Blocked.Ok()); FString OriginalMarker; FFileHelper::LoadFileToString(OriginalMarker, *Marker);
+    TestEqual(TEXT("Existing marker never overwritten"), OriginalMarker, FString(TEXT("Unrelated active recovery"))); IFileManager::Get().Delete(*Marker);
+    TestEqual(TEXT("All refusals preserve saved file"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Filename}).Text(), Bytes);
+    for (const TCHAR* Mode : {TEXT("foreign"), TEXT("otherclone"), TEXT("offline"), TEXT("auth")})
+    {
+        Files.Mode(Mode); TestFalse(FString(Mode) + TEXT(" blocks actor deletion"), GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content).Ok());
+        TestTrue(TEXT("Lock refusal keeps the actor file"), IFileManager::Get().FileExists(*Filename));
+    }
+    Files.Mode(TEXT(""));
+    const FString Alias = FPaths::Combine(F.Content, TEXT("HardlinkedActor.uasset"));
+    if (TestTrue(TEXT("Hardlink fixture"), link(TCHAR_TO_UTF8(*Filename), TCHAR_TO_UTF8(*Alias)) == 0))
+    {
+        TestFalse(TEXT("Hardlinked actor refuses deletion"), GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content).Ok());
+        TestTrue(TEXT("Hardlinked original remains"), IFileManager::Get().FileExists(*Filename)); unlink(TCHAR_TO_UTF8(*Alias));
+    }
+    TArray<uint8> OriginalBytes, ForeignBytes; FFileHelper::LoadFileToArray(OriginalBytes, *Filename); ForeignBytes = OriginalBytes; ForeignBytes.Add(17);
+    FFileHelper::SaveArrayToFile(ForeignBytes, *Filename);
+    TestFalse(TEXT("Changed bytes refuse old permit"), GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content).Ok());
+    TArray<uint8> Foreign; FFileHelper::LoadFileToArray(Foreign, *Filename); TestEqual(TEXT("Competing valid package bytes remain intact"), Foreign, ForeignBytes);
+    FFileHelper::SaveArrayToFile(OriginalBytes, *Filename);
+    TestEqual(TEXT("All refusals preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("All refusals preserve HEAD"), Repo.Refresh().Head, Before.Head);
+    TestTrue(TEXT("Owned lock retained"), Repo.VerifyLocks(TEXT("origin")).Locks.Contains(Plan.Paths[0]));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitActorDeletionPartialTest, "GitWorkspace.SaveLock.ExternalActorDeletionPartialAndRetry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitActorDeletionPartialTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(true, Actors); if (!TestNotNull(TEXT("Partial deletion map"), World)) return false;
+    Actors[0]->Modify(); World->EditorDestroyActor(Actors[0], false); World->GetPackage()->SetDirtyFlag(true);
+    Actors[1]->Modify(); Actors[1]->SetActorLabel(TEXT("After deletion edit"));
+    const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Delete, actor write and map: ") + Plan.Error, Plan.Error.IsEmpty() && Plan.DeletePaths.Num() == 1 && Plan.Paths.Num() == 3)) return false;
+    TestTrue(TEXT("Deletion precedes dependency and map writes"), Plan.Entries[0].Kind == GitWorkspaceSave::FPackageSavePaths::EKind::DeleteActor && Plan.Entries.Last().Kind == GitWorkspaceSave::FPackageSavePaths::EKind::Map);
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); const auto Before = Repo.Refresh(); const FString Stashes = Repo.ListStashes().Fingerprint;
+    GitWorkspaceSession::FLease Lease; FString Error; if (!TestTrue(TEXT("Partial deletion lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    FFileHelper::SaveStringToFile(Plan.Paths.Last(), *FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+    auto Ready = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths, Plan.DeletePaths), Lease, true);
+    TestTrue(TEXT("Acquisition failure retains earlier locks"), !Ready.Result.Ok() && !Ready.AcquiredPaths.IsEmpty());
+    TestTrue(TEXT("Acquisition failure removes nothing"), IFileManager::Get().FileExists(*Plan.Entries[0].Filename));
+    IFileManager::Get().Delete(*FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+    Ready = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths, Plan.DeletePaths), Lease, true);
+    if (!TestTrue(TEXT("Retry gets all locks"), Ready.Result.Ok() && Ready.Permit)) return false;
+    GitWorkspaceSave::RemoveGuard(); const auto Previous = FCoreUObjectDelegates::IsPackageOKToSaveDelegate;
+    FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([File = Plan.Entries.Last().Filename](UPackage*, const FString& Destination, FOutputDevice*) { return FPaths::ConvertRelativePathToFull(Destination) != File; });
+    GitWorkspaceSave::InstallGuard(); const auto Partial = GitWorkspaceSave::WriteExternalActorSave(Plan, Repo, *Ready.Permit, Lease, F.Content);
+    GitWorkspaceSave::RemoveGuard(); FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Previous; GitWorkspaceSave::InstallGuard();
+    TestTrue(TEXT("Partial report retains deletion backup and unfinished map"), !Partial.Ok() && Partial.Error.Contains(TEXT("Deleted with recovery: ") + Plan.Entries[0].Path) && Partial.Error.Contains(TEXT("Recovery backup:")) && Partial.Error.Contains(TEXT("Not completed: ") + Plan.Entries.Last().Path));
+    TestFalse(TEXT("Completed deletion stays absent"), IFileManager::Get().FileExists(*Plan.Entries[0].Filename));
+    const auto Retry = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    TestTrue(TEXT("Retry reviews only unfinished map"), Retry.Error.IsEmpty() && Retry.DeletePaths.IsEmpty() && Retry.Paths == TArray<FString>{Plan.Entries.Last().Path});
+    Ready = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Retry.Paths, TEXT("origin"), {}, Retry.ExternalActorPaths), Lease, false);
+    if (!TestTrue(TEXT("Retry reuses retained lock"), Ready.Result.Ok() && Ready.Permit)) return false;
+    const auto Written = GitWorkspaceSave::WriteExternalActorSave(Retry, Repo, *Ready.Permit, Lease, F.Content); TestTrue(TEXT("Map-only retry succeeds: ") + Written.Error, Written.Ok());
+    TestEqual(TEXT("Partial/retry keeps all locks"), Repo.VerifyLocks(TEXT("origin")).Locks.Num(), 3);
+    TestEqual(TEXT("Staging preserved"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("HEAD preserved"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Stashes preserved"), Repo.ListStashes().Fingerprint, Stashes);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitActorDeletionRecoveryFailureTest, "GitWorkspace.SaveLock.ExternalActorDeletionRecoveryFailures", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitActorDeletionRecoveryFailureTest::RunTest(const FString&)
+{
+    for (int32 Case = 0; Case < 3; ++Case)
+    {
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+        TArray<AActor*> Actors; UWorld* World = F.ExistingActorWorld(false, Actors); if (!TestNotNull(TEXT("Recovery failure map"), World)) return false;
+        Actors[0]->Modify(); World->EditorDestroyActor(Actors[0], false); World->GetPackage()->SetDirtyFlag(false);
+        const auto Plan = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Recovery failure deletion: ") + Plan.Error, Plan.Error.IsEmpty() && Plan.DeletePaths.Num() == 1)) return false;
+        GitWorkspace::FRepository Repo(Files.Git, Files.Repo); GitWorkspaceSession::FLease Lease; FString Error;
+        if (!TestTrue(TEXT("Recovery failure lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        const auto Ready = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths, Plan.DeletePaths), Lease, true);
+        if (!TestTrue(TEXT("Recovery failure permit"), Ready.Result.Ok() && Ready.Permit)) return false;
+        GitWorkspaceSave::FActorDeletionRecovery Recovery;
+        const auto Removed = GitWorkspaceSave::RemoveExternalActorFile(Plan, Plan.Entries[0], Repo, *Ready.Permit, Lease, Recovery);
+        if (!TestTrue(TEXT("Durable removal before completion: ") + Removed.Error, Removed.Ok() && Recovery.bActive)) return false;
+        const FString Original = Plan.Entries[0].Filename, Payload = FPaths::Combine(Recovery.Folder, TEXT("payload.uasset"));
+        const FString OriginalBytes = Files.Call({TEXT("hash-object"), TEXT("--no-filters"), FPaths::Combine(Recovery.Folder, TEXT("removed.uasset"))}).Text();
+        if (Case == 0)
+        { TArray<uint8> Bytes; FFileHelper::LoadFileToArray(Bytes, *Payload); Bytes.Add(19); FFileHelper::SaveArrayToFile(Bytes, *Payload); }
+        else if (Case == 1)
+        { TestTrue(TEXT("Competing destination fixture"), IFileManager::Get().Copy(*Original, *Payload, false, true) == COPY_OK); }
+        else FFileHelper::SaveStringToFile(TEXT("Competing marker identity"), *Recovery.Marker);
+        const auto Complete = GitWorkspaceSave::CompleteExternalActorDeletion(Recovery, Repo, Lease);
+        TestFalse(TEXT("Unverified completion fails"), Complete.Ok());
+        TestTrue(TEXT("Recovery marker remains active"), Recovery.bActive && IFileManager::Get().FileExists(*Recovery.Marker));
+        TestTrue(TEXT("Active recovery blocks workspace mutations"), Repo.Refresh().bOperationInProgress && !Repo.Stage({Plan.Paths[0]}).Ok());
+        TestFalse(TEXT("Active recovery refuses another save review"), Repo.ReviewAssetSave(Plan.Paths, TEXT("origin"), {}, Plan.ExternalActorPaths, Plan.DeletePaths).IsFresh());
+        TestFalse(TEXT("No completion report on failure"), IFileManager::Get().FileExists(*FPaths::Combine(Recovery.Folder, TEXT("complete.json"))));
+        TestEqual(TEXT("Original quarantined bytes retained"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), FPaths::Combine(Recovery.Folder, TEXT("removed.uasset"))}).Text(), OriginalBytes);
+        if (Case == 1) TestEqual(TEXT("Competing destination untouched"), Files.Call({TEXT("hash-object"), TEXT("--no-filters"), Original}).Text(), OriginalBytes);
+        if (Case == 2) { FString Marker; FFileHelper::LoadFileToString(Marker, *Recovery.Marker); TestEqual(TEXT("Changed marker untouched"), Marker, FString(TEXT("Competing marker identity"))); }
+        // This is our isolated fixture marker; production never clears failures.
+        IFileManager::Get().Delete(*Recovery.Marker);
+    }
+    return true;
+}
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalWorldWriteTest, "GitWorkspace.SaveLock.ExternalWorldMapAndBuildData", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitExternalWorldWriteTest::RunTest(const FString&)
 {

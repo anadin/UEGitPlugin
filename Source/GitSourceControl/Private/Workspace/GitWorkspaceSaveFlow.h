@@ -10,6 +10,7 @@ class UObject;
 class FAssetEditorToolkit;
 class UWorld;
 class AActor;
+class UDeletedObjectPlaceholder;
 
 namespace GitWorkspaceSave
 {
@@ -24,7 +25,7 @@ void InstallGuard();
 void RemoveGuard();
 struct FPackageSavePaths
 {
-    enum class EKind : uint8 { Asset, Actor, BuildData, Map };
+    enum class EKind : uint8 { Asset, Actor, BuildData, Map, DeleteActor };
     struct FEntry
     {
         TWeakObjectPtr<UPackage> Package;
@@ -32,6 +33,7 @@ struct FPackageSavePaths
         TWeakObjectPtr<AActor> Actor;
         FString PackageName, Path, Filename, WorldName, WorldFilename, WorldHash;
         FGuid ActorGuid;
+        FString ActorPath, ActorLabel;
         EKind Kind = EKind::Asset;
     };
     struct FOwner
@@ -40,7 +42,7 @@ struct FPackageSavePaths
         TWeakObjectPtr<UObject> BuildData;
         FString Name, Filename, Path, Hash, BuildDataName;
     };
-    TArray<FString> Paths, NewPaths, ExternalActorPaths;
+    TArray<FString> Paths, NewPaths, ExternalActorPaths, DeletePaths;
     TArray<FEntry> Entries;
     TArray<FOwner> Owners;
     TArray<TWeakObjectPtr<UPackage>> Sources;
@@ -75,9 +77,14 @@ UObject* GetCopyData(FAssetEditorToolkit& Editor);
 FString ReviewCopyData(UObject* Source, UObject* EditedData);
 FAssetCopyDestination ReviewCopyDestination(UObject* Source, const FString& PackageName, const FString& Root, const FString& Content);
 #if PLATFORM_MAC
-// Writes only the reviewed set; never discovers/deletes packages or auto-stages files.
+// Writes/deletes only the reviewed set, preserving deletion recovery and staging.
 GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content);
+struct FActorDeletionRecovery { FString Folder, Marker, Manifest, Path, Hash, Head, Branch, Stashes; TArray<uint8> IndexEntries; bool bActive = false; };
+GitWorkspace::FResult RemoveExternalActorFile(const FPackageSavePaths& Plan, const FPackageSavePaths::FEntry& Entry, GitWorkspace::FRepository& Repository,
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, FActorDeletionRecovery& Recovery);
+GitWorkspace::FResult CompleteExternalActorDeletion(FActorDeletionRecovery& Recovery, GitWorkspace::FRepository& Repository,
+    const GitWorkspaceSession::FLease& Lease);
 GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UObject*& OutCopy, UObject* EditedData = nullptr);
 GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,

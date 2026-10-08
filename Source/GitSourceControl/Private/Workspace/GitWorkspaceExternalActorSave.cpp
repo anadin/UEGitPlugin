@@ -1,6 +1,9 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitWorkspaceSaveFlow.h"
 #include "Editor.h"
+#include "DeletedObjectPlaceholder.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "WorldPartition/WorldPartitionActorDescUtils.h"
 #include "Async/Async.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
@@ -68,6 +71,41 @@ FString ExistingWorldError(UWorld* World, const FString& Root, const FString& Co
             return TEXT("Legacy, shared, embedded or custom build data requires a separate map save adapter.");
     return FString();
 }
+FString DeletedActorDescription(UPackage* Package, UWorld* World, FPackageSavePaths::FEntry& Entry)
+{
+    if (!Package || !World || !World->PersistentLevel || !UPackage::IsEmptyPackage(Package) ||
+        Package->HasAnyPackageFlags(PKG_NewlyCreated) || !Package->IsDirty())
+        return TEXT("Only dirty, previously saved empty actor packages can be deleted. Never-saved actors and conversions need separate handling.");
+    FString Filename;
+    if (!FPackageName::DoesPackageExist(Package->GetName(), &Filename)) return TEXT("The deleted actor's saved file is missing; restore it before reviewing deletion.");
+    TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*Filename)); uint32 Tag = 0;
+    if (Reader && Reader->TotalSize() >= sizeof(Tag)) *Reader << Tag;
+    if (!Reader || Reader->IsError() || Tag != PACKAGE_FILE_TAG) return TEXT("Hydrate the saved actor before reviewing deletion.");
+    Reader.Reset();
+    auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+    // Bind to saved metadata rather than a transient/deleted in-memory actor.
+    // Prime before entering core save scope; its late validator only reads it.
+    if (!UE::IsSavingPackage()) Registry.ScanFilesSynchronous({Filename}, true);
+    TArray<FAssetData> Assets; Registry.GetAssetsByPackageName(FName(*Package->GetName()), Assets, true);
+    if (Assets.Num() != 1) return TEXT("Cannot identify one saved main actor in this empty package. Restore/hydrate it before reviewing deletion.");
+    const auto Desc = FWorldPartitionActorDescUtils::GetActorDescriptorFromAssetData(Assets[0]);
+    if (!Desc || !Desc->GetGuid().IsValid() || Desc->IsChildContainerInstance() || Desc->GetExternalDataLayerAsset().IsValid() ||
+        Desc->GetActorPackage() != FName(*Package->GetName()))
+        return TEXT("Deletion supports main persistent-map actors only; external data layers and nested containers need separate adapters.");
+    UClass* Class = nullptr;
+    // Also runs during late package validation: do not resolve/load classes here.
+    for (TObjectIterator<UClass> It; It; ++It) if (It->GetClassPathName() == Desc->GetNativeClass()) { Class = *It; break; }
+    if (!Class || !Class->IsChildOf(AActor::StaticClass()) || Class->IsChildOf(ALODActor::StaticClass()) || Class->IsChildOf(AWorldPartitionHLOD::StaticClass()))
+        return TEXT("The saved actor class is unavailable or requires a separate deletion adapter.");
+    Entry.ActorPath = Desc->GetActorSoftPath().ToString(); Entry.ActorGuid = Desc->GetGuid(); Entry.ActorLabel = Desc->GetActorLabelString();
+    if (Entry.ActorPath != World->PersistentLevel->GetPathName() + TEXT(".") + Desc->GetActorNameString() ||
+        ULevel::GetActorPackageName(World->GetPackage(), World->PersistentLevel->GetActorPackagingScheme(), Entry.ActorPath, World->PersistentLevel) != Package->GetName())
+        return TEXT("The empty actor package does not belong to this exact map's main actor namespace.");
+    for (AActor* Actor : World->PersistentLevel->Actors)
+        if (IsValid(Actor) && (Actor->GetActorGuid() == Entry.ActorGuid || Actor->GetPathName() == Entry.ActorPath))
+            return TEXT("The actor still exists in this level. Conversion/move cleanup cannot use actor deletion.");
+    return FString();
+}
 FString RelativeFile(const FString& File, const FString& Root)
 { FString Path = File; FPaths::MakePathRelativeTo(Path, *(Root + TEXT("/"))); return Path; }
 TArray<UPackage*> Sources(const FPackageSavePaths& Plan)
@@ -88,6 +126,10 @@ FString PlanDrift(const FPackageSavePaths& Plan, const FPackageSavePaths& Curren
     TArray<FString> ExpectedNew, ActualNew;
     for (const auto& Path : Plan.NewPaths) if (!Saved.Contains(Path)) ExpectedNew.Add(Path);
     for (const auto& Path : Current.NewPaths) if (!Saved.Contains(Path)) ActualNew.Add(Path);
+    TArray<FString> ExpectedDelete, ActualDelete;
+    for (const auto& Path : Plan.DeletePaths) if (!Saved.Contains(Path)) ExpectedDelete.Add(Path);
+    for (const auto& Path : Current.DeletePaths) if (!Saved.Contains(Path)) ActualDelete.Add(Path);
+    if (ExpectedDelete != ActualDelete) return TEXT("The actor deletion set changed after review.");
     if (ExpectedNew != ActualNew) return TEXT("The first-save destination set changed after review.");
     TArray<FString> Expected, Actual;
     for (const auto& Path : Plan.Paths) if (!Saved.Contains(Path)) Expected.Add(Path);
@@ -99,7 +141,8 @@ FString PlanDrift(const FPackageSavePaths& Plan, const FPackageSavePaths& Curren
         const auto* Now = Current.Entries.FindByPredicate([&](const FPackageSavePaths::FEntry& E) { return E.Path == Entry.Path; });
         if (!Now || Now->Package != Entry.Package || Now->PackageName != Entry.PackageName || Now->Filename != Entry.Filename ||
             Now->Actor != Entry.Actor || Now->ActorGuid != Entry.ActorGuid || Now->World != Entry.World || Now->WorldName != Entry.WorldName ||
-            Now->WorldFilename != Entry.WorldFilename || Now->WorldHash != Entry.WorldHash || Now->Kind != Entry.Kind)
+            Now->WorldFilename != Entry.WorldFilename || Now->WorldHash != Entry.WorldHash || Now->Kind != Entry.Kind ||
+            Now->ActorPath != Entry.ActorPath || Now->ActorLabel != Entry.ActorLabel)
             return TEXT("A reviewed package or its owning map changed before writing: ") + Entry.Path;
     }
     return FString();
@@ -119,9 +162,12 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
         else if (ExternalName(Package->GetName()))
         {
             AActor* Actor = AActor::FindActorInPackage(Package);
-            if (!Actor || !Actor->GetLevel())
-            { Out.Error = TEXT("External-object and deleted/empty actor packages are not supported yet. No files were written or deleted."); return Out; }
-            Worlds.AddUnique(Actor->GetLevel()->GetWorld());
+            UWorld* Owner = Actor && Actor->GetLevel() ? Actor->GetLevel()->GetWorld() : nullptr;
+            if (!Owner && Package->GetName().Contains(TEXT("/__ExternalActors__/")))
+                for (TObjectIterator<UWorld> It; It; ++It)
+                    if (ExternalWorld(*It) && It->PersistentLevel->GetLoadedExternalObjectPackages().Contains(Package)) { Owner = *It; break; }
+            if (!Owner) { Out.Error = TEXT("This external package has no exact loaded persistent-map owner."); return Out; }
+            Worlds.AddUnique(Owner);
         }
         else if (UWorld* DataOwner = BuildDataWorld(Package)) Worlds.AddUnique(DataOwner);
         else Ordinary.AddUnique(Package);
@@ -170,8 +216,10 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
         {
             if (!Package || (!Package->IsDirty() && !Package->HasAnyPackageFlags(PKG_NewlyCreated) && !UPackage::IsEmptyPackage(Package))) continue;
             FString Filename;
-            if (UPackage::IsEmptyPackage(Package))
-            { Out.Error = TEXT("Deleted/empty external packages require deletion recovery support. No packages were saved or deleted: ") + Package->GetName(); return Out; }
+            const bool bDelete = UPackage::IsEmptyPackage(Package);
+            if (bDelete && !Package->IsDirty() &&
+                FPackageName::TryConvertLongPackageNameToFilename(Package->GetName(), Filename, TEXT(".uasset")) &&
+                !IFileManager::Get().FileExists(*Filename) && !IFileManager::Get().DirectoryExists(*Filename)) continue; // Completed deletion; no disk target.
             const bool bNew = Package->HasAnyPackageFlags(PKG_NewlyCreated);
             if (bNew)
             {
@@ -189,7 +237,9 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
             Entry.Package = Package; Entry.PackageName = Package->GetName(); Entry.Path = RelativeFile(Filename, Root); Entry.Filename = Filename;
             Entry.World = World; Entry.WorldName = World->GetPackage()->GetName(); Entry.WorldFilename = MapFile; Entry.WorldHash = Hash;
             Entry.Actor = AActor::FindActorInPackage(Package); if (Entry.Actor.IsValid()) Entry.ActorGuid = Entry.Actor->GetActorGuid();
-            Entry.Kind = FPackageSavePaths::EKind::Actor;
+            Entry.Kind = bDelete ? FPackageSavePaths::EKind::DeleteActor : FPackageSavePaths::EKind::Actor;
+            if (bDelete)
+            { Out.Error = DeletedActorDescription(Package, World, Entry); if (!Out.Error.IsEmpty()) return Out; Out.DeletePaths.AddUnique(Entry.Path); }
             Out.Entries.Add(Entry); Out.Paths.AddUnique(Entry.Path); Out.ExternalActorPaths.AddUnique(Entry.Path);
             if (bNew) Out.NewPaths.AddUnique(Entry.Path);
             Out.Error = ValidateExternalActorBinding(Out, Entry.Path, Package); if (!Out.Error.IsEmpty()) return Out;
@@ -213,10 +263,10 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
         FPackageSavePaths::FEntry Entry; Entry.Package = Package; Entry.PackageName = Name; Entry.Path = Path; Entry.Filename = Filename;
         Out.Entries.Add(Entry); Out.Paths.AddUnique(Path);
     }
-    Out.Paths.Sort(); Out.NewPaths.Sort(); Out.ExternalActorPaths.Sort();
+    Out.Paths.Sort(); Out.NewPaths.Sort(); Out.ExternalActorPaths.Sort(); Out.DeletePaths.Sort();
     Out.Entries.Sort([](const FPackageSavePaths::FEntry& A, const FPackageSavePaths::FEntry& B)
     {
-        auto Rank = [](FPackageSavePaths::EKind Kind) { return Kind == FPackageSavePaths::EKind::BuildData ? 0 : Kind == FPackageSavePaths::EKind::Actor ? 1 : Kind == FPackageSavePaths::EKind::Asset ? 2 : 3; };
+        auto Rank = [](FPackageSavePaths::EKind Kind) { return Kind == FPackageSavePaths::EKind::DeleteActor ? -1 : Kind == FPackageSavePaths::EKind::BuildData ? 0 : Kind == FPackageSavePaths::EKind::Actor ? 1 : Kind == FPackageSavePaths::EKind::Asset ? 2 : 3; };
         return Rank(A.Kind) == Rank(B.Kind) ? A.Path < B.Path : Rank(A.Kind) < Rank(B.Kind);
     });
     return Out;
@@ -225,6 +275,18 @@ FString ValidateExternalActorBinding(const FPackageSavePaths& Plan, const FStrin
 {
     check(IsInGameThread());
     const auto* Entry = Plan.Entries.FindByPredicate([&](const FPackageSavePaths::FEntry& E) { return E.Path == Path; });
+    if (Entry && Entry->Kind == FPackageSavePaths::EKind::DeleteActor)
+    {
+        if (!Plan.DeletePaths.Contains(Path) || !Plan.ExternalActorPaths.Contains(Path) || !Package || Entry->Package.Get() != Package ||
+            Package->GetName() != Entry->PackageName || !Entry->World.IsValid()) return TEXT("The deleted actor package changed after review.");
+        FPackageSavePaths::FEntry Now; const FString Error = DeletedActorDescription(Package, Entry->World.Get(), Now);
+        FString Filename;
+        if (!Error.IsEmpty()) return Error;
+        if (Now.ActorPath != Entry->ActorPath || Now.ActorGuid != Entry->ActorGuid || Now.ActorLabel != Entry->ActorLabel ||
+            !FPackageName::DoesPackageExist(Package->GetName(), &Filename) || FPaths::ConvertRelativePathToFull(Filename) != Entry->Filename ||
+            FileHash(Entry->WorldFilename) != Entry->WorldHash) return TEXT("The deleted actor identity or owning map changed after review.");
+        return FString();
+    }
     const bool bNew = Plan.NewPaths.Contains(Path);
     if (!Plan.ExternalActorPaths.Contains(Path) || !Entry || !Package || Entry->Package.Get() != Package || Package->GetName() != Entry->PackageName ||
         !Entry->World.IsValid() || !Entry->Actor.IsValid() || UPackage::IsEmptyPackage(Package) || Package->HasAnyPackageFlags(PKG_NewlyCreated) != bNew)
@@ -254,10 +316,12 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
     const FString Root = Repository.Refresh().Root;
     TSet<FString> Saved;
     TMap<FString, FString> SavedMaps;
+    TArray<FString> RecoveryFolders;
     auto Fail = [&](const FString& Message)
     {
-        GitWorkspace::FResult R; R.Error = Message + TEXT("\nLocks remain held. Completed writes remain on disk; nothing was staged, deleted or unlocked.");
-        for (const auto& Entry : Plan.Entries) R.Error += TEXT("\n") + FString(Saved.Contains(Entry.Path) ? TEXT("Saved: ") : TEXT("Not completed: ")) + Entry.Path;
+        GitWorkspace::FResult R; R.Error = Message + TEXT("\nLocks remain held. Completed writes remain on disk; nothing was staged or unlocked.");
+        for (const auto& Entry : Plan.Entries) R.Error += TEXT("\n") + FString(Saved.Contains(Entry.Path) ? (Entry.Kind == FPackageSavePaths::EKind::DeleteActor ? TEXT("Deleted with recovery: ") : TEXT("Saved: ")) : TEXT("Not completed: ")) + Entry.Path;
+        for (const auto& Folder : RecoveryFolders) R.Error += TEXT("\nRecovery backup: ") + Folder;
         return R;
     };
     if (!Plan.Error.IsEmpty() || !Plan.bCoordinatedActors || Plan.Owners.IsEmpty() || Plan.Entries.IsEmpty()) return Fail(TEXT("No valid coordinated map save was reviewed."));
@@ -282,7 +346,7 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
         const auto* Entry = Plan.Entries.FindByPredicate([&](const auto& E) { return E.Path == Path; });
         if (!Entry || !Package || Entry->Package.Get() != Package || Package->GetName() != Entry->PackageName || Saved.Contains(Path))
             return TEXT("The package object/destination no longer matches the reviewed map save.");
-        if (Entry->Kind == FPackageSavePaths::EKind::Actor)
+        if (Entry->Kind == FPackageSavePaths::EKind::Actor || Entry->Kind == FPackageSavePaths::EKind::DeleteActor)
         { const FString Error = ValidateExternalActorBinding(Plan, Path, Package); if (!Error.IsEmpty()) return Error; }
         return CheckBatch();
     };
@@ -323,6 +387,7 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
     }
     for (const auto& Entry : Plan.Entries)
     {
+        if (Entry.Kind == FPackageSavePaths::EKind::DeleteActor) continue;
         FObjectSaveContextData Context(Entry.Package.Get(), nullptr, *Entry.Filename, SAVE_NoError);
         UPackage::PreSavePackageWithContextEvent.Broadcast(Entry.Package.Get(), FObjectPreSaveContext(Context));
     }
@@ -333,6 +398,23 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
     for (const auto& Entry : Plan.Entries)
     {
         Error = CheckBatch(); if (!Error.IsEmpty()) return Fail(Error);
+        if (Entry.Kind == FPackageSavePaths::EKind::DeleteActor)
+        {
+            Error = CheckWrite(Entry.Path, Entry.Package.Get()); if (!Error.IsEmpty()) return Fail(Error);
+            FActorDeletionRecovery Recovery;
+            const auto Removed = RemoveExternalActorFile(Plan, Entry, Repository, Permit, Lease, Recovery);
+            if (!Recovery.Folder.IsEmpty()) RecoveryFolders.Add(Recovery.Folder);
+            if (!Removed.Ok()) return Fail(Removed.Error);
+            // Notify only after the reviewed file is durably preserved and absent.
+            // No ObjectTools cleanup, unloading, collection or source-control revert.
+            FAssetRegistryModule::PackageDeleted(Entry.Package.Get());
+            FEditorDelegates::OnPackageDeleted.Broadcast(Entry.Package.Get());
+            UDeletedObjectPlaceholder::RemoveFromPackage(Entry.Package.Get());
+            Entry.Package->SetDirtyFlag(false); Entry.Package->MarkAsNewlyCreated(); Saved.Add(Entry.Path);
+            const auto Complete = CompleteExternalActorDeletion(Recovery, Repository, Lease);
+            if (!Complete.Ok()) return Fail(Complete.Error);
+            continue;
+        }
         FString LateError;
         auto Settings = FSavePackageSettings::GetDefaultSettings();
         // Core invokes import validation after PreSave/harvest, before creating
@@ -362,7 +444,11 @@ GitWorkspace::FResult WriteExternalActorSave(const FPackageSavePaths& Plan, GitW
         }
     }
     PostExternal(); Error = CheckBatch(); if (!Error.IsEmpty()) return Fail(Error);
-    GitWorkspace::FResult Result; Result.Code = 0; return Result;
+    GitWorkspace::FResult Result; Result.Code = 0;
+    FString Report;
+    for (const auto& Folder : RecoveryFolders) Report += TEXT("Recovery backup: ") + Folder + TEXT("\n");
+    if (!Report.IsEmpty()) Report += TEXT("With the editor closed, copy payload.uasset to the exact path in manifest.json to restore saved working bytes. Reopen to reload the actor. Staging and locks are unchanged. Keep backups until no longer needed.\n");
+    FTCHARToUTF8 Bytes(*Report); Result.Out.Append(reinterpret_cast<const uint8*>(Bytes.Get()), Bytes.Length()); return Result;
 }
 #endif
 }
