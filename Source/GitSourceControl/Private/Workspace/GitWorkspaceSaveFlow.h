@@ -77,13 +77,24 @@ struct FMapSaveDestination
         FString SourcePackage, SourcePath, Label;
         FAssetCopyDestination Target;
     };
+    struct FPartitionDescriptor
+    {
+        FGuid Guid;
+        FString Package, Path, Label;
+        TArray<FGuid> References;
+        bool operator==(const FPartitionDescriptor& Other) const
+        { return Guid == Other.Guid && Package == Other.Package && Path == Other.Path && Label == Other.Label && References == Other.References; }
+    };
     FAssetCopyDestination Map, BuildData;
     TArray<FActorDestination> Actors;
     TArray<FSourceFile> SourceFiles;
     TArray<TWeakObjectPtr<AActor>> SourceActors;
     TArray<FString> SourceActorFolders, SourceObjectFolders;
+    TArray<FPartitionDescriptor> SourceDescriptors;
     FString SourcePackage, Error;
     TWeakObjectPtr<UObject> SourceBuildData, SourceLevel, SourcePartition;
+    TWeakObjectPtr<UObject> SourceContainer;
+    bool bSourcePartitionInitialized = false;
     bool bNameCurrent = false, bExternalFirstSave = false, bExternalCopy = false;
     TArray<FString> ExternalPaths() const { TArray<FString> Out; for (const auto& Actor : Actors) Out.Add(Actor.Target.Path); Out.Sort(); return Out; }
     TArray<FString> Paths() const { TArray<FString> Out{Map.Path}; if (!BuildData.Path.IsEmpty()) Out.Add(BuildData.Path); Out.Append(ExternalPaths()); Out.Sort(); return Out; }
@@ -91,9 +102,9 @@ struct FMapSaveDestination
 FString ReviewMapSource(UWorld* World);
 FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary);
 void ReviewExternalFirstMapActors(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);
-FString ReviewOFPACopySource(UWorld* World);
-FString CaptureOFPACopySource(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);
-FString ValidateOFPACopySource(UWorld* World, const FMapSaveDestination& Destination);
+FString ReviewExternalMapCopySource(UWorld* World);
+FString CaptureExternalMapCopySource(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);
+FString ValidateExternalMapCopySource(UWorld* World, const FMapSaveDestination& Destination);
 FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageName, const FString& Root, const FString& Content);
 bool SupportsAssetCopy(const UObject* Source);
 UObject* GetCopySource(const FAssetEditorToolkit& Editor);
@@ -116,7 +127,7 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
 GitWorkspace::FResult WriteExternalFirstMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
-GitWorkspace::FResult WriteOFPACopyDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
+GitWorkspace::FResult WriteExternalMapCopyDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
 class FPreparedScope
 {

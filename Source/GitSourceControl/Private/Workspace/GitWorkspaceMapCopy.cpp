@@ -4,6 +4,7 @@
 #include "Engine/World.h"
 #include "Engine/Level.h"
 #include "Engine/MapBuildDataRegistry.h"
+#include "WorldPartition/WorldPartition.h"
 #include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
 #include "Misc/PackageName.h"
@@ -55,22 +56,42 @@ FString ObjectFiles(const TArray<FString>& Folders)
     }
     return FString();
 }
-}
-FString ReviewOFPACopySource(UWorld* World)
+TArray<FMapSaveDestination::FPartitionDescriptor> PartitionDescriptors(UWorldPartition* Partition)
 {
-    if (!World || World->GetWorldPartition())
-        return TEXT("World Partition Save As needs unloaded-actor and companion remapping. Use Save for the current map; WP copies are not supported yet.");
+    // Descriptor accessors read cached metadata. Do not call GetActor(),
+    // resolve soft paths or invoke external-path providers in the save scope.
+    TArray<FMapSaveDestination::FPartitionDescriptor> Out;
+    if (Partition) for (UWorldPartition::TIterator<> It(Partition); It; ++It)
+    {
+        FMapSaveDestination::FPartitionDescriptor Entry;
+        Entry.Guid = It->GetGuid(); Entry.Package = It->GetActorPackage().ToString();
+        Entry.Path = It->GetActorSoftPath().ToString(); Entry.Label = It->GetActorLabel().ToString();
+        Entry.References = It->GetReferences(); Entry.References.Sort(); Out.Add(MoveTemp(Entry));
+    }
+    Out.Sort([](const auto& A, const auto& B) { return A.Guid < B.Guid; }); return Out;
+}
+}
+FString ReviewExternalMapCopySource(UWorld* World)
+{
     const FString Error = ReviewExternalFirstMapSource(World, false);
-    if (!Error.IsEmpty()) return TEXT("OFPA copy requires a fully loaded persistent map with canonical main actors and modern build data.\n") + Error;
+    if (!Error.IsEmpty()) return TEXT("WP/OFPA copy requires a fully loaded persistent map with canonical main actors and modern build data.\n") + Error;
     if (FPackageName::IsTempPackage(World->GetPackage()->GetName()) || World->GetPackage()->HasAnyPackageFlags(PKG_NewlyCreated) ||
         World->GetName() != FPackageName::GetShortName(World->GetPackage()->GetName()))
-        return TEXT("Save and name this OFPA map before making a copy.");
+        return TEXT("Save and name this WP/OFPA map before making a copy.");
     return FString();
 }
-FString CaptureOFPACopySource(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination)
+FString CaptureExternalMapCopySource(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination)
 {
-    const FString Error = ReviewOFPACopySource(World); if (!Error.IsEmpty()) return Error;
-    // Providers may call StaticFindObject (even for OFPA). Resolve them only
+    const FString Error = ReviewExternalMapCopySource(World); if (!Error.IsEmpty()) return Error;
+    if (auto* Partition = World->GetWorldPartition())
+    {
+        Destination.SourceContainer = Partition->GetActorDescContainerInstance();
+        Destination.bSourcePartitionInitialized = Partition->IsInitialized();
+        if (auto* Container = Partition->GetActorDescContainerInstance(); Container && Container->GetContainerPackage() != World->GetPackage()->GetFName())
+            return TEXT("This WP container belongs to another map instance. Copy the original named map instead.");
+        Destination.SourceDescriptors = PartitionDescriptors(Partition);
+    }
+    // Providers may call StaticFindObject (even for WP/OFPA). Resolve them only
     // outside serialization, then inspect these exact folders in late checks.
     const auto ActorPaths = ULevel::GetExternalActorsPaths(World->GetPackage()->GetName());
     auto ObjectPaths = ULevel::GetExternalObjectsPaths(World->GetPackage()->GetName());
@@ -98,20 +119,20 @@ FString CaptureOFPACopySource(UWorld* World, const FString& Root, const FString&
     {
         FMapSaveDestination::FSourceFile Entry; Entry.Package = Package; Entry.Name = Package->GetName(); Entry.bDirty = Package->IsDirty();
         if (!FPackageName::TryConvertLongPackageNameToFilename(Entry.Name, Entry.Filename, Package == World->GetPackage() ? TEXT(".umap") : TEXT(".uasset")))
-            return TEXT("Cannot resolve a source package for OFPA copy.");
+            return TEXT("Cannot resolve a source package for WP/OFPA copy.");
         Entry.Filename = FPaths::ConvertRelativePathToFull(Entry.Filename);
         if (!FPaths::IsUnderDirectory(Entry.Filename, Root) || !FPaths::IsUnderDirectory(Entry.Filename, Content))
-            return TEXT("Every OFPA source package must be inside this checkout's game Content.");
+            return TEXT("Every WP/OFPA source package must be inside this checkout's game Content.");
         if (!LiteralPath(Entry.Filename))
-            return TEXT("Symlinked or unresolved OFPA source packages cannot be copied.");
+            return TEXT("Symlinked or unresolved WP/OFPA source packages cannot be copied.");
         for (FString Parent = FPaths::GetPath(Entry.Filename); Parent != Root && !Parent.IsEmpty(); Parent = FPaths::GetPath(Parent))
             if (IFileManager::Get().DirectoryExists(*(Parent / TEXT(".git"))) || IFileManager::Get().FileExists(*(Parent / TEXT(".git"))))
-                return TEXT("An OFPA source package belongs to a nested checkout.");
+                return TEXT("An WP/OFPA source package belongs to a nested checkout.");
         Entry.bExists = IFileManager::Get().FileExists(*Entry.Filename);
         if (!Entry.bExists)
         {
             if (Package == World->GetPackage() || !Package->HasAnyPackageFlags(PKG_NewlyCreated) || IFileManager::Get().DirectoryExists(*Entry.Filename))
-                return TEXT("Restore/hydrate the missing saved source package before making an OFPA copy: ") + Entry.Name;
+                return TEXT("Restore/hydrate the missing saved source package before making an WP/OFPA copy: ") + Entry.Name;
         }
         else
         {
@@ -128,49 +149,55 @@ FString CaptureOFPACopySource(UWorld* World, const FString& Root, const FString&
     }
     TArray<FString> ActualActors; ActorFiles(Destination.SourceActorFolders, ActualActors);
     ExpectedActors.Sort();
-    if (ActualActors != ExpectedActors) return TEXT("This OFPA map has unloaded, deleted or orphan actor files. Load/reconcile the complete map before copying.");
+    if (ActualActors != ExpectedActors) return TEXT("This WP/OFPA map has unloaded, deleted or orphan actor files. Load/reconcile the complete map before copying.");
     return FString();
 }
-FString ValidateOFPACopySource(UWorld* World, const FMapSaveDestination& Destination)
+FString ValidateExternalMapCopySource(UWorld* World, const FMapSaveDestination& Destination)
 {
     // Also called inside core serialization: inspect held objects and files,
     // never FindPackage/StaticFindObject, load objects or resolve descriptors.
     if (!World || World->GetPackage()->GetName() != Destination.SourcePackage ||
-        World->PersistentLevel != Destination.SourceLevel.Get() || World->GetWorldPartition() ||
+        World->PersistentLevel != Destination.SourceLevel.Get() || World->GetWorldPartition() != Destination.SourcePartition.Get() ||
         World->PersistentLevel->MapBuildData.Get() != Destination.SourceBuildData.Get())
-        return TEXT("The OFPA copy's source world or build-data relationship changed. Review again.");
-    const FString Error = ReviewOFPACopySource(World); if (!Error.IsEmpty()) return Error;
+        return TEXT("The WP/OFPA copy's source world or build-data relationship changed. Review again.");
+    const FString Error = ReviewExternalMapCopySource(World); if (!Error.IsEmpty()) return Error;
+    if (auto* Partition = World->GetWorldPartition())
+        if (Partition->GetActorDescContainerInstance() != Destination.SourceContainer.Get() ||
+            Partition->IsInitialized() != Destination.bSourcePartitionInitialized ||
+            (Partition->GetActorDescContainerInstance() && Partition->GetActorDescContainerInstance()->GetContainerPackage() != FName(*Destination.SourcePackage)) ||
+            PartitionDescriptors(Partition) != Destination.SourceDescriptors)
+            return TEXT("The source WP container or descriptor set changed during map copy. Review again.");
     const FString ObjectError = ObjectFiles(Destination.SourceObjectFolders); if (!ObjectError.IsEmpty()) return ObjectError;
-    for (const auto& Folder : Destination.SourceActorFolders) if (!LiteralPath(Folder)) return TEXT("Source actor directory changed during OFPA copy.");
-    if (World->PersistentLevel->Actors.Num() != Destination.SourceActors.Num()) return TEXT("The source actor set changed during OFPA copy. Review again.");
+    for (const auto& Folder : Destination.SourceActorFolders) if (!LiteralPath(Folder)) return TEXT("Source actor directory changed during WP/OFPA copy.");
+    if (World->PersistentLevel->Actors.Num() != Destination.SourceActors.Num()) return TEXT("The source actor set changed during WP/OFPA copy. Review again.");
     for (int32 I = 0; I < Destination.SourceActors.Num(); ++I)
-        if (World->PersistentLevel->Actors[I] != Destination.SourceActors[I].Get()) return TEXT("A source actor was replaced during OFPA copy. Review again.");
+        if (World->PersistentLevel->Actors[I] != Destination.SourceActors[I].Get()) return TEXT("A source actor was replaced during WP/OFPA copy. Review again.");
     for (const auto& Actor : Destination.Actors)
         if (!Actor.Actor.IsValid() || Actor.Actor->GetActorGuid() != Actor.Guid || Actor.Actor->GetPathName() != Actor.SourcePath ||
             Actor.Actor->GetActorLabel() != Actor.Label || !Actor.Actor->GetExternalPackage() || Actor.Actor->GetExternalPackage()->GetName() != Actor.SourcePackage)
-            return TEXT("A source actor identity or binding changed during OFPA copy. Review again.");
+            return TEXT("A source actor identity or binding changed during WP/OFPA copy. Review again.");
     TArray<FString> ExpectedActors;
     for (const auto& File : Destination.SourceFiles)
     {
         if (!File.Package.IsValid() || File.Package->GetName() != File.Name || File.Package->IsDirty() != File.bDirty ||
             IFileManager::Get().FileExists(*File.Filename) != File.bExists || IFileManager::Get().DirectoryExists(*File.Filename) ||
             (File.bExists && (Hash(File.Filename) != File.Hash || FileMode(File.Filename) != File.Mode || IFileManager::Get().IsReadOnly(*File.Filename) != File.bReadOnly)))
-            return TEXT("Source bytes, permissions or package state changed during OFPA copy: ") + File.Name + TEXT(". Review again.");
-        if (!LiteralPath(File.Filename)) return TEXT("Source path changed during OFPA copy.");
+            return TEXT("Source bytes, permissions or package state changed during WP/OFPA copy: ") + File.Name + TEXT(". Review again.");
+        if (!LiteralPath(File.Filename)) return TEXT("Source path changed during WP/OFPA copy.");
         if (File.bExists && File.Name.Contains(TEXT("/__ExternalActors__/"))) ExpectedActors.Add(File.Filename);
     }
     TArray<FString> ActualActors; ActorFiles(Destination.SourceActorFolders, ActualActors);
     ExpectedActors.Sort();
-    return ActualActors == ExpectedActors ? FString() : TEXT("The source actor files changed during OFPA copy. Review again.");
+    return ActualActors == ExpectedActors ? FString() : TEXT("The source actor files changed during WP/OFPA copy. Review again.");
 }
 #if PLATFORM_MAC
-GitWorkspace::FResult WriteOFPACopyDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
+GitWorkspace::FResult WriteExternalMapCopyDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld)
 {
     check(IsInGameThread()); OutWorld = nullptr;
     auto Fail = [](const FString& Error) { GitWorkspace::FResult R; R.Error = Error + TEXT("\nThe source stays open. Completed copy files, unsaved copy packages and destination locks remain; review Save All to retry remaining copy packages. Nothing was staged or unlocked."); return R; };
     TStrongObjectPtr<UWorld> HoldSource(Source);
-    auto CheckSource = [&] { return ValidateOFPACopySource(Source, Destination); };
+    auto CheckSource = [&] { return ValidateExternalMapCopySource(Source, Destination); };
     FString Error = CheckSource(); if (!Error.IsEmpty()) return Fail(Error);
     UPackage* Package = CreatePackage(*Destination.Map.PackageName); UWorld* Copy = nullptr;
     TMap<UObject*, UObject*> Created;
@@ -181,10 +208,12 @@ GitWorkspace::FResult WriteOFPACopyDestination(UWorld* Source, const FMapSaveDes
         auto Params = InitStaticDuplicateObjectParams(Source, Package, *FPackageName::GetShortName(Destination.Map.PackageName), RF_AllFlags, nullptr, EDuplicateMode::World);
         Params.CreatedObjects = &Created; Copy = Cast<UWorld>(StaticDuplicateObjectEx(Params));
     }
-    if (!Copy) return Fail(TEXT("Unreal could not duplicate this OFPA map."));
+    if (!Copy) return Fail(TEXT("Unreal could not duplicate this WP/OFPA map."));
     TStrongObjectPtr<UWorld> HoldCopy(Copy); OutWorld = Copy;
     Error = CheckSource(); if (!Error.IsEmpty()) return Fail(Error);
-    if (Copy == Source || Copy->PersistentLevel == Source->PersistentLevel || Copy->GetWorldPartition() || !Copy->PersistentLevel->IsUsingExternalActors())
+    if (Copy == Source || Copy->PersistentLevel == Source->PersistentLevel || !Copy->PersistentLevel->IsUsingExternalActors() ||
+        (Copy->GetWorldPartition() != nullptr) != Destination.SourcePartition.IsValid() ||
+        (Copy->GetWorldPartition() && (Copy->GetWorldPartition() == Source->GetWorldPartition() || Copy->GetWorldPartition()->GetTypedOuter<UWorld>() != Copy)))
         return Fail(TEXT("The duplicated world has unexpected ownership or packaging."));
     TSet<FGuid> Guids;
     for (const auto& Entry : Destination.Actors)

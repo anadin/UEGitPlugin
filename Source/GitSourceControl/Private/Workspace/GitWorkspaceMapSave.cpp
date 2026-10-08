@@ -30,7 +30,7 @@ FString ReviewMapSource(UWorld* World)
     if (World->GetWorldPartition() || Level->IsUsingExternalActors() || Level->IsUsingExternalObjects() || !World->GetPackage()->GetExternalPackages().IsEmpty())
     {
         if (FPackageName::IsTempPackage(World->GetPackage()->GetName())) return ReviewExternalFirstMapSource(World, true);
-        return ReviewOFPACopySource(World);
+        return ReviewExternalMapCopySource(World);
     }
     if (World->GetCurrentLevel() != Level || World->GetLevels().Num() != 1 || !World->GetStreamingLevels().IsEmpty() || World->WorldComposition)
         return TEXT("Streaming, sublevel and World Composition saves need a separate map workflow. Save an ordinary persistent map here.");
@@ -53,7 +53,7 @@ FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageNa
     Out.bExternalFirstSave = Out.bNameCurrent && World->PersistentLevel->IsUsingExternalActors();
     Out.bExternalCopy = !Out.bNameCurrent && World->PersistentLevel->IsUsingExternalActors();
     if (Out.bExternalCopy)
-    { Out.Error = CaptureOFPACopySource(World, Root, Content, Out); if (!Out.Error.IsEmpty()) return Out; }
+    { Out.Error = CaptureExternalMapCopySource(World, Root, Content, Out); if (!Out.Error.IsEmpty()) return Out; }
     Out.Map = ReviewAbsentDestination(PackageName, Out.SourcePackage, Root, Content, true);
     if (!Out.Map.Error.IsEmpty()) { Out.Error = Out.Map.Error; return Out; }
     // Refuse orphan companion data even when the source has none. Never delete
@@ -86,6 +86,8 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
         Current.bNameCurrent != Destination.bNameCurrent || Current.bExternalFirstSave != Destination.bExternalFirstSave ||
         Current.bExternalCopy != Destination.bExternalCopy ||
         Current.SourceActorFolders != Destination.SourceActorFolders || Current.SourceObjectFolders != Destination.SourceObjectFolders ||
+        Current.SourceContainer != Destination.SourceContainer || Current.bSourcePartitionInitialized != Destination.bSourcePartitionInitialized ||
+        Current.SourceDescriptors != Destination.SourceDescriptors ||
         Current.Map.Filename != Destination.Map.Filename || Current.Paths() != Destination.Paths() || Current.Actors.Num() != Destination.Actors.Num())
         return Fail(TEXT("The map or its build-data package changed after review. Review the complete package set again."));
     for (int32 I = 0; I < Current.Actors.Num(); ++I)
@@ -103,8 +105,8 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
     if (Current.bExternalFirstSave) return WriteExternalFirstMapDestination(Source, Current, Repository, Permit, Lease, Content, OutWorld);
     if (Current.bExternalCopy)
     {
-        const FString Error = ValidateOFPACopySource(Source, Destination); if (!Error.IsEmpty()) return Fail(Error);
-        return WriteOFPACopyDestination(Source, Destination, Repository, Permit, Lease, Content, OutWorld);
+        const FString Error = ValidateExternalMapCopySource(Source, Destination); if (!Error.IsEmpty()) return Fail(Error);
+        return WriteExternalMapCopyDestination(Source, Destination, Repository, Permit, Lease, Content, OutWorld);
     }
     TStrongObjectPtr<UWorld> HoldSource(Source);
     FPreparedScope Prepared(Repository, Permit, Lease, Root);

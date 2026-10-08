@@ -166,7 +166,7 @@ struct FMapSaveFixture
         FVolumeLightingSample Sample; Sample.Position = FVector3f(1, 2, 3); Sample.Radius = 10; Volume.AddHighQualityLightingSample(Sample); Volume.FinalizeSamples();
         Data->LevelLightingQuality = Quality_Production; Data->MarkPackageDirty(); World->MarkPackageDirty();
     }
-    UWorld* ExistingActorWorld(bool bPartitioned, TArray<AActor*>& Actors, bool bData = false)
+    UWorld* ExistingActorWorld(bool bPartitioned, TArray<AActor*>& Actors, bool bData = false, bool bInitializePartition = false)
     {
         const FString Name = Mount + TEXT("L_Actors");
         UWorld::InitializationValues Init; Init.CreateWorldPartition(bPartitioned).EnableWorldPartitionStreaming(false).CreateNavigation(false).CreateAISystem(false);
@@ -179,6 +179,8 @@ struct FMapSaveFixture
             AActor* Actor = World->SpawnActor<AActor>(AActor::StaticClass(), FTransform(FVector(I * 100.f, 0, 0)), Params);
             Actor->SetActorLabel(FString::Printf(TEXT("BaselineActor%d"), I)); Actor->SetPackageExternal(true); Actors.Add(Actor);
         }
+        if (bInitializePartition && World->GetWorldPartition() && !World->GetWorldPartition()->IsInitialized())
+            World->GetWorldPartition()->Initialize(World, FTransform::Identity);
         // Bootstrap real fixtures in an isolated mount outside game Content.
         // This does not call the production first-save flow or acquire hosted locks.
         FSavePackageArgs Args; Args.TopLevelFlags = RF_Standalone; Args.SaveFlags = SAVE_NoError;
@@ -1299,12 +1301,12 @@ bool FGitOFPACopyTest::RunTest(const FString&)
     if (!TestTrue(TEXT("Edited source review: ") + Destination.Error, Destination.Error.IsEmpty())) return false;
     auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths());
     TestFalse(TEXT("Cancel reserves nothing"), Repo.PrepareAssetSave(Review, Lease, false).Result.Ok());
-    TestTrue(TEXT("Cancel preserves source"), GitWorkspaceSave::ValidateOFPACopySource(Source, Destination).IsEmpty());
+    TestTrue(TEXT("Cancel preserves source"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
     TestEqual(TEXT("Cancel preserves source lock count"), Repo.VerifyLocks(TEXT("origin")).Locks.Num(), SourceLocks.Locks.Num());
     auto Prepared = Repo.PrepareAssetSave(Review, Lease, true); if (!TestTrue(TEXT("All copy locks prepared: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
     UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy); F.Keep(Copy);
     if (!TestTrue(TEXT("OFPA copy write: ") + Written.Error, Written.Ok() && Copy)) return false;
-    TestTrue(TEXT("Source files, bindings and dirty state unchanged"), GitWorkspaceSave::ValidateOFPACopySource(Source, Destination).IsEmpty());
+    TestTrue(TEXT("Source files, bindings and dirty state unchanged"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
     TestTrue(TEXT("Independent map, level and build data"), Copy != Source && Copy->PersistentLevel != Source->PersistentLevel && Copy->PersistentLevel->MapBuildData != OriginalData);
     TestEqual(TEXT("Current unsaved map value copied"), Copy->GetWorldSettings()->KillZ, -76543.f);
     TestTrue(TEXT("Edited lighting quality copied"), Copy->PersistentLevel->MapBuildData->LevelLightingQuality == Quality_Preview);
@@ -1353,11 +1355,8 @@ bool FGitOFPACopyBoundariesTest::RunTest(const FString&)
     FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Boundary lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
     const FString Name = F.Mount + TEXT("L_Boundary"); const auto Destination = GitWorkspaceSave::ReviewMapDestination(Source, Name, Files.Repo, F.Content);
     if (!TestTrue(TEXT("Boundary review: ") + Destination.Error, Destination.Error.IsEmpty())) return false;
-    Source->GetWorldSettings()->SetWorldPartition(NewObject<UWorldPartition>(Source));
-    TestFalse(TEXT("Named WP copy still requires its own adapter"), GitWorkspaceSave::ReviewMapDestination(Source, Name, Files.Repo, F.Content).Error.IsEmpty());
-    Source->GetWorldSettings()->SetWorldPartition(nullptr);
     for (const auto& File : Destination.SourceFiles) File.Package->SetDirtyFlag(File.bDirty);
-    TestTrue(TEXT("Baseline source valid before drift probes"), GitWorkspaceSave::ValidateOFPACopySource(Source, Destination).IsEmpty());
+    TestTrue(TEXT("Baseline source valid before drift probes"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
     auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
     if (!TestTrue(TEXT("Boundary permit"), Prepared.Result.Ok() && Prepared.Permit)) return false;
     UWorld* Copy = nullptr; auto Refused = [&] { const auto R = GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy); F.Keep(Copy); return !R.Ok() && !Copy; };
@@ -1375,7 +1374,7 @@ bool FGitOFPACopyBoundariesTest::RunTest(const FString&)
     if (!TestTrue(TEXT("Write disposable LFS pointer probe"), FFileHelper::SaveStringToFile(TEXT("version https://git-lfs.github.com/spec/v1\noid sha256:0000000000000000000000000000000000000000000000000000000000000000\nsize 123\n"), *File.Filename))) return false;
     chmod(TCHAR_TO_UTF8(*File.Filename), Status.st_mode & 0777); TestTrue(TEXT("Source LFS pointer refuses until hydrated"), Refused());
     chmod(TCHAR_TO_UTF8(*File.Filename), (Status.st_mode & 0777) | 0200); FFileHelper::SaveArrayToFile(Original, *File.Filename); chmod(TCHAR_TO_UTF8(*File.Filename), Status.st_mode & 0777);
-    TestTrue(TEXT("Restored source valid before directory probes"), GitWorkspaceSave::ValidateOFPACopySource(Source, Destination).IsEmpty());
+    TestTrue(TEXT("Restored source valid before directory probes"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
     FString ActorFolder; FPackageName::TryConvertLongPackageNameToFilename(ULevel::GetExternalActorsPath(Source->GetPackage()->GetName()), ActorFolder);
     const FString Orphan = ActorFolder / TEXT("Orphan.uasset"); TArray<uint8> Bytes; FFileHelper::LoadFileToArray(Bytes, *Destination.SourceFiles.Last().Filename);
     FFileHelper::SaveArrayToFile(Bytes, *Orphan); TestTrue(TEXT("Unknown on-disk actor refuses copy"), Refused()); unlink(TCHAR_TO_UTF8(*Orphan));
@@ -1435,7 +1434,7 @@ bool FGitOFPACopyPartialTest::RunTest(const FString&)
     if (!TestTrue(TEXT("Partial review"), Destination.Error.IsEmpty())) return false;
     FFileHelper::SaveStringToFile(Destination.ExternalPaths().Last(), *(Files.Root / TEXT("fail-lock-path")));
     auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
-    TestFalse(TEXT("Partial reservation refuses permit"), Prepared.Result.Ok() || Prepared.Permit); TestTrue(TEXT("Source preserved after partial reservation"), GitWorkspaceSave::ValidateOFPACopySource(Source, Destination).IsEmpty());
+    TestFalse(TEXT("Partial reservation refuses permit"), Prepared.Result.Ok() || Prepared.Permit); TestTrue(TEXT("Source preserved after partial reservation"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
     IFileManager::Get().Delete(*(Files.Root / TEXT("fail-lock-path")));
     Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
     if (!TestTrue(TEXT("Remaining reservations prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
@@ -1444,7 +1443,7 @@ bool FGitOFPACopyPartialTest::RunTest(const FString&)
     { return !File.EndsWith(TEXT(".umap")) && (!Guard.IsBound() || Guard.Execute(Package, File, Output)); });
     UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy); F.Keep(Copy);
     TestFalse(TEXT("Map failure reported"), Written.Ok()); if (!TestNotNull(TEXT("Unsaved copy retained"), Copy)) return false;
-    TestTrue(TEXT("Source unchanged after partial copy"), GitWorkspaceSave::ValidateOFPACopySource(Source, Destination).IsEmpty());
+    TestTrue(TEXT("Source unchanged after partial copy"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
     TestFalse(TEXT("Copy map absent"), IFileManager::Get().FileExists(*Destination.Map.Filename));
     for (const auto& Actor : Destination.Actors) TestTrue(TEXT("Completed actor retained"), IFileManager::Get().FileExists(*Actor.Target.Filename));
     TestTrue(TEXT("Completed build data retained"), IFileManager::Get().FileExists(*Destination.BuildData.Filename)); FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard;
@@ -1454,7 +1453,193 @@ bool FGitOFPACopyPartialTest::RunTest(const FString&)
     if (!TestTrue(TEXT("Retry prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
     const auto Retried = GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content);
     TestTrue(TEXT("Remaining copy map saved: ") + Retried.Error, Retried.Ok());
-    TestTrue(TEXT("Source unchanged after retry"), GitWorkspaceSave::ValidateOFPACopySource(Source, Destination).IsEmpty());
+    TestTrue(TEXT("Source unchanged after retry"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
+    TestEqual(TEXT("Partial copy and retry preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("No implicit commit"), Repo.Refresh().Head, Before.Head);
+    TestTrue(TEXT("Copy locks retained after retry"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == Destination.Paths().Num());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyBoundariesTest, "GitWorkspace.SaveLock.WPCopyBoundariesAndDrift", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyBoundariesTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    TArray<AActor*> Actors; UWorld* Source = F.ExistingActorWorld(true, Actors, true, true); if (!TestNotNull(TEXT("Initialized WP boundary source"), Source)) return false;
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(Files.Git, Files.Repo);
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("WP boundary lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    const FString Name = F.Mount + TEXT("L_Boundary"); const auto Destination = GitWorkspaceSave::ReviewMapDestination(Source, Name, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("WP source and descriptor review: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.SourceContainer.IsValid() && !Destination.SourceDescriptors.IsEmpty())) return false;
+    TStrongObjectPtr<UWorldPartition> Partition(Source->GetWorldPartition());
+    const auto Loaded = Source->PersistentLevel->Actors; Source->PersistentLevel->Actors.Remove(Actors[0]);
+    const auto Unloaded = GitWorkspaceSave::ReviewMapDestination(Source, Name, Files.Repo, F.Content);
+    TestFalse(TEXT("A descriptor without its exact loaded actor refuses before reservation"), Unloaded.Error.IsEmpty()); Source->PersistentLevel->Actors = Loaded;
+    TestTrue(TEXT("Loading boundary does not acquire locks"), Repo.VerifyLocks(TEXT("origin")).Locks.IsEmpty());
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+    if (!TestTrue(TEXT("WP boundary reservations"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const auto Before = Repo.Refresh(); UWorld* Copy = nullptr;
+    Source->GetWorldSettings()->SetWorldPartition(nullptr);
+    Source->GetWorldSettings()->SetWorldPartition(NewObject<UWorldPartition>(Source->PersistentLevel));
+    TestFalse(TEXT("Partition/container replacement refuses"), GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy).Ok());
+    TestTrue(TEXT("Container drift never duplicates the source"), !Copy); Source->GetWorldSettings()->SetWorldPartition(nullptr); Source->GetWorldSettings()->SetWorldPartition(Partition.Get());
+    for (const auto& File : Destination.SourceFiles) File.Package->SetDirtyFlag(File.bDirty);
+    TestTrue(TEXT("Restored source binding matches snapshot"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
+    GitWorkspaceSave::FMapSaveDestination Altered = Destination; Altered.SourceDescriptors[0].References.Add(FGuid::NewGuid());
+    TestFalse(TEXT("Exact source descriptor reference set is required"), GitWorkspaceSave::WriteMapDestination(Source, Altered, Repo, *Prepared.Permit, Lease, F.Content, Copy).Ok());
+    TestTrue(TEXT("Descriptor drift writes no destination"), !Copy && !IFileManager::Get().FileExists(*Destination.Map.Filename));
+    TestEqual(TEXT("Drift retains staging"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestTrue(TEXT("All explicitly acquired reservations retained"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == Destination.Paths().Num());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyTest, "GitWorkspace.SaveLock.WPCopyCurrentEdits", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); TArray<AActor*> Actors;
+    UWorld* Source = F.ExistingActorWorld(true, Actors, true, true); if (!TestNotNull(TEXT("Saved initialized WP source"), Source)) return false;
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content);
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Copy lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    auto Initial = GitWorkspaceSave::ReviewMapDestination(Source, F.Mount + TEXT("L_Copy"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Complete copy review: ") + Initial.Error, Initial.Error.IsEmpty() && Initial.bExternalCopy && Initial.Paths().Num() == Initial.Actors.Num() + 2)) return false;
+    TestTrue(TEXT("Source partition is initialized and has a main container"), Source->GetWorldPartition()->IsInitialized() && Initial.SourceContainer.IsValid());
+    TArray<FString> SourcePaths, SourceExternal;
+    for (const auto& File : Initial.SourceFiles)
+    {
+        FString Path = File.Filename; FPaths::MakePathRelativeTo(Path, *(Files.Repo + TEXT("/"))); SourcePaths.Add(Path);
+        if (File.Name.Contains(TEXT("/__ExternalActors__/"))) SourceExternal.Add(Path);
+    }
+    const auto SourcePrepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(SourcePaths, TEXT("origin"), {}, SourceExternal), Lease, true);
+    if (!TestTrue(TEXT("Existing source locks prepared"), SourcePrepared.Result.Ok())) return false;
+    const auto SourceLocks = Repo.VerifyLocks(TEXT("origin")); const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    Source->GetWorldSettings()->KillZ = -76543.f; Source->MarkPackageDirty();
+    Actors[0]->Modify(); Actors[0]->SetActorLabel(TEXT("Copy current actor A"));
+    Actors[1]->Modify(); Actors[1]->SetActorLabel(TEXT("Copy current actor B")); Actors[1]->SetOwner(Actors[0]);
+    auto* OriginalData = Source->PersistentLevel->MapBuildData.Get(); OriginalData->LevelLightingQuality = Quality_Preview; OriginalData->MarkPackageDirty();
+    const auto Destination = GitWorkspaceSave::ReviewMapDestination(Source, F.Mount + TEXT("L_Copy"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Edited source review: ") + Destination.Error, Destination.Error.IsEmpty())) return false;
+    auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths());
+    TestFalse(TEXT("Cancel reserves nothing"), Repo.PrepareAssetSave(Review, Lease, false).Result.Ok());
+    TestTrue(TEXT("Cancel preserves source"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
+    TestEqual(TEXT("Cancel preserves source lock count"), Repo.VerifyLocks(TEXT("origin")).Locks.Num(), SourceLocks.Locks.Num());
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true); if (!TestTrue(TEXT("All copy locks prepared: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+    UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy); F.Keep(Copy);
+    if (!TestTrue(TEXT("WP copy write: ") + Written.Error, Written.Ok() && Copy)) return false;
+    TestTrue(TEXT("Source files, bindings and dirty state unchanged"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
+    TestTrue(TEXT("Copy has independent WP ownership"), Copy->GetWorldPartition() && Copy->GetWorldPartition() != Source->GetWorldPartition() && Copy->GetWorldPartition()->GetTypedOuter<UWorld>() == Copy);
+    TestTrue(TEXT("Independent map, level and build data"), Copy != Source && Copy->PersistentLevel != Source->PersistentLevel && Copy->PersistentLevel->MapBuildData != OriginalData);
+    TestEqual(TEXT("Current unsaved map value copied"), Copy->GetWorldSettings()->KillZ, -76543.f);
+    TestTrue(TEXT("Edited lighting quality copied"), Copy->PersistentLevel->MapBuildData->LevelLightingQuality == Quality_Preview);
+    const auto* CopiedVolume = Copy->PersistentLevel->MapBuildData->GetLevelPrecomputedLightVolumeBuildData(Copy->PersistentLevel->LevelBuildDataId);
+    TestTrue(TEXT("Initialized independent lighting volume copied"), CopiedVolume && CopiedVolume->IsInitialized());
+    AActor* A = nullptr; AActor* B = nullptr;
+    for (AActor* Actor : Copy->PersistentLevel->Actors) if (Actor)
+    { if (Actor->GetFName() == Actors[0]->GetFName()) A = Actor; if (Actor->GetFName() == Actors[1]->GetFName()) B = Actor; }
+    if (!TestTrue(TEXT("Copied actors loaded"), A && B)) return false;
+    TestTrue(TEXT("Actor references point to the copy"), B->GetOwner() == A && B->GetOwner() != Actors[0]);
+    TestTrue(TEXT("Independent GUIDs"), A->GetActorGuid() != Actors[0]->GetActorGuid() && B->GetActorGuid() != Actors[1]->GetActorGuid());
+    auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+    for (const auto& Entry : Destination.Actors)
+    {
+        Registry.ScanFilesSynchronous({Entry.Target.Filename}, true); TArray<FAssetData> Assets; Registry.GetAssetsByPackageName(FName(*Entry.Target.PackageName), Assets, true);
+        const auto* CopiedActor = Copy->PersistentLevel->Actors.FindByPredicate([&](AActor* Actor) { return Actor && Actor->GetFName() == Entry.Actor->GetFName(); });
+        bool bMatches = false, bReferences = Entry.Actor.Get() != Actors[1];
+        for (const auto& Asset : Assets) if (auto Desc = FWorldPartitionActorDescUtils::GetActorDescriptorFromAssetData(Asset))
+        {
+            bMatches |= CopiedActor && Desc->GetGuid() == (*CopiedActor)->GetActorGuid() && Desc->GetGuid() != Entry.Guid &&
+                Desc->GetActorPackage() == FName(*Entry.Target.PackageName) && Desc->GetActorSoftPath().ToString() == (*CopiedActor)->GetPathName() && Desc->GetActorLabel() == FName(*Entry.Label);
+            if (Entry.Actor.Get() == Actors[1]) bReferences = Desc->GetReferences().Contains(A->GetActorGuid()) && !Desc->GetReferences().Contains(Actors[0]->GetActorGuid());
+        }
+        TestTrue(TEXT("Saved WP descriptor has exact new actor identity, path and package"), bMatches);
+        TestTrue(TEXT("Saved WP reference GUID points at copied owner"), bReferences);
+    }
+    TestEqual(TEXT("Staged A stays A while copy contains B"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("No implicit commit"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("No implicit stash"), Repo.ListStashes().Fingerprint, Stashes);
+    const auto Locks = Repo.VerifyLocks(TEXT("origin")); TestTrue(TEXT("Source and copy locks retained"), Locks.IsFresh() && Locks.Locks.Num() == SourcePaths.Num() + Destination.Paths().Num());
+    for (const auto& Path : SourcePaths) TestEqual(TEXT("Original lock ID retained"), Locks.Locks[Path].Id, SourceLocks.Locks[Path].Id);
+    for (const auto& Path : Destination.Paths()) TestTrue(TEXT("Copy lock verified"), Locks.State(Path, true) == GitWorkspace::ELockState::Ours);
+    const FString Export = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Automation/WPCopyFixtures")); F.Export(Export);
+    FFileHelper::SaveStringToFile(Actors[0]->GetActorGuid().ToString() + TEXT("\n") + Actors[1]->GetActorGuid().ToString() + TEXT("\n") + A->GetActorGuid().ToString() + TEXT("\n") + B->GetActorGuid().ToString() + TEXT("\n"), *(Export / TEXT("guids.txt")));
+    // A new unsaved source actor is copied without ever creating its source file.
+    AActor* New = F.NewActor(Source, TEXT("NewSourceActor"), TEXT("Unsaved source actor"));
+    const auto NewDestination = GitWorkspaceSave::ReviewMapDestination(Source, F.Mount + TEXT("L_WithNew"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("New unsaved source actor has an explicit destination: ") + NewDestination.Error, NewDestination.Error.IsEmpty() && NewDestination.Actors.Num() == Destination.Actors.Num() + 1)) return false;
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(NewDestination.Paths(), TEXT("origin"), NewDestination.Paths(), NewDestination.ExternalPaths()), Lease, true);
+    if (!TestTrue(TEXT("New actor copy prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    UWorld* WithNew = nullptr; const auto Added = GitWorkspaceSave::WriteMapDestination(Source, NewDestination, Repo, *Prepared.Permit, Lease, F.Content, WithNew); F.Keep(WithNew);
+    TestTrue(TEXT("New actor copy saved: ") + Added.Error, Added.Ok());
+    TestTrue(TEXT("New source actor stays unsaved and dirty"), New->GetPackage()->IsDirty() && !FPackageName::DoesPackageExist(New->GetPackage()->GetName()));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyCallbacksTest, "GitWorkspace.SaveLock.WPCopyCallbacks", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyCallbacksTest::RunTest(const FString&)
+{
+    for (bool bLate : {false, true})
+    {
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+        TArray<AActor*> Actors; UWorld* Source = F.ExistingActorWorld(true, Actors, true, true); if (!TestNotNull(TEXT("Callback source"), Source)) return false;
+        GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(Files.Git, Files.Repo);
+        FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Callback lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        const auto Destination = GitWorkspaceSave::ReviewMapDestination(Source, F.Mount + TEXT("L_Callback"), Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Callback review"), Destination.Error.IsEmpty())) return false;
+        auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+        if (!TestTrue(TEXT("Callback permit"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+        const auto Before = Repo.Refresh(); AActor* Added = nullptr; bool bSourceWrite = true, bLateChanged = false;
+        auto Change = [&] { if (!Added) Added = F.NewActor(Source, TEXT("SourceCallback"), TEXT("Callback source edit")); };
+        const auto Hook = FEditorDelegates::PreSaveExternalActors.AddLambda([&](UWorld* Saving)
+        {
+            if (Saving == Source || Saving->GetPackage()->GetName() != Destination.Map.PackageName) return;
+            if (!bLate) Change();
+            FSavePackageArgs Args; Args.TopLevelFlags = RF_Standalone; Args.SaveFlags = SAVE_NoError;
+            FString File; FPackageName::TryConvertLongPackageNameToFilename(Source->GetPackage()->GetName(), File, TEXT(".umap"));
+            bSourceWrite = UPackage::SavePackage(Source->GetPackage(), Source, *File, Args);
+        });
+        const auto Late = FCoreUObjectDelegates::OnObjectPreSave.AddLambda([&](UObject* Object, FObjectPreSaveContext)
+        { if (bLate && Object->GetPackage()->GetName() == Destination.BuildData.PackageName && !bLateChanged)
+            { Actors[0]->SetActorLabel(TEXT("Core callback source edit")); bLateChanged = true; } });
+        ON_SCOPE_EXIT { FEditorDelegates::PreSaveExternalActors.Remove(Hook); FCoreUObjectDelegates::OnObjectPreSave.Remove(Late); };
+        UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy); F.Keep(Copy);
+        TestFalse(TEXT("Source callback expansion refuses copied batch"), Written.Ok()); TestFalse(TEXT("Callback cannot save the source"), bSourceWrite);
+        TestTrue(TEXT("Source callback edits remain available"), bLate ? bLateChanged && Actors[0]->GetPackage()->IsDirty() : Added && Added->GetPackage()->IsDirty());
+        for (const auto& Path : Destination.Paths()) TestFalse(TEXT("No copy file written after source drift"), IFileManager::Get().FileExists(*FPaths::Combine(Files.Repo, Path)));
+        for (const auto& File : Destination.SourceFiles) TestEqual(TEXT("Source saved bytes intact"), LexToString(FMD5Hash::HashFile(*File.Filename)), File.Hash);
+        TestEqual(TEXT("Callback preserves staging"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+        TestTrue(TEXT("No callback lock expansion"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == Destination.Paths().Num());
+    }
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyPartialTest, "GitWorkspace.SaveLock.WPCopyPartialAndRetry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyPartialTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    TArray<AActor*> Actors; UWorld* Source = F.ExistingActorWorld(true, Actors, true, true); if (!TestNotNull(TEXT("Partial source"), Source)) return false;
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(Files.Git, Files.Repo);
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Partial lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    const auto Destination = GitWorkspaceSave::ReviewMapDestination(Source, F.Mount + TEXT("L_Partial"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Partial review"), Destination.Error.IsEmpty())) return false;
+    FFileHelper::SaveStringToFile(Destination.ExternalPaths().Last(), *(Files.Root / TEXT("fail-lock-path")));
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+    TestFalse(TEXT("Partial reservation refuses permit"), Prepared.Result.Ok() || Prepared.Permit); TestTrue(TEXT("Source preserved after partial reservation"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
+    IFileManager::Get().Delete(*(Files.Root / TEXT("fail-lock-path")));
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+    if (!TestTrue(TEXT("Remaining reservations prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const auto Before = Repo.Refresh(); auto Guard = FCoreUObjectDelegates::IsPackageOKToSaveDelegate; ON_SCOPE_EXIT { FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard; };
+    FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([Guard](UPackage* Package, const FString& File, FOutputDevice* Output)
+    { return !File.EndsWith(TEXT(".umap")) && (!Guard.IsBound() || Guard.Execute(Package, File, Output)); });
+    UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy); F.Keep(Copy);
+    TestFalse(TEXT("Map failure reported"), Written.Ok()); if (!TestNotNull(TEXT("Unsaved copy retained"), Copy)) return false;
+    TestTrue(TEXT("Source unchanged after partial copy"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
+    TestFalse(TEXT("Copy map absent"), IFileManager::Get().FileExists(*Destination.Map.Filename));
+    for (const auto& Actor : Destination.Actors) TestTrue(TEXT("Completed actor retained"), IFileManager::Get().FileExists(*Actor.Target.Filename));
+    TestTrue(TEXT("Completed build data retained"), IFileManager::Get().FileExists(*Destination.BuildData.Filename)); FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard;
+    const auto Again = GitWorkspaceSave::GatherPackageSavePaths({Copy->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Only unfinished map needs retry: ") + Again.Error, Again.Error.IsEmpty() && Again.Paths == TArray<FString>{Destination.Map.Path})) return false;
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Again.Paths, TEXT("origin"), Again.NewPaths, Again.ExternalActorPaths), Lease, true);
+    if (!TestTrue(TEXT("Retry prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const auto Retried = GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content);
+    TestTrue(TEXT("Remaining copy map saved: ") + Retried.Error, Retried.Ok());
+    TestTrue(TEXT("Source unchanged after retry"), GitWorkspaceSave::ValidateExternalMapCopySource(Source, Destination).IsEmpty());
     TestEqual(TEXT("Partial copy and retry preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("No implicit commit"), Repo.Refresh().Head, Before.Head);
     TestTrue(TEXT("Copy locks retained after retry"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == Destination.Paths().Num());
     return true;

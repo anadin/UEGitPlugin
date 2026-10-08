@@ -319,7 +319,7 @@ void ExecuteMapSaveAs(UWorld* World, const FExecuteAction& Original)
     if (Destination.bExternalFirstSave || Destination.bExternalCopy)
     {
         Introduction = Destination.bExternalCopy ?
-            TEXT("This copies the current OFPA map, external actors and modern build data into new locked files. Copied actors receive new identities. The original stays open with its unsaved edits; its files and locks are preserved. Open the copy from Content Browser to switch maps. Locks remain held.\n\n") :
+            TEXT("This copies the fully loaded WP/OFPA map, external actors and modern build data into new locked files. Copied actors receive new identities. The original stays open with its unsaved edits and loaded actors; its files and locks are preserved. Open the copy from Content Browser to switch maps. Locks remain held.\n\n") :
             TEXT("This names the current WP/OFPA map and remaps its external actors. Every new file is locked before naming; actors and build data are saved before the map. You keep editing this map. Locks remain held.\n\n");
         for (const auto& Actor : Destination.Actors) Introduction += TEXT("New actor: ") + Actor.Label + TEXT("\n") + Actor.Target.Path + TEXT("\n\n");
     }
