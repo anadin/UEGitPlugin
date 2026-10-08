@@ -100,8 +100,8 @@ FAssetSaveReview FRepository::ReviewAssetSaveInternal(const TArray<FString>& Req
     TArray<FString> Paths = Requested; Paths.Sort();
     for (const auto& Path : NewPaths) if (!Paths.Contains(Path)) { R.Error = TEXT("First-save destination was not selected."); return R; }
     for (const auto& Path : ExternalActorPaths)
-        if (!Paths.Contains(Path) || !Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/")) || NewPaths.Contains(Path))
-        { R.Error = TEXT("Only existing external actors in a coordinated save can be reviewed."); return R; }
+        if (!Paths.Contains(Path) || !Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/")))
+        { R.Error = TEXT("Only external actors in a coordinated save can be reviewed."); return R; }
     for (const auto& Path : Paths)
     {
         const bool bExternal = Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/"));
@@ -119,7 +119,7 @@ FAssetSaveReview FRepository::ReviewAssetSaveInternal(const TArray<FString>& Req
         {
             const auto New = CheckNewAssetPath(Path, R.Local);
             if (!New.Ok()) { R.Error = New.Error; return R; }
-            R.Paths.AddUnique(Path); R.NewPaths.AddUnique(Path); continue;
+            R.Paths.AddUnique(Path); R.NewPaths.AddUnique(Path); if (bExternal) R.ExternalActorPaths.AddUnique(Path); continue;
         }
         const auto File = UntrackedFingerprint({Path});
         if (!File.Ok()) { R.Error = File.Error; return R; }

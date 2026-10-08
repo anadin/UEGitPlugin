@@ -344,10 +344,10 @@ void ExecuteSave(const TArray<UPackage*>& Packages, const FExecuteAction& Origin
     FString Introduction;
     if (Destinations.bCoordinatedActors)
     {
-        Introduction = TEXT("Saving the reviewed map, build data and actor edits. Clean files are not locked by this save.\nBuild data and actors save before their map. New actors, deletion and external objects are not supported yet.\n\n");
+        Introduction = TEXT("Saving the reviewed map, build data and actor edits. Clean files are not locked by this save.\nNew actor files are locked before their first save. Deleted actors and external objects are not supported yet.\n\n");
         for (const auto& Entry : Destinations.Entries)
         {
-            if (Entry.Actor.IsValid() && Entry.World.IsValid()) Introduction += Entry.Actor->GetActorLabel() + TEXT(" — ") + Entry.World->GetName() + TEXT("\n") + Entry.Path + TEXT("\n\n");
+            if (Entry.Actor.IsValid() && Entry.World.IsValid()) Introduction += (Destinations.NewPaths.Contains(Entry.Path) ? FString(TEXT("New actor: ")) : FString()) + Entry.Actor->GetActorLabel() + TEXT(" — ") + Entry.World->GetName() + TEXT("\n") + Entry.Path + TEXT("\n\n");
             else if (Entry.Kind == FPackageSavePaths::EKind::Map || Entry.Kind == FPackageSavePaths::EKind::BuildData)
                 Introduction += FString(Entry.Kind == FPackageSavePaths::EKind::Map ? TEXT("Map: ") : TEXT("Build data: ")) + Entry.Path + TEXT("\n\n");
         }

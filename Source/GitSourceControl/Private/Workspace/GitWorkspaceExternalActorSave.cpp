@@ -52,7 +52,7 @@ FString ExistingWorldError(UWorld* World, const FString& Root, const FString& Co
     UPackage* Map = World->GetPackage();
     if (FPackageName::IsTempPackage(Map->GetName()) || Map->HasAnyPackageFlags(PKG_NewlyCreated) ||
         !FPackageName::DoesPackageExist(Map->GetName(), &Filename))
-        return TEXT("First saves and Save As for World Partition / OFPA maps are not supported yet. Existing actor edits require an already saved map.");
+        return TEXT("First saves and Save As for World Partition / OFPA maps are not supported yet. Actor saves require an already saved map.");
     Filename = FPaths::ConvertRelativePathToFull(Filename);
     if (!FPaths::IsUnderDirectory(Filename, Content) || !FPaths::IsUnderDirectory(Filename, Root))
         return TEXT("The owning map must be an existing map in this repository's game Content folder.");
@@ -168,11 +168,20 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
         // which can delete them without consulting IsPackageOKToSaveDelegate.
         for (UPackage* Package : World->PersistentLevel->GetLoadedExternalObjectPackages())
         {
-            if (!Package || (!Package->IsDirty() && !UPackage::IsEmptyPackage(Package))) continue;
+            if (!Package || (!Package->IsDirty() && !Package->HasAnyPackageFlags(PKG_NewlyCreated) && !UPackage::IsEmptyPackage(Package))) continue;
             FString Filename;
-            if (Package->HasAnyPackageFlags(PKG_NewlyCreated) || UPackage::IsEmptyPackage(Package) ||
-                !FPackageName::DoesPackageExist(Package->GetName(), &Filename))
-            { Out.Error = TEXT("New or deleted/empty external packages require first-save/deletion recovery support. No packages were saved or deleted: ") + Package->GetName(); return Out; }
+            if (UPackage::IsEmptyPackage(Package))
+            { Out.Error = TEXT("Deleted/empty external packages require deletion recovery support. No packages were saved or deleted: ") + Package->GetName(); return Out; }
+            const bool bNew = Package->HasAnyPackageFlags(PKG_NewlyCreated);
+            if (bNew)
+            {
+                if (!FPackageName::TryConvertLongPackageNameToFilename(Package->GetName(), Filename, TEXT(".uasset")))
+                { Out.Error = TEXT("Cannot resolve the new actor destination."); return Out; }
+                if (IFileManager::Get().FileExists(*Filename) || IFileManager::Get().DirectoryExists(*Filename))
+                { Out.Error = TEXT("A new actor destination is already occupied. No file was overwritten: ") + Package->GetName(); return Out; }
+            }
+            else if (!FPackageName::DoesPackageExist(Package->GetName(), &Filename))
+            { Out.Error = TEXT("An existing actor file is missing. Restore or hydrate it before saving; it cannot be treated as a new actor: ") + Package->GetName(); return Out; }
             Filename = FPaths::ConvertRelativePathToFull(Filename);
             if (!FPaths::IsUnderDirectory(Filename, Content) || !FPaths::IsUnderDirectory(Filename, Root))
             { Out.Error = TEXT("An external package is outside the owning repository's Content folder."); return Out; }
@@ -182,6 +191,7 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
             Entry.Actor = AActor::FindActorInPackage(Package); if (Entry.Actor.IsValid()) Entry.ActorGuid = Entry.Actor->GetActorGuid();
             Entry.Kind = FPackageSavePaths::EKind::Actor;
             Out.Entries.Add(Entry); Out.Paths.AddUnique(Entry.Path); Out.ExternalActorPaths.AddUnique(Entry.Path);
+            if (bNew) Out.NewPaths.AddUnique(Entry.Path);
             Out.Error = ValidateExternalActorBinding(Out, Entry.Path, Package); if (!Out.Error.IsEmpty()) return Out;
         }
     }
@@ -215,8 +225,9 @@ FString ValidateExternalActorBinding(const FPackageSavePaths& Plan, const FStrin
 {
     check(IsInGameThread());
     const auto* Entry = Plan.Entries.FindByPredicate([&](const FPackageSavePaths::FEntry& E) { return E.Path == Path; });
+    const bool bNew = Plan.NewPaths.Contains(Path);
     if (!Plan.ExternalActorPaths.Contains(Path) || !Entry || !Package || Entry->Package.Get() != Package || Package->GetName() != Entry->PackageName ||
-        !Entry->World.IsValid() || !Entry->Actor.IsValid() || UPackage::IsEmptyPackage(Package) || Package->HasAnyPackageFlags(PKG_NewlyCreated))
+        !Entry->World.IsValid() || !Entry->Actor.IsValid() || UPackage::IsEmptyPackage(Package) || Package->HasAnyPackageFlags(PKG_NewlyCreated) != bNew)
         return TEXT("The external actor/package no longer matches this prepared save.");
     UWorld* World = Entry->World.Get(); AActor* Actor = Entry->Actor.Get();
     if (!World->PersistentLevel || World->GetPackage()->GetName() != Entry->WorldName ||
@@ -226,9 +237,11 @@ FString ValidateExternalActorBinding(const FPackageSavePaths& Plan, const FStrin
         Actor->IsA<ALODActor>() || Actor->IsA<AWorldPartitionHLOD>() || !Entry->ActorGuid.IsValid() || Actor->GetActorGuid() != Entry->ActorGuid ||
         !World->PersistentLevel->Actors.Contains(Actor) || !Package->GetName().Contains(TEXT("/__ExternalActors__/")) ||
         ULevel::GetActorPackageName(World->GetPackage(), World->PersistentLevel->GetActorPackagingScheme(), Actor->GetPathName(), Actor) != Package->GetName())
-        return TEXT("Only existing main actors belonging to this exact persistent map can be saved. External objects, HLOD and nested-container paths need separate adapters.");
+        return TEXT("Only main actors belonging to this exact persistent map can be saved. External objects, HLOD and nested-container paths need separate adapters.");
     FString Filename;
-    if (!FPackageName::DoesPackageExist(Package->GetName(), &Filename) || FPaths::ConvertRelativePathToFull(Filename) != Entry->Filename ||
+    const bool bResolved = bNew ? FPackageName::TryConvertLongPackageNameToFilename(Package->GetName(), Filename, TEXT(".uasset")) : FPackageName::DoesPackageExist(Package->GetName(), &Filename);
+    if (!bResolved || FPaths::ConvertRelativePathToFull(Filename) != Entry->Filename ||
+        (bNew && (IFileManager::Get().FileExists(*Entry->Filename) || IFileManager::Get().DirectoryExists(*Entry->Filename))) ||
         FileHash(Entry->WorldFilename) != Entry->WorldHash)
         return TEXT("The actor destination or owning map's saved bytes changed after review.");
     return FString();
