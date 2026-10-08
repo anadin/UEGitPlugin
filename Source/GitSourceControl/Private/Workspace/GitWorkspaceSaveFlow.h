@@ -60,16 +60,27 @@ struct FAssetCopyDestination
     FString PackageName, Path, Filename, Error;
 };
 FAssetCopyDestination ReviewAbsentDestination(const FString& PackageName, const FString& SourcePackage, const FString& Root, const FString& Content, bool bMap);
-// Ordinary persistent maps only. First Save names the live world; Save As copies it.
+// First Save names the live world; ordinary-map Save As copies it.
 struct FMapSaveDestination
 {
+    struct FActorDestination
+    {
+        TWeakObjectPtr<AActor> Actor;
+        FGuid Guid;
+        FString SourcePackage, SourcePath, Label;
+        FAssetCopyDestination Target;
+    };
     FAssetCopyDestination Map, BuildData;
+    TArray<FActorDestination> Actors;
     FString SourcePackage, Error;
-    TWeakObjectPtr<UObject> SourceBuildData;
-    bool bNameCurrent = false;
-    TArray<FString> Paths() const { TArray<FString> Out{Map.Path}; if (!BuildData.Path.IsEmpty()) Out.Add(BuildData.Path); return Out; }
+    TWeakObjectPtr<UObject> SourceBuildData, SourceLevel, SourcePartition;
+    bool bNameCurrent = false, bExternalFirstSave = false;
+    TArray<FString> ExternalPaths() const { TArray<FString> Out; for (const auto& Actor : Actors) Out.Add(Actor.Target.Path); Out.Sort(); return Out; }
+    TArray<FString> Paths() const { TArray<FString> Out{Map.Path}; if (!BuildData.Path.IsEmpty()) Out.Add(BuildData.Path); Out.Append(ExternalPaths()); Out.Sort(); return Out; }
 };
 FString ReviewMapSource(UWorld* World);
+FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary);
+void ReviewExternalFirstMapActors(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination);
 FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageName, const FString& Root, const FString& Content);
 bool SupportsAssetCopy(const UObject* Source);
 UObject* GetCopySource(const FAssetEditorToolkit& Editor);
@@ -89,6 +100,8 @@ GitWorkspace::FResult CompleteExternalActorDeletion(FActorDeletionRecovery& Reco
 GitWorkspace::FResult WriteAssetCopy(UObject* Source, const FAssetCopyDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UObject*& OutCopy, UObject* EditedData = nullptr);
 GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
+GitWorkspace::FResult WriteExternalFirstMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
     const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld);
 class FPreparedScope
 {

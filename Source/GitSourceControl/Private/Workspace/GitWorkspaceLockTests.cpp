@@ -204,6 +204,18 @@ struct FMapSaveFixture
         AActor* Actor = World->SpawnActor<AActor>(AActor::StaticClass(), FTransform(FVector(200, 30, 40)), Params);
         Actor->SetActorLabel(Label); Actor->SetPackageExternal(true); return Actor;
     }
+    UWorld* NewExternalWorld(bool bPartitioned, TArray<AActor*>& Actors, bool bData = true)
+    {
+        const FString Name = TEXT("/Temp/Untitled_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+        UWorld::InitializationValues Init; Init.CreateWorldPartition(bPartitioned).EnableWorldPartitionStreaming(false).CreateNavigation(false).CreateAISystem(false);
+        UWorld* World = UWorld::CreateWorld(EWorldType::Inactive, false, FPackageName::GetShortFName(*Name), CreatePackage(*Name), false, ERHIFeatureLevel::Num, &Init);
+        World->SetFlags(RF_Public | RF_Standalone); World->MarkPackageDirty(); Worlds.Emplace(World);
+        World->PersistentLevel->SetUseExternalActors(true);
+        Actors.Add(NewActor(World, TEXT("FirstActor0"), TEXT("First actor A")));
+        Actors.Add(NewActor(World, TEXT("FirstActor1"), TEXT("First actor B")));
+        if (bData) AddValidBuildData(World);
+        return World;
+    }
     void Export(const FString& Folder)
     {
         IFileManager::Get().DeleteDirectory(*Folder, false, true); IFileManager::Get().MakeDirectory(*Folder, true);
@@ -1035,7 +1047,7 @@ bool FGitMapBoundaryTest::RunTest(const FString&)
     TestFalse(TEXT("World Partition refused before naming and acquisition"), ReviewDestination().Error.IsEmpty());
     World->GetWorldSettings()->SetWorldPartition(nullptr);
     World->PersistentLevel->SetUseExternalActors(true);
-    TestFalse(TEXT("OFPA refused before naming"), ReviewDestination().Error.IsEmpty()); World->PersistentLevel->SetUseExternalActors(false);
+    TestTrue(TEXT("Empty OFPA first naming has a coordinated destination"), ReviewDestination().Error.IsEmpty() && ReviewDestination().bExternalFirstSave); World->PersistentLevel->SetUseExternalActors(false);
     World->WorldComposition = NewObject<UWorldComposition>(World);
     TestFalse(TEXT("World Composition refused before naming"), ReviewDestination().Error.IsEmpty()); World->WorldComposition = nullptr;
     TestFalse(TEXT("Save All cannot open an unreviewed temporary-map naming route"), GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content).Error.IsEmpty());
@@ -1078,6 +1090,183 @@ bool FGitMapPartialTest::RunTest(const FString&)
     const auto Gathered = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
     TestTrue(TEXT("Ordinary Save retry reviews both files and only absent map as new"), Gathered.Error.IsEmpty() && Gathered.Paths.Num() == 2 && Gathered.NewPaths.Num() == 1 && Gathered.NewPaths.Contains(Destination.Map.Path));
     TestTrue(TEXT("Both locks retained after partial save"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == 2);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalMapNameTest, "GitWorkspace.SaveLock.ExternalMapFirstNaming", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalMapNameTest::RunTest(const FString&)
+{
+    for (bool bPartitioned : {false, true})
+    {
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+        ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+        GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content);
+        TArray<AActor*> Actors; UWorld* World = F.NewExternalWorld(bPartitioned, Actors);
+        GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+        if (!TestTrue(TEXT("External naming lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+        const auto Destination = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_First"), Files.Repo, F.Content);
+        const int32 ExternalCount = World->PersistentLevel->Actors.FilterByPredicate([](AActor* A) { return A && A->IsPackageExternal(); }).Num();
+        if (!TestTrue(TEXT("Complete first-map review: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.bExternalFirstSave && Destination.Actors.Num() == ExternalCount && ExternalCount >= 2 && Destination.Paths().Num() == ExternalCount + 2)) return false;
+        const FString Source = World->GetPathName(); UObject* Data = World->PersistentLevel->MapBuildData.Get();
+        const auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths());
+        TestTrue(TEXT("All map/actor/data paths explicitly first-save"), Review.IsFresh() && Review.NeedsLock.Num() == Destination.Paths().Num() && Review.ExternalActorPaths.Num() == ExternalCount);
+        TestFalse(TEXT("Cancel leaves first-map plan unprepared"), Repo.PrepareAssetSave(Review, Lease).Result.Ok());
+        TestEqual(TEXT("Cancel leaves current map unnamed"), World->GetPathName(), Source);
+        TestEqual(TEXT("Cancel acquires no locks"), Repo.VerifyLocks(TEXT("origin")).Locks.Num(), 0);
+        auto Prepared = Repo.PrepareAssetSave(Review, Lease, true);
+        if (!TestTrue(TEXT("Every destination reserved: ") + Prepared.Result.Error, Prepared.Result.Ok() && Prepared.Permit)) return false;
+        UWorld* Named = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+        if (!TestTrue(TEXT("First external map save: ") + Written.Error, Written.Ok() && Named == World)) return false;
+        TestEqual(TEXT("Same world has chosen persistent name"), World->GetPackage()->GetName(), Destination.Map.PackageName);
+        TestTrue(TEXT("Same modern build-data object follows naming"), World->PersistentLevel->MapBuildData == Data && Data->GetPackage()->GetName() == Destination.BuildData.PackageName);
+        for (const auto& A : Destination.Actors)
+        {
+            TestTrue(TEXT("Actor identity and canonical package remapped"), A.Actor.IsValid() && A.Actor->GetActorGuid() == A.Guid && A.Actor->GetExternalPackage()->GetName() == A.Target.PackageName);
+            TestTrue(TEXT("Native cleanup boundary remains active"), GitWorkspaceSession::IsExternalCleanupProtected(A.Target.Filename));
+            TestFalse(TEXT("Actor first save clears dirty state"), A.Actor->GetPackage()->IsDirty());
+            auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get(); Registry.ScanFilesSynchronous({A.Target.Filename}, true);
+            TArray<FAssetData> Saved; Registry.GetAssetsByPackageName(FName(*A.Target.PackageName), Saved, true);
+            TestEqual(TEXT("Saved actor descriptor exists"), Saved.Num(), 1);
+            if (Saved.Num() == 1)
+            {
+                const auto Desc = FWorldPartitionActorDescUtils::GetActorDescriptorFromAssetData(Saved[0]);
+                TestTrue(TEXT("Saved descriptor refers to named world and reviewed GUID"), Desc && Desc->GetGuid() == A.Guid && Desc->GetActorSoftPath().ToString() == A.Actor->GetPathName());
+            }
+        }
+        for (const FString& Path : Destination.Paths()) TestTrue(TEXT("Every reviewed output exists"), IFileManager::Get().FileExists(*FPaths::Combine(Files.Repo, Path)));
+        TestFalse(TEXT("Newly named map is saved"), World->GetPackage()->IsDirty());
+        TestFalse(TEXT("Named external map Save As remains explicitly unsupported"), GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_Copy"), Files.Repo, F.Content).Error.IsEmpty());
+        Actors[0]->SetActorLabel(TEXT("First actor A edited")); Actors[0]->MarkPackageDirty(); World->GetWorldSettings()->KillZ = -45678.f; World->MarkPackageDirty();
+        const auto Again = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Subsequent Save uses existing coordinated actor/map flow: ") + Again.Error, Again.Error.IsEmpty() && Again.NewPaths.IsEmpty() && Again.Paths.Num() == (World->GetWorldSettings()->IsPackageExternal() ? 3 : 2))) return false;
+        Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Again.Paths, TEXT("origin"), Again.NewPaths, Again.ExternalActorPaths), Lease, true);
+        if (!TestTrue(TEXT("Follow-up prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+        const auto Resaved = GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content);
+        TestTrue(TEXT("Follow-up save succeeds: ") + Resaved.Error, Resaved.Ok());
+        TestEqual(TEXT("No implicit stage"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("No implicit commit"), Repo.Refresh().Head, Before.Head);
+        TestEqual(TEXT("No implicit stash"), Repo.ListStashes().Fingerprint, Stashes);
+        const auto Locks = Repo.VerifyLocks(TEXT("origin")); TestTrue(TEXT("Every first-map lock retained"), Locks.IsFresh() && Locks.Locks.Num() == Destination.Paths().Num());
+        F.Export(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Automation/ExternalMapFirstFixtures"), bPartitioned ? TEXT("WorldPartition") : TEXT("OFPA")));
+    }
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalMapBoundaryTest, "GitWorkspace.SaveLock.ExternalMapNamingBoundaries", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalMapBoundaryTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content);
+    TArray<AActor*> Actors; UWorld* World = F.NewExternalWorld(false, Actors, false);
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("Naming boundary lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    const FString Name = F.Mount + TEXT("L_Boundary"); auto Destination = GitWorkspaceSave::ReviewMapDestination(World, Name, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Data-free map reviews only map and actors"), Destination.Error.IsEmpty() && Destination.Paths().Num() == 3)) return false;
+    const auto Review = Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths());
+    auto Prepared = Repo.PrepareAssetSave(Review, Lease, true); if (!TestTrue(TEXT("Boundary locks acquired"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    Actors[0]->SetActorLabel(TEXT("Changed after naming review")); UWorld* Named = nullptr;
+    TestFalse(TEXT("Actor identity/label drift refuses before naming"), GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named).Ok());
+    TestTrue(TEXT("Drift retains unnamed live world and writes nothing"), !Named && FPackageName::IsTempPackage(World->GetPackage()->GetName()) && !IFileManager::Get().FileExists(*Destination.Map.Filename));
+    Actors[0]->SetActorLabel(Destination.Actors.FindByPredicate([&](const auto& A) { return A.Actor.Get() == Actors[0]; })->Label);
+    AActor* Added = F.NewActor(World, TEXT("LateActor"), TEXT("Added after review"));
+    TestFalse(TEXT("An added actor cannot expand the reviewed map destinations"), GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named).Ok());
+    World->DestroyActor(Added); Added = nullptr;
+    // An unrelated object package must be detected before any rename or write.
+    UObject* External = NewObject<UTexture2D>(World->PersistentLevel, TEXT("UnsupportedExternalObject"));
+    External->SetExternalPackage(CreatePackage(*(F.Mount + TEXT("__ExternalObjects__/L_Orphan/Object"))));
+    TestFalse(TEXT("External objects refuse first naming"), GitWorkspaceSave::ReviewMapDestination(World, Name, Files.Repo, F.Content).Error.IsEmpty()); External->SetExternalPackage(nullptr);
+    Destination = GitWorkspaceSave::ReviewMapDestination(World, Name, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Fresh review valid after removing unsupported object: ") + Destination.Error, Destination.Error.IsEmpty())) return false;
+    const auto Target = Destination.Actors[0].Target;
+    // Use real package bytes so background asset discovery can inspect the
+    // occupied destination without an unrelated invalid-package error.
+    TStrongObjectPtr<UTexture2D> Sentinel(NewObject<UTexture2D>(CreatePackage(*(F.Mount + TEXT("T_Sentinel"))), TEXT("T_Sentinel"), RF_Public | RF_Standalone));
+    ON_SCOPE_EXIT { FAssetRegistryModule::AssetDeleted(Sentinel.Get()); Sentinel->GetPackage()->SetDirtyFlag(false); Sentinel->ClearFlags(RF_Standalone); };
+    FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError;
+    const FString SentinelFile = FPaths::Combine(F.Content, TEXT("T_Sentinel.uasset"));
+    if (!TestTrue(TEXT("Valid occupied-destination fixture"), UPackage::SavePackage(Sentinel->GetPackage(), Sentinel.Get(), *SentinelFile, Args))) return false;
+    TArray<uint8> Occupied; FFileHelper::LoadFileToArray(Occupied, *SentinelFile);
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Target.Filename), true); FFileHelper::SaveArrayToFile(Occupied, *Target.Filename);
+    TestFalse(TEXT("Orphan destination actor tree refuses before naming"), GitWorkspaceSave::ReviewMapDestination(World, Name, Files.Repo, F.Content).Error.IsEmpty());
+    TestFalse(TEXT("Post-review occupied destination refuses writer"), GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named).Ok());
+    TArray<uint8> Bytes; FFileHelper::LoadFileToArray(Bytes, *Target.Filename); TestEqual(TEXT("Occupied bytes not overwritten"), Bytes, Occupied);
+    TestTrue(TEXT("Boundary failures retain all reserved locks"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == 3);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalMapPartialTest, "GitWorkspace.SaveLock.ExternalMapFirstPartialAndRetry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalMapPartialTest::RunTest(const FString&)
+{
+    for (bool bMapFailure : {false, true})
+    {
+        auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+        ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content);
+        TArray<AActor*> Actors; UWorld* World = F.NewExternalWorld(bMapFailure, Actors);
+        GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+        if (!TestTrue(TEXT("Partial naming lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        const auto Before = Repo.Refresh(); const auto Destination = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_Partial"), Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Partial naming destination: ") + Destination.Error, Destination.Error.IsEmpty())) return false;
+        FFileHelper::SaveStringToFile(Destination.ExternalPaths().Last(), *FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+        auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+        TestFalse(TEXT("Partial lock failure refuses preparation"), Prepared.Result.Ok());
+        TestTrue(TEXT("Partial locks leave map unnamed without outputs"), FPackageName::IsTempPackage(World->GetPackage()->GetName()) && !IFileManager::Get().FileExists(*Destination.Map.Filename));
+        IFileManager::Get().Delete(*FPaths::Combine(Files.Root, TEXT("fail-lock-path")));
+        Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+        if (!TestTrue(TEXT("Remaining reservations acquired"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+        const FString Failed = bMapFailure ? Destination.Map.Filename : Destination.Actors.Last().Target.Filename;
+        auto Guard = FCoreUObjectDelegates::IsPackageOKToSaveDelegate; ON_SCOPE_EXIT { FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard; };
+        FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([Guard, Failed](UPackage* Package, const FString& File, FOutputDevice* Output)
+        { return FPaths::ConvertRelativePathToFull(File) != Failed && (!Guard.IsBound() || Guard.Execute(Package, File, Output)); });
+        UWorld* Named = nullptr; const auto Saved = GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+        TestFalse(TEXT("First-map writer failure reported"), Saved.Ok()); TestTrue(TEXT("Live named world retained for retry"), Named == World && World->GetPackage()->IsDirty());
+        TestTrue(TEXT("Completed build data retained"), IFileManager::Get().FileExists(*Destination.BuildData.Filename));
+        TestTrue(TEXT("Completed first actor retained"), IFileManager::Get().FileExists(*Destination.Actors[0].Target.Filename));
+        TestFalse(TEXT("Map absent until dependencies complete"), IFileManager::Get().FileExists(*Destination.Map.Filename));
+        const auto Again = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+        if (!TestTrue(TEXT("Retry reviews only unfinished files: ") + Again.Error, Again.Error.IsEmpty() && Again.Paths.Num() == (bMapFailure ? 1 : 2) && Again.NewPaths == Again.Paths)) return false;
+        FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard;
+        Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Again.Paths, TEXT("origin"), Again.NewPaths, Again.ExternalActorPaths), Lease, true);
+        if (!TestTrue(TEXT("Retry prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+        const auto Retried = GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content);
+        TestTrue(TEXT("Partial first save retries successfully: ") + Retried.Error, Retried.Ok()); TestFalse(TEXT("Retry clears named map dirty state"), World->GetPackage()->IsDirty());
+        TestEqual(TEXT("Partial and retry preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("Partial and retry preserve HEAD"), Repo.Refresh().Head, Before.Head);
+        TestTrue(TEXT("Every first-map lock remains held after retry"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == Destination.Paths().Num());
+    }
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitExternalMapCallbackTest, "GitWorkspace.SaveLock.ExternalMapFirstCallbacks", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitExternalMapCallbackTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FMapSaveFixture>(); auto& F = *Lifetime; auto& Files = F.Files;
+    ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime)); GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content);
+    TArray<AActor*> Actors; UWorld* World = F.NewExternalWorld(false, Actors);
+    GitWorkspace::FRepository Repo(Files.Git, Files.Repo); FString Error; GitWorkspaceSession::FLease Lease;
+    if (!TestTrue(TEXT("First-map callback lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    const auto Destination = GitWorkspaceSave::ReviewMapDestination(World, F.Mount + TEXT("L_Callback"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Callback destinations valid"), Destination.Error.IsEmpty())) return false;
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+    if (!TestTrue(TEXT("Callback batch locks prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    AActor* Added = nullptr; const auto Hook = FEditorDelegates::PreSaveExternalActors.AddLambda([&](UWorld* Saving)
+    { if (Saving == World && !Added) Added = F.NewActor(World, TEXT("CallbackActor"), TEXT("Added by save callback")); });
+    ON_SCOPE_EXIT { FEditorDelegates::PreSaveExternalActors.Remove(Hook); };
+    UWorld* Named = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(World, Destination, Repo, *Prepared.Permit, Lease, F.Content, Named);
+    TestFalse(TEXT("Save callback cannot silently expand first-map batch"), Written.Ok());
+    TestTrue(TEXT("Named world and callback edit remain available"), Named == World && Added && Added->GetPackage()->IsDirty() && World->GetPackage()->IsDirty());
+    for (const auto& Path : Destination.Paths()) TestFalse(TEXT("Callback drift writes no reviewed destination"), IFileManager::Get().FileExists(*FPaths::Combine(Files.Repo, Path)));
+    TestTrue(TEXT("Callback drift acquires no extra lock"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == 4);
+    FEditorDelegates::PreSaveExternalActors.Remove(Hook);
+    const auto Again = GitWorkspaceSave::GatherPackageSavePaths({World->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Fresh review includes callback actor: ") + Again.Error, Again.Error.IsEmpty() && Again.Paths.Num() == 5 && Again.NewPaths == Again.Paths)) return false;
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Again.Paths, TEXT("origin"), Again.NewPaths, Again.ExternalActorPaths), Lease, true);
+    if (!TestTrue(TEXT("Fresh consent acquires callback actor reservation"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const auto Retry = GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content);
+    TestTrue(TEXT("Callback drift retries through fresh complete review: ") + Retry.Error, Retry.Ok());
+    TestEqual(TEXT("Callback drift and retry preserve staging"), Repo.Refresh().IndexEntries, Before.IndexEntries);
+    TestEqual(TEXT("Callback drift and retry preserve HEAD"), Repo.Refresh().Head, Before.Head);
+    TestEqual(TEXT("Callback drift and retry preserve stashes"), Repo.ListStashes().Fingerprint, Stashes);
     return true;
 }
 

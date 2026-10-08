@@ -56,16 +56,30 @@ FString ExistingWorldError(UWorld* World, const FString& Root, const FString& Co
         !World->GetStreamingLevels().IsEmpty() || World->WorldComposition)
         return TEXT("External actor saves currently support one persistent editor map. Stop Play/Simulate; sublevels and level instances need a separate save adapter.");
     UPackage* Map = World->GetPackage();
-    if (FPackageName::IsTempPackage(Map->GetName()) || Map->HasAnyPackageFlags(PKG_NewlyCreated) ||
-        !FPackageName::DoesPackageExist(Map->GetName(), &Filename))
-        return TEXT("First saves and Save As for World Partition / OFPA maps are not supported yet. Actor saves require an already saved map.");
+    if (FPackageName::IsTempPackage(Map->GetName()))
+        return TEXT("Name this WP/OFPA map using Save Current Level first, then retry Save All. Save As copies of named external maps are not supported yet.");
+    const bool bExists = FPackageName::DoesPackageExist(Map->GetName(), &Filename);
+    const bool bFirst = Map->HasAnyPackageFlags(PKG_NewlyCreated) && !bExists;
+    if (bFirst)
+    {
+        const FString Error = ReviewExternalFirstMapSource(World, false); if (!Error.IsEmpty()) return Error;
+        if (!FPackageName::TryConvertLongPackageNameToFilename(Map->GetName(), Filename, TEXT(".umap")))
+            return TEXT("Cannot resolve this named map's first-save destination.");
+        if (IFileManager::Get().FileExists(*Filename) || IFileManager::Get().DirectoryExists(*Filename))
+            return TEXT("The never-saved map destination is occupied; choose another name without overwriting it.");
+    }
+    else if (!bExists || Map->HasAnyPackageFlags(PKG_NewlyCreated))
+        return TEXT("The owning map is missing or its first-save destination is occupied. Restore/hydrate a saved map; it cannot be treated as a new map.");
     Filename = FPaths::ConvertRelativePathToFull(Filename);
     if (!FPaths::IsUnderDirectory(Filename, Content) || !FPaths::IsUnderDirectory(Filename, Root))
         return TEXT("The owning map must be an existing map in this repository's game Content folder.");
-    TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*Filename)); uint32 Tag = 0;
-    if (Reader && Reader->TotalSize() >= sizeof(Tag)) *Reader << Tag;
-    if (!Reader || Reader->IsError() || Tag != PACKAGE_FILE_TAG)
-        return TEXT("Hydrate the owning map before saving its actors. Its saved file is not a readable Unreal package.");
+    if (!bFirst)
+    {
+        TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*Filename)); uint32 Tag = 0;
+        if (Reader && Reader->TotalSize() >= sizeof(Tag)) *Reader << Tag;
+        if (!Reader || Reader->IsError() || Tag != PACKAGE_FILE_TAG)
+            return TEXT("Hydrate the owning map before saving its actors. Its saved file is not a readable Unreal package.");
+    }
     if (World->PersistentLevel->OwningWorld != World)
         return TEXT("The persistent level no longer belongs to this exact map.");
     if (UMapBuildDataRegistry* Data = World->PersistentLevel->MapBuildData)
@@ -181,14 +195,15 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
     for (UWorld* World : Worlds)
     {
         FString MapFile; Out.Error = ExistingWorldError(World, Root, Content, MapFile); if (!Out.Error.IsEmpty()) return Out;
+        const bool bFirstMap = World->GetPackage()->HasAnyPackageFlags(PKG_NewlyCreated);
         const FString Hash = FileHash(MapFile);
-        if (Hash.IsEmpty()) { Out.Error = TEXT("Cannot read the owning map before reviewing actor saves."); return Out; }
+        if (Hash.IsEmpty() && !bFirstMap) { Out.Error = TEXT("Cannot read the owning map before reviewing actor saves."); return Out; }
         Out.Sources.Add(World->GetPackage());
         FPackageSavePaths::FOwner Owner; Owner.World = World; Owner.Name = World->GetPackage()->GetName(); Owner.Filename = MapFile;
         Owner.Path = RelativeFile(MapFile, Root); Owner.Hash = Hash; Owner.BuildData = World->PersistentLevel->MapBuildData.Get();
         if (Owner.BuildData.IsValid()) Owner.BuildDataName = Owner.BuildData->GetPackage()->GetName();
         Out.Owners.Add(Owner);
-        bool bSaveMap = World->GetPackage()->IsDirty();
+        bool bSaveMap = bFirstMap || World->GetPackage()->IsDirty();
         if (UMapBuildDataRegistry* Data = World->PersistentLevel->MapBuildData)
         {
             UPackage* Package = Data->GetPackage(); FString Filename;
@@ -212,6 +227,7 @@ FPackageSavePaths GatherPackageSavePaths(const TArray<UPackage*>& Packages, cons
             FPackageSavePaths::FEntry Entry; Entry.Package = World->GetPackage(); Entry.PackageName = Owner.Name; Entry.Filename = MapFile; Entry.Path = Owner.Path;
             Entry.World = World; Entry.WorldName = Owner.Name; Entry.WorldFilename = MapFile; Entry.WorldHash = Hash; Entry.Kind = FPackageSavePaths::EKind::Map;
             Out.Entries.Add(Entry); Out.Paths.AddUnique(Entry.Path);
+            if (bFirstMap) Out.NewPaths.AddUnique(Entry.Path);
         }
         // This list includes deleted/empty packages. Never pass it to FileHelpers,
         // which can delete them without consulting IsPackageOKToSaveDelegate.
