@@ -1,5 +1,6 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitWorkspaceSaveFlow.h"
+#include "GitWorkspaceMapCopyLoad.h"
 #include "Editor.h"
 #include "FileHelpers.h"
 #include "Containers/Ticker.h"
@@ -125,6 +126,7 @@ void Register()
 }
 void Unregister()
 {
+    ShutdownWPMapCopyLoads();
     if (TickHandle.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(TickHandle); TickHandle.Reset();
     if (auto* Browser = FModuleManager::GetModulePtr<FContentBrowserModule>(TEXT("ContentBrowser")))
         Browser->GetAllContentBrowserCommandExtenders().RemoveAll([](const FContentBrowserCommandExtender& E) { return E.GetHandle() == BrowserHandle; });

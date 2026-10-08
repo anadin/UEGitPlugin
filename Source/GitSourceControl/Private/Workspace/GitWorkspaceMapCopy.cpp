@@ -1,5 +1,8 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitWorkspaceSaveFlow.h"
+#if PLATFORM_MAC
+#include "GitWorkspaceSession.h"
+#endif
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
@@ -71,18 +74,18 @@ TArray<FMapSaveDestination::FPartitionDescriptor> PartitionDescriptors(UWorldPar
     Out.Sort([](const auto& A, const auto& B) { return A.Guid < B.Guid; }); return Out;
 }
 }
-FString ReviewExternalMapCopySource(UWorld* World)
+FString ReviewExternalMapCopySource(UWorld* World, bool bAllowUnloaded)
 {
-    const FString Error = ReviewExternalFirstMapSource(World, false);
+    const FString Error = ReviewExternalFirstMapSource(World, false, !bAllowUnloaded);
     if (!Error.IsEmpty()) return TEXT("WP/OFPA copy requires a fully loaded persistent map with canonical main actors and modern build data.\n") + Error;
     if (FPackageName::IsTempPackage(World->GetPackage()->GetName()) || World->GetPackage()->HasAnyPackageFlags(PKG_NewlyCreated) ||
         World->GetName() != FPackageName::GetShortName(World->GetPackage()->GetName()))
         return TEXT("Save and name this WP/OFPA map before making a copy.");
     return FString();
 }
-FString CaptureExternalMapCopySource(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination)
+FString CaptureExternalMapCopySource(UWorld* World, const FString& Root, const FString& Content, FMapSaveDestination& Destination, bool bAllowUnloaded)
 {
-    const FString Error = ReviewExternalMapCopySource(World); if (!Error.IsEmpty()) return Error;
+    const FString Error = ReviewExternalMapCopySource(World, bAllowUnloaded); if (!Error.IsEmpty()) return Error;
     if (auto* Partition = World->GetWorldPartition())
     {
         Destination.SourceContainer = Partition->GetActorDescContainerInstance();
@@ -113,12 +116,22 @@ FString CaptureExternalMapCopySource(UWorld* World, const FString& Root, const F
         Destination.SourceActors.Add(Actor);
         if (Actor && Actor->IsPackageExternal()) Packages.AddUnique(Actor->GetExternalPackage());
     }
-    Packages.Sort([](const auto& A, const auto& B) { return A.GetName() < B.GetName(); });
-    TArray<FString> ExpectedActors;
-    for (UPackage* Package : Packages)
+    TMap<FString, UPackage*> PackagesByName;
+    for (UPackage* Package : Packages) PackagesByName.Add(Package->GetName(), Package);
+    if (bAllowUnloaded) for (const auto& Descriptor : Destination.SourceDescriptors)
     {
-        FMapSaveDestination::FSourceFile Entry; Entry.Package = Package; Entry.Name = Package->GetName(); Entry.bDirty = Package->IsDirty();
-        if (!FPackageName::TryConvertLongPackageNameToFilename(Entry.Name, Entry.Filename, Package == World->GetPackage() ? TEXT(".umap") : TEXT(".uasset")))
+        const FString Prefix = World->GetPathName() + TEXT(":") + World->PersistentLevel->GetName() + TEXT(".");
+        if (!Descriptor.Path.StartsWith(Prefix) || Descriptor.Package != ULevel::GetActorPackageName(ULevel::GetExternalActorsPath(World->GetPackage()->GetName()), World->PersistentLevel->GetActorPackagingScheme(), Descriptor.Path))
+            return TEXT("Every WP descriptor must name its canonical main-map actor package before loading for a copy.");
+        if (!PackagesByName.Contains(Descriptor.Package)) PackagesByName.Add(Descriptor.Package, nullptr);
+    }
+    TArray<FString> PackageNames; PackagesByName.GetKeys(PackageNames); PackageNames.Sort();
+    TArray<FString> ExpectedActors;
+    for (const FString& Name : PackageNames)
+    {
+        UPackage* Package = PackagesByName[Name];
+        FMapSaveDestination::FSourceFile Entry; Entry.Package = Package; Entry.Name = Name; Entry.bLoaded = Package != nullptr; Entry.bDirty = Package && Package->IsDirty();
+        if (!FPackageName::TryConvertLongPackageNameToFilename(Entry.Name, Entry.Filename, Name == World->GetPackage()->GetName() ? TEXT(".umap") : TEXT(".uasset")))
             return TEXT("Cannot resolve a source package for WP/OFPA copy.");
         Entry.Filename = FPaths::ConvertRelativePathToFull(Entry.Filename);
         if (!FPaths::IsUnderDirectory(Entry.Filename, Root) || !FPaths::IsUnderDirectory(Entry.Filename, Content))
@@ -127,16 +140,16 @@ FString CaptureExternalMapCopySource(UWorld* World, const FString& Root, const F
             return TEXT("Symlinked or unresolved WP/OFPA source packages cannot be copied.");
         for (FString Parent = FPaths::GetPath(Entry.Filename); Parent != Root && !Parent.IsEmpty(); Parent = FPaths::GetPath(Parent))
             if (IFileManager::Get().DirectoryExists(*(Parent / TEXT(".git"))) || IFileManager::Get().FileExists(*(Parent / TEXT(".git"))))
-                return TEXT("An WP/OFPA source package belongs to a nested checkout.");
+                return TEXT("A WP/OFPA source package belongs to a nested checkout.");
         Entry.bExists = IFileManager::Get().FileExists(*Entry.Filename);
         if (!Entry.bExists)
         {
-            if (Package == World->GetPackage() || !Package->HasAnyPackageFlags(PKG_NewlyCreated) || IFileManager::Get().DirectoryExists(*Entry.Filename))
-                return TEXT("Restore/hydrate the missing saved source package before making an WP/OFPA copy: ") + Entry.Name;
+            if (!Package || Package == World->GetPackage() || !Package->HasAnyPackageFlags(PKG_NewlyCreated) || IFileManager::Get().DirectoryExists(*Entry.Filename))
+                return TEXT("Restore/hydrate the missing saved source package before making a WP/OFPA copy: ") + Entry.Name;
         }
         else
         {
-            if (Package->HasAnyPackageFlags(PKG_NewlyCreated)) return TEXT("A new source package has an occupied destination: ") + Entry.Name;
+            if (Package && Package->HasAnyPackageFlags(PKG_NewlyCreated)) return TEXT("A new source package has an occupied destination: ") + Entry.Name;
             TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*Entry.Filename)); uint32 Tag = 0;
             if (Reader && Reader->TotalSize() >= sizeof(Tag)) *Reader << Tag;
             if (!Reader || Reader->IsError() || Tag != PACKAGE_FILE_TAG) return TEXT("Hydrate the source Unreal package before copying: ") + Entry.Name;
@@ -152,7 +165,7 @@ FString CaptureExternalMapCopySource(UWorld* World, const FString& Root, const F
     if (ActualActors != ExpectedActors) return TEXT("This WP/OFPA map has unloaded, deleted or orphan actor files. Load/reconcile the complete map before copying.");
     return FString();
 }
-FString ValidateExternalMapCopySource(UWorld* World, const FMapSaveDestination& Destination)
+FString ValidateExternalMapCopySource(UWorld* World, const FMapSaveDestination& Destination, bool bAllowUnloaded)
 {
     // Also called inside core serialization: inspect held objects and files,
     // never FindPackage/StaticFindObject, load objects or resolve descriptors.
@@ -160,7 +173,7 @@ FString ValidateExternalMapCopySource(UWorld* World, const FMapSaveDestination& 
         World->PersistentLevel != Destination.SourceLevel.Get() || World->GetWorldPartition() != Destination.SourcePartition.Get() ||
         World->PersistentLevel->MapBuildData.Get() != Destination.SourceBuildData.Get())
         return TEXT("The WP/OFPA copy's source world or build-data relationship changed. Review again.");
-    const FString Error = ReviewExternalMapCopySource(World); if (!Error.IsEmpty()) return Error;
+    const FString Error = ReviewExternalMapCopySource(World, bAllowUnloaded); if (!Error.IsEmpty()) return Error;
     if (auto* Partition = World->GetWorldPartition())
         if (Partition->GetActorDescContainerInstance() != Destination.SourceContainer.Get() ||
             Partition->IsInitialized() != Destination.bSourcePartitionInitialized ||
@@ -179,7 +192,7 @@ FString ValidateExternalMapCopySource(UWorld* World, const FMapSaveDestination& 
     TArray<FString> ExpectedActors;
     for (const auto& File : Destination.SourceFiles)
     {
-        if (!File.Package.IsValid() || File.Package->GetName() != File.Name || File.Package->IsDirty() != File.bDirty ||
+        if ((!bAllowUnloaded && !File.bLoaded) || (File.bLoaded && (!File.Package.IsValid() || File.Package->GetName() != File.Name || File.Package->IsDirty() != File.bDirty)) ||
             IFileManager::Get().FileExists(*File.Filename) != File.bExists || IFileManager::Get().DirectoryExists(*File.Filename) ||
             (File.bExists && (Hash(File.Filename) != File.Hash || FileMode(File.Filename) != File.Mode || IFileManager::Get().IsReadOnly(*File.Filename) != File.bReadOnly)))
             return TEXT("Source bytes, permissions or package state changed during WP/OFPA copy: ") + File.Name + TEXT(". Review again.");
@@ -192,12 +205,12 @@ FString ValidateExternalMapCopySource(UWorld* World, const FMapSaveDestination& 
 }
 #if PLATFORM_MAC
 GitWorkspace::FResult WriteExternalMapCopyDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
-    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld)
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld, TFunction<FString()> ValidateContext)
 {
     check(IsInGameThread()); OutWorld = nullptr;
     auto Fail = [](const FString& Error) { GitWorkspace::FResult R; R.Error = Error + TEXT("\nThe source stays open. Completed copy files, unsaved copy packages and destination locks remain; review Save All to retry remaining copy packages. Nothing was staged or unlocked."); return R; };
     TStrongObjectPtr<UWorld> HoldSource(Source);
-    auto CheckSource = [&] { return ValidateExternalMapCopySource(Source, Destination); };
+    auto CheckSource = [&] { const FString Error = ValidateExternalMapCopySource(Source, Destination); return Error.IsEmpty() && ValidateContext ? ValidateContext() : Error; };
     FString Error = CheckSource(); if (!Error.IsEmpty()) return Fail(Error);
     UPackage* Package = CreatePackage(*Destination.Map.PackageName); UWorld* Copy = nullptr;
     TMap<UObject*, UObject*> Created;

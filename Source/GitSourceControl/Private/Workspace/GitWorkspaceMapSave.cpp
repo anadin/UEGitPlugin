@@ -74,10 +74,11 @@ FMapSaveDestination ReviewMapDestination(UWorld* World, const FString& PackageNa
 }
 #if PLATFORM_MAC
 GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestination& Destination, GitWorkspace::FRepository& Repository,
-    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld)
+    const GitWorkspace::FAssetSavePermit& Permit, const GitWorkspaceSession::FLease& Lease, const FString& Content, UWorld*& OutWorld, TFunction<FString()> ValidateContext)
 {
     check(IsInGameThread()); OutWorld = nullptr;
     auto Fail = [](const FString& Error) { GitWorkspace::FResult R; R.Error = Error; return R; };
+    if (ValidateContext) { const FString Error = ValidateContext(); if (!Error.IsEmpty()) return Fail(Error); }
     const FString Root = Repository.Refresh().Root;
     const auto Current = ReviewMapDestination(Source, Destination.Map.PackageName, Root, Content);
     if (!Destination.Error.IsEmpty() || !Current.Error.IsEmpty()) return Fail(Current.Error.IsEmpty() ? Destination.Error : Current.Error);
@@ -106,7 +107,7 @@ GitWorkspace::FResult WriteMapDestination(UWorld* Source, const FMapSaveDestinat
     if (Current.bExternalCopy)
     {
         const FString Error = ValidateExternalMapCopySource(Source, Destination); if (!Error.IsEmpty()) return Fail(Error);
-        return WriteExternalMapCopyDestination(Source, Destination, Repository, Permit, Lease, Content, OutWorld);
+        return WriteExternalMapCopyDestination(Source, Destination, Repository, Permit, Lease, Content, OutWorld, MoveTemp(ValidateContext));
     }
     TStrongObjectPtr<UWorld> HoldSource(Source);
     FPreparedScope Prepared(Repository, Permit, Lease, Root);

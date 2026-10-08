@@ -22,7 +22,7 @@
 
 namespace GitWorkspaceSave
 {
-FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary)
+FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary, bool bRequireLoaded)
 {
     if (!World || World->GetClass() != UWorld::StaticClass() || !World->PersistentLevel ||
         (World->WorldType != EWorldType::Editor && World->WorldType != EWorldType::Inactive) ||
@@ -46,8 +46,8 @@ FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary)
             // GetActor() can resolve a stale soft path using StaticFindObject,
             // which is illegal in the core save validator after a map rename.
             // Bind descriptors to already-loaded level actors by GUID instead.
-            if (It->IsChildContainerInstance() || !Level->Actors.ContainsByPredicate([&](AActor* Actor)
-                { return IsValid(Actor) && Actor->GetActorGuid() == It->GetGuid(); }))
+            if (It->IsChildContainerInstance() || (bRequireLoaded && !Level->Actors.ContainsByPredicate([&](AActor* Actor)
+                { return IsValid(Actor) && Actor->GetActorGuid() == It->GetGuid(); })))
                 return TEXT("Every actor must be loaded in this exact persistent map before its first naming. Unloaded actors and nested containers need separate remapping.");
     }
     if (auto* Data = Level->MapBuildData.Get())
@@ -94,6 +94,12 @@ FString ReviewExternalFirstMapSource(UWorld* World, bool bTemporary)
     for (UPackage* Package : Level->GetLoadedExternalObjectPackages())
     {
         if (ActorPackages.Contains(Package)) continue;
+        if (!bRequireLoaded && Package && World->GetWorldPartition())
+        {
+            bool bKnown = false;
+            for (UWorldPartition::TIterator<> It(World->GetWorldPartition()); It; ++It) bKnown |= It->GetActorPackage() == Package->GetFName();
+            if (bKnown && !Package->IsDirty()) continue;
+        }
         if (!Package || !UPackage::IsEmptyPackage(Package) || FPackageName::DoesPackageExist(Package->GetName()))
             return TEXT("External objects or saved orphan packages need separate review before naming this map.");
     }

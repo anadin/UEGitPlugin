@@ -2,6 +2,11 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "GitWorkspaceRepository.h"
 #include "GitWorkspaceSaveFlow.h"
+#include "GitWorkspaceMapCopyLoad.h"
+#include "WorldPartition/LoaderAdapter/LoaderAdapterShape.h"
+#include "WorldPartition/WorldPartitionHandle.h"
+#include "WorldPartition/WorldPartitionSubsystem.h"
+#include "WorldPartition/IWorldPartitionEditorModule.h"
 #include "Misc/PackageName.h"
 #include "Misc/ScopeExit.h"
 #include "UObject/SavePackage.h"
@@ -166,10 +171,10 @@ struct FMapSaveFixture
         FVolumeLightingSample Sample; Sample.Position = FVector3f(1, 2, 3); Sample.Radius = 10; Volume.AddHighQualityLightingSample(Sample); Volume.FinalizeSamples();
         Data->LevelLightingQuality = Quality_Production; Data->MarkPackageDirty(); World->MarkPackageDirty();
     }
-    UWorld* ExistingActorWorld(bool bPartitioned, TArray<AActor*>& Actors, bool bData = false, bool bInitializePartition = false)
+    UWorld* ExistingActorWorld(bool bPartitioned, TArray<AActor*>& Actors, bool bData = false, bool bInitializePartition = false, bool bStreaming = false)
     {
         const FString Name = Mount + TEXT("L_Actors");
-        UWorld::InitializationValues Init; Init.CreateWorldPartition(bPartitioned).EnableWorldPartitionStreaming(false).CreateNavigation(false).CreateAISystem(false);
+        UWorld::InitializationValues Init; Init.CreateWorldPartition(bPartitioned).EnableWorldPartitionStreaming(bStreaming).CreateNavigation(false).CreateAISystem(false);
         UWorld* World = UWorld::CreateWorld(EWorldType::Inactive, false, FPackageName::GetShortFName(*Name), CreatePackage(*Name), false, ERHIFeatureLevel::Num, &Init);
         World->SetFlags(RF_Public | RF_Standalone); World->GetPackage()->ThisContainsMap(); Worlds.Emplace(World);
         World->PersistentLevel->SetUseExternalActors(true);
@@ -1459,6 +1464,191 @@ bool FGitOFPACopyPartialTest::RunTest(const FString&)
     return true;
 }
 
+namespace
+{
+struct FPartialWPFixture : FMapSaveFixture
+{
+    UWorld* Source = nullptr;
+    TArray<AActor*> Actors;
+    FGuid Missing;
+    UWorldPartitionEditorLoaderAdapter* Region = nullptr;
+    UObject* Settings = nullptr;
+    FBoolProperty* LoadingSetting = nullptr;
+    bool bPreviousLoading = false;
+    FPartialWPFixture()
+    {
+        IWorldPartitionEditorModule::Get();
+        // Test process only: enable WP editor loading in memory before creating
+        // the world, without broadcasting/saving a user preference change.
+        if (UClass* Class = FindObject<UClass>(nullptr, TEXT("/Script/WorldPartitionEditor.WorldPartitionEditorSettings")))
+        {
+            Settings = Class->GetDefaultObject(); LoadingSetting = FindFProperty<FBoolProperty>(Class, TEXT("bEnableLoadingInEditor"));
+            if (LoadingSetting) { bPreviousLoading = LoadingSetting->GetPropertyValue_InContainer(Settings); LoadingSetting->SetPropertyValue_InContainer(Settings, true); }
+        }
+        Source = ExistingActorWorld(true, Actors, true, true, true); if (!Source) return;
+        auto* Partition = Source->GetWorldPartition(); Missing = Actors[1]->GetActorGuid();
+        // Inactive fixtures do not receive normal world ticks. Drain the
+        // engine's saved-actor tracking references before selecting the layout.
+        Source->GetSubsystem<UWorldPartitionSubsystem>()->Tick(0.f);
+        Partition->UnpinActors({Actors[0]->GetActorGuid(), Missing});
+        Partition->PinActors({Actors[0]->GetActorGuid()});
+        Region = Partition->CreateEditorLoaderAdapter<FLoaderAdapterShape>(Source, FBox(FVector(10000), FVector(20000)), TEXT("Fixture user region"));
+        Region->GetLoaderAdapter()->SetUserCreated(true); Region->GetLoaderAdapter()->Load();
+        // Real engine registration/unregistration, not an edited actor array.
+        { FWorldPartitionReference Reference(Partition, Missing); }
+    }
+    ~FPartialWPFixture() { if (LoadingSetting) LoadingSetting->SetPropertyValue_InContainer(Settings, bPreviousLoading); }
+    AActor* LoadedMissing() const
+    {
+        if (!Source) return nullptr;
+        const auto* Found = Source->PersistentLevel->Actors.FindByPredicate([&](AActor* A) { return IsValid(A) && A->GetActorGuid() == Missing; });
+        return Found ? *Found : nullptr;
+    }
+};
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyLoadCancelTest, "GitWorkspace.SaveLock.WPCopyLoadCancelAndDrift", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyLoadCancelTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FPartialWPFixture>(); auto& F = *Lifetime; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    if (!TestNotNull(TEXT("Partially loaded WP source"), F.Source)) return false;
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(F.Files.Git, F.Files.Repo);
+    auto Review = [&] { return GitWorkspaceSave::ReviewWPMapCopyLoad(F.Source, F.Files.Repo, F.Content); };
+    const auto Before = Review();
+    AddInfo(FString::Printf(TEXT("Missing=%d; live=%d; streaming=%d; spatial=%d; pinned=%d; editor-loading=%d"), Before.Missing.Num(), F.LoadedMissing() != nullptr, F.Source->GetWorldPartition()->IsStreamingEnabled(), F.Actors[1]->GetIsSpatiallyLoaded(), F.Source->GetWorldPartition()->IsActorPinned(F.Missing), IWorldPartitionEditorModule::Get().GetEnableLoadingInEditor()));
+    if (!TestTrue(TEXT("Exactly one real missing actor: ") + Before.Error, Before.Error.IsEmpty() && Before.Missing == TArray<FGuid>{F.Missing} && !F.LoadedMissing())) return false;
+    TestFalse(TEXT("Unprepared direct copy still refuses missing actors"), GitWorkspaceSave::ReviewMapDestination(F.Source, F.Mount + TEXT("L_NoLoad"), F.Files.Repo, F.Content).Error.IsEmpty());
+    GitWorkspaceSave::FWPMapCopyLoadScope Cancel;
+    TestFalse(TEXT("Loading requires confirmation"), Cancel.Load(Before, false).IsEmpty()); TestTrue(TEXT("Cancel needs no release"), Cancel.Release().IsEmpty());
+    TestTrue(TEXT("Cancelled loading leaves actor unloaded"), !F.LoadedMissing()); TestTrue(TEXT("Cancel acquires no locks"), Repo.VerifyLocks(TEXT("origin")).Locks.IsEmpty());
+    F.Actors[0]->SetActorLabel(TEXT("Edit after load review"));
+    GitWorkspaceSave::FWPMapCopyLoadScope Drift;
+    TestFalse(TEXT("Loaded actor drift refuses before acquiring a reference"), Drift.Load(Before, true).IsEmpty()); TestTrue(TEXT("Actor remains unloaded after drift"), !F.LoadedMissing());
+    const auto Fresh = Review(); if (!TestTrue(TEXT("Fresh loading review"), Fresh.Error.IsEmpty())) return false;
+    F.Region->GetLoaderAdapter()->Unload(); GitWorkspaceSave::FWPMapCopyLoadScope Layout;
+    TestFalse(TEXT("Region state drift refuses before loading"), Layout.Load(Fresh, true).IsEmpty()); TestTrue(TEXT("Layout refusal leaves actor unloaded"), !F.LoadedMissing());
+    F.Region->GetLoaderAdapter()->Load();
+    GitWorkspaceSave::FWPMapCopyLoadScope NamingCancel; const auto Again = Review();
+    if (!TestTrue(TEXT("Confirmed loading: ") + Again.Error, NamingCancel.Load(Again, true).IsEmpty())) return false;
+    TestNotNull(TEXT("Missing actor now loaded for naming/review"), F.LoadedMissing());
+    TestTrue(TEXT("Cancellation after loading releases references"), NamingCancel.Release().IsEmpty());
+    TestTrue(TEXT("Missing actor unloaded again"), !F.LoadedMissing()); TestEqual(TEXT("Existing edited actor retained"), F.Actors[0]->GetActorLabel(), FString(TEXT("Edit after load review")));
+    const auto After = Review(); TestTrue(TEXT("Original loaded-region adapters/pins restored"), After.Error.IsEmpty() && After.Loaders == Again.Loaders && After.Pins.OrderIndependentCompareEqual(Again.Pins) && After.Missing == Again.Missing);
+    TestTrue(TEXT("No locks from naming/loading cancellation"), Repo.VerifyLocks(TEXT("origin")).Locks.IsEmpty());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyLoadTest, "GitWorkspace.SaveLock.WPCopyLoadCurrentEdits", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyLoadTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FPartialWPFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    if (!TestNotNull(TEXT("Partially loaded copy source"), F.Source)) return false;
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(Files.Git, Files.Repo);
+    F.Source->GetWorldSettings()->KillZ = -65432.f; F.Source->MarkPackageDirty(); F.Actors[0]->SetActorLabel(TEXT("Loaded source edit"));
+    auto Loading = GitWorkspaceSave::ReviewWPMapCopyLoad(F.Source, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Complete saved-file review: ") + Loading.Error, Loading.Error.IsEmpty() && Loading.Missing == TArray<FGuid>{F.Missing})) return false;
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Loading/copy lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    TArray<FString> SourcePaths, SourceExternal;
+    for (const auto& File : Loading.Source.SourceFiles)
+    { FString Path = File.Filename; FPaths::MakePathRelativeTo(Path, *(Files.Repo + TEXT("/"))); SourcePaths.Add(Path); if (File.Name.Contains(TEXT("/__ExternalActors__/"))) SourceExternal.Add(Path); }
+    auto SourcePrepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(SourcePaths, TEXT("origin"), {}, SourceExternal), Lease, true);
+    if (!TestTrue(TEXT("Source reservations"), SourcePrepared.Result.Ok())) return false;
+    // Lock preparation can make a source file writable. Bind the loading
+    // review to the state after this deliberate fixture setup, as the UI does.
+    Loading = GitWorkspaceSave::ReviewWPMapCopyLoad(F.Source, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Loading review after source reservations"), Loading.Error.IsEmpty())) return false;
+    const auto OriginalLocks = Repo.VerifyLocks(TEXT("origin")); const auto Before = Repo.Refresh(); const auto Stashes = Repo.ListStashes().Fingerprint;
+    GitWorkspaceSave::FWPMapCopyLoadScope Scope; const FString Loaded = Scope.Load(Loading, true);
+    if (!TestTrue(TEXT("Scoped load: ") + Loaded, Loaded.IsEmpty() && F.LoadedMissing())) return false;
+    TestTrue(TEXT("Saved missing actor has its unchanged baseline owner"), F.LoadedMissing()->GetOwner() == nullptr);
+    const auto Destination = GitWorkspaceSave::ReviewMapDestination(F.Source, F.Mount + TEXT("L_ScopedCopy"), Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Complete destination review: ") + Destination.Error, Destination.Error.IsEmpty() && Destination.Actors.Num() == Loading.Source.SourceDescriptors.Num())) return false;
+    const auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+    if (!TestTrue(TEXT("All scoped-copy reservations"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(F.Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy, [&] { return Scope.Validate(); }); F.Keep(Copy);
+    if (!TestTrue(TEXT("Partially loaded source copied: ") + Written.Error, Written.Ok() && Copy)) return false;
+    AActor* A = nullptr; AActor* B = nullptr; for (AActor* Actor : Copy->PersistentLevel->Actors) if (Actor)
+    { if (Actor->GetName() == TEXT("FixtureActor0")) A = Actor; if (Actor->GetName() == TEXT("FixtureActor1")) B = Actor; }
+    if (!TestTrue(TEXT("Both loaded and previously missing actors copied"), A && B)) return false;
+    TestTrue(TEXT("Independent copied GUIDs and unchanged baseline owner"), A->GetActorGuid() != F.Actors[0]->GetActorGuid() && B->GetActorGuid() != F.Missing && !B->GetOwner());
+    TestEqual(TEXT("Current source map edit copied"), Copy->GetWorldSettings()->KillZ, -65432.f); TestEqual(TEXT("Current loaded actor edit copied"), A->GetActorLabel(), FString(TEXT("Loaded source edit")));
+    auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+    for (const auto& Entry : Destination.Actors)
+    {
+        Registry.ScanFilesSynchronous({Entry.Target.Filename}, true); TArray<FAssetData> Assets; Registry.GetAssetsByPackageName(FName(*Entry.Target.PackageName), Assets, true);
+        bool bMatches = false; for (const auto& Asset : Assets) if (auto Desc = FWorldPartitionActorDescUtils::GetActorDescriptorFromAssetData(Asset))
+        { for (AActor* Actor : Copy->PersistentLevel->Actors) if (Actor && Actor->GetName() == Entry.Actor->GetName()) bMatches |= Desc->GetGuid() == Actor->GetActorGuid() && Desc->GetActorPackage() == FName(*Entry.Target.PackageName) && Desc->GetActorSoftPath().ToString() == Actor->GetPathName(); }
+        TestTrue(TEXT("Serialized copied descriptor identity and references"), bMatches);
+    }
+    const FString Export = FPaths::ProjectSavedDir() / TEXT("Automation/WPCopyLoadFixtures"); F.Export(Export);
+    FFileHelper::SaveStringToFile(F.Actors[0]->GetActorGuid().ToString() + TEXT("\n") + F.Missing.ToString() + TEXT("\n") + A->GetActorGuid().ToString() + TEXT("\n") + B->GetActorGuid().ToString() + TEXT("\n"), *(Export / TEXT("guids.txt")));
+    const FString Released = Scope.Release(); TestTrue(TEXT("Release restores loading layout: ") + Released, Released.IsEmpty() && !F.LoadedMissing());
+    const auto After = GitWorkspaceSave::ReviewWPMapCopyLoad(F.Source, Files.Repo, F.Content);
+    TestTrue(TEXT("Exact regions, pins and missing set preserved"), After.Error.IsEmpty() && After.Loaders == Loading.Loaders && After.Pins.OrderIndependentCompareEqual(Loading.Pins) && After.Missing == Loading.Missing);
+    for (int32 I = 0; I < After.Source.SourceFiles.Num(); ++I)
+    { TestEqual(TEXT("Source saved bytes preserved"), After.Source.SourceFiles[I].Hash, Loading.Source.SourceFiles[I].Hash); TestEqual(TEXT("Source mode preserved"), After.Source.SourceFiles[I].Mode, Loading.Source.SourceFiles[I].Mode); TestEqual(TEXT("Source dirty state preserved"), After.Source.SourceFiles[I].bDirty, Loading.Source.SourceFiles[I].bDirty); }
+    TestEqual(TEXT("Existing source map edit retained"), F.Source->GetWorldSettings()->KillZ, -65432.f); TestTrue(TEXT("Existing source actor remains dirty"), F.Actors[0]->GetPackage()->IsDirty());
+    const auto Locks = Repo.VerifyLocks(TEXT("origin")); for (const auto& Path : SourcePaths) TestEqual(TEXT("Original lock ID retained"), Locks.Locks[Path].Id, OriginalLocks.Locks[Path].Id);
+    TestTrue(TEXT("Source and copy locks retained"), Locks.Locks.Num() == SourcePaths.Num() + Destination.Paths().Num());
+    TestEqual(TEXT("Staging preserved"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("HEAD preserved"), Repo.Refresh().Head, Before.Head); TestEqual(TEXT("Stashes preserved"), Repo.ListStashes().Fingerprint, Stashes);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyLoadCallbacksTest, "GitWorkspace.SaveLock.WPCopyLoadCallbacksAndRetention", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyLoadCallbacksTest::RunTest(const FString&)
+{
+    for (bool bCore : {false, true})
+    {
+        auto Lifetime = MakeShared<FPartialWPFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+        if (!TestNotNull(TEXT("Retention source"), F.Source)) return false;
+        GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(Files.Git, Files.Repo);
+        const auto Loading = GitWorkspaceSave::ReviewWPMapCopyLoad(F.Source, Files.Repo, F.Content); GitWorkspaceSave::FWPMapCopyLoadScope Scope;
+        const FString Loaded = Scope.Load(Loading, true); if (!TestTrue(TEXT("Retention scoped load: ") + Loaded, Loading.Missing == TArray<FGuid>{F.Missing} && Loaded.IsEmpty() && F.LoadedMissing())) return false;
+        const auto Destination = GitWorkspaceSave::ReviewMapDestination(F.Source, F.Mount + TEXT("L_Retained"), Files.Repo, F.Content);
+        FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Retention lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+        const auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+        if (!TestTrue(TEXT("Retention permit"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+        bool bChanged = false; auto Edit = [&] { if (!bChanged) { bChanged = true; F.LoadedMissing()->SetActorLabel(TEXT("Retain temporary callback edit")); } };
+        const auto EditorHook = FEditorDelegates::PreSaveExternalActors.AddLambda([&](UWorld* Saving) { if (!bCore && Saving->GetPackage()->GetName() == Destination.Map.PackageName) Edit(); });
+        const auto CoreHook = FCoreUObjectDelegates::OnObjectPreSave.AddLambda([&](UObject* Object, FObjectPreSaveContext) { if (bCore && Object->GetPackage()->GetName() == Destination.BuildData.PackageName) Edit(); });
+        ON_SCOPE_EXIT { FEditorDelegates::PreSaveExternalActors.Remove(EditorHook); FCoreUObjectDelegates::OnObjectPreSave.Remove(CoreHook); };
+        UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(F.Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy, [&] { return Scope.Validate(); }); F.Keep(Copy);
+        TestFalse(TEXT("Temporary source edit refuses copy batch"), Written.Ok()); TestTrue(TEXT("Callback ran"), bChanged);
+        for (const auto& Path : Destination.Paths()) TestFalse(TEXT("No destination written after callback drift"), IFileManager::Get().FileExists(*(Files.Repo / Path)));
+        TestFalse(TEXT("Edited temporary reference is not silently released"), Scope.Release().IsEmpty());
+        TestTrue(TEXT("Edited temporary actor remains loaded and dirty"), F.LoadedMissing() && F.LoadedMissing()->GetPackage()->IsDirty() && GitWorkspaceSave::HasRetainedWPMapCopyLoads(F.Source));
+        TestEqual(TEXT("Temporary unsaved label kept"), F.LoadedMissing()->GetActorLabel(), FString(TEXT("Retain temporary callback edit")));
+        TestTrue(TEXT("Original actor pin unchanged"), F.Source->GetWorldPartition()->IsActorPinned(F.Actors[0]->GetActorGuid())); TestFalse(TEXT("Temporary actor not implicitly pinned"), F.Source->GetWorldPartition()->IsActorPinned(F.Missing));
+        for (const auto& File : Loading.Source.SourceFiles) TestEqual(TEXT("Original saved source bytes intact"), LexToString(FMD5Hash::HashFile(*File.Filename)), File.Hash);
+        TestTrue(TEXT("Acquired destination locks retained"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == Destination.Paths().Num());
+    }
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyLoadPartialTest, "GitWorkspace.SaveLock.WPCopyLoadPartialAndRetry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGitWPCopyLoadPartialTest::RunTest(const FString&)
+{
+    auto Lifetime = MakeShared<FPartialWPFixture>(); auto& F = *Lifetime; auto& Files = F.Files; ADD_LATENT_AUTOMATION_COMMAND(FMapFixtureCleanup(Lifetime));
+    if (!TestNotNull(TEXT("Partial load source"), F.Source)) return false;
+    GitWorkspaceSession::FExternalCleanupTestScope Boundary(F.Content); GitWorkspace::FRepository Repo(Files.Git, Files.Repo);
+    const auto Loading = GitWorkspaceSave::ReviewWPMapCopyLoad(F.Source, Files.Repo, F.Content); GitWorkspaceSave::FWPMapCopyLoadScope Scope;
+    const FString Loaded = Scope.Load(Loading, true); if (!TestTrue(TEXT("Partial scoped load: ") + Loaded, Loading.Missing == TArray<FGuid>{F.Missing} && Loaded.IsEmpty())) return false;
+    const auto Destination = GitWorkspaceSave::ReviewMapDestination(F.Source, F.Mount + TEXT("L_PartialLoaded"), Files.Repo, F.Content);
+    FString Error; GitWorkspaceSession::FLease Lease; if (!TestTrue(TEXT("Partial load lease"), Lease.Acquire(Files.Repo, true, Error))) return false;
+    auto Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Destination.Paths(), TEXT("origin"), Destination.Paths(), Destination.ExternalPaths()), Lease, true);
+    if (!TestTrue(TEXT("Partial load reservations"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    const auto Before = Repo.Refresh(); auto Guard = FCoreUObjectDelegates::IsPackageOKToSaveDelegate; ON_SCOPE_EXIT { FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard; };
+    FCoreUObjectDelegates::IsPackageOKToSaveDelegate.BindLambda([Guard](UPackage* Package, const FString& File, FOutputDevice* Output) { return !File.EndsWith(TEXT(".umap")) && (!Guard.IsBound() || Guard.Execute(Package, File, Output)); });
+    UWorld* Copy = nullptr; const auto Written = GitWorkspaceSave::WriteMapDestination(F.Source, Destination, Repo, *Prepared.Permit, Lease, F.Content, Copy, [&] { return Scope.Validate(); }); F.Keep(Copy);
+    if (!TestTrue(TEXT("Partial map failure retains copy"), !Written.Ok() && Copy)) return false;
+    TestTrue(TEXT("Source load layout restored after partial write"), Scope.Release().IsEmpty() && !F.LoadedMissing());
+    FCoreUObjectDelegates::IsPackageOKToSaveDelegate = Guard;
+    const auto Again = GitWorkspaceSave::GatherPackageSavePaths({Copy->GetPackage()}, Files.Repo, F.Content);
+    if (!TestTrue(TEXT("Only map needs retry"), Again.Error.IsEmpty() && Again.Paths == TArray<FString>{Destination.Map.Path})) return false;
+    Prepared = Repo.PrepareAssetSave(Repo.ReviewAssetSave(Again.Paths, TEXT("origin"), Again.NewPaths, Again.ExternalActorPaths), Lease, true);
+    if (!TestTrue(TEXT("Retry prepared"), Prepared.Result.Ok() && Prepared.Permit)) return false;
+    TestTrue(TEXT("Copy map retry does not reload source"), GitWorkspaceSave::WriteExternalActorSave(Again, Repo, *Prepared.Permit, Lease, F.Content).Ok() && !F.LoadedMissing());
+    const auto After = GitWorkspaceSave::ReviewWPMapCopyLoad(F.Source, Files.Repo, F.Content); TestTrue(TEXT("Regions, pins and missing state unchanged"), After.Error.IsEmpty() && After.Loaders == Loading.Loaders && After.Pins.OrderIndependentCompareEqual(Loading.Pins) && After.Missing == Loading.Missing);
+    for (const auto& File : Loading.Source.SourceFiles) TestEqual(TEXT("Source bytes intact through retry"), LexToString(FMD5Hash::HashFile(*File.Filename)), File.Hash);
+    TestEqual(TEXT("Staging unchanged"), Repo.Refresh().IndexEntries, Before.IndexEntries); TestEqual(TEXT("HEAD unchanged"), Repo.Refresh().Head, Before.Head);
+    TestTrue(TEXT("All reservations retained"), Repo.VerifyLocks(TEXT("origin")).Locks.Num() == Destination.Paths().Num()); return true;
+}
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitWPCopyBoundariesTest, "GitWorkspace.SaveLock.WPCopyBoundariesAndDrift", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGitWPCopyBoundariesTest::RunTest(const FString&)
 {

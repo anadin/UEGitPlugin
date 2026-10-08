@@ -1,5 +1,6 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitWorkspaceSaveFlow.h"
+#include "GitWorkspaceMapCopyLoad.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlSettings.h"
 #include "Async/Async.h"
@@ -28,10 +29,12 @@
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopedSlowTask.h"
+#include "Misc/ScopeExit.h"
 #include "HAL/FileManager.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/Package.h"
 #include "UObject/StrongObjectPtr.h"
+#include "WorldPartition/WorldPartition.h"
 #if PLATFORM_MAC
 #include "GitWorkspaceSession.h"
 #include "GitWorkspaceFileGuard.h"
@@ -206,19 +209,19 @@ bool GuardSave(UPackage* Package, const FString& Filename, FOutputDevice* Output
     }
     return true;
 }
-bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review, const FString& Introduction = FString())
+bool ConfirmSaveReview(const FString& Title, const FString& Text, const FString& Action, TFunction<bool()> CanConfirm = {})
 {
     bool bConfirmed = false;
-    const auto Window = SNew(SWindow).Title(SaveText(Review.DeletePaths.IsEmpty() ? TEXT("Lock assets before saving") : TEXT("Review actor deletions and saves"))).ClientSize(FVector2D(720, 480)).SupportsMinimize(false).SupportsMaximize(false);
+    const auto Window = SNew(SWindow).Title(SaveText(Title)).ClientSize(FVector2D(720, 480)).SupportsMinimize(false).SupportsMaximize(false);
     TWeakPtr<SWindow> Weak = Window;
     TSharedPtr<SButton> CancelButton;
     Window->SetContent(SNew(SBorder).Padding(12)[SNew(SVerticalBox)
         + SVerticalBox::Slot().FillHeight(1)
-        [SNew(SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(SaveText(Introduction + Review.Text()))]
+        [SNew(SMultiLineEditableTextBox).IsReadOnly(true).AutoWrapText(true).Text(SaveText(Text))]
         + SVerticalBox::Slot().AutoHeight().Padding(0, 12)
         [SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth()
-            [SNew(SButton).Text(SaveText(Review.DeletePaths.IsEmpty() ? TEXT("Lock and save") : TEXT("Save and delete reviewed actors"))).IsEnabled_Lambda([Review] { return Review.IsFresh(); })
+            [SNew(SButton).Text(SaveText(Action)).IsEnabled_Lambda([CanConfirm] { return !CanConfirm || CanConfirm(); })
                 .OnClicked_Lambda([&bConfirmed, Weak] { bConfirmed = true; if (auto W = Weak.Pin()) W->RequestDestroyWindow(); return FReply::Handled(); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(12, 0)
             [SAssignNew(CancelButton, SButton).Text(SaveText(TEXT("Cancel"))).OnClicked_Lambda([Weak] { if (auto W = Weak.Pin()) W->RequestDestroyWindow(); return FReply::Handled(); })]
@@ -227,6 +230,11 @@ bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review, const FString& I
     Window->SetWidgetToFocusOnActivate(CancelButton);
     FSlateApplication::Get().AddModalWindow(Window, FSlateApplication::Get().GetActiveTopLevelWindow());
     return bConfirmed;
+}
+bool ConfirmLocks(const GitWorkspace::FAssetSaveReview& Review, const FString& Introduction = FString())
+{
+    return ConfirmSaveReview(Review.DeletePaths.IsEmpty() ? TEXT("Lock assets before saving") : TEXT("Review actor deletions and saves"),
+        Introduction + Review.Text(), Review.DeletePaths.IsEmpty() ? TEXT("Lock and save") : TEXT("Save and delete reviewed actors"), [Review] { return Review.IsFresh(); });
 }
 void ExecuteSaveAs(UObject* Source, UObject* EditedData, const FExecuteAction& OriginalAction)
 {
@@ -293,6 +301,30 @@ void ExecuteMapSaveAs(UWorld* World, const FExecuteAction& Original)
     const auto Local = Async(EAsyncExecution::ThreadPool, [Repo] { return Repo->Refresh(); }).Get();
     if (Local.Root.IsEmpty()) { Original.ExecuteIfBound(); return; }
     if (!Local.bValid) { Blocked(Local.Error); return; }
+    const FString Content = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
+    FWPMapCopyLoadScope ActorLoad;
+    ON_SCOPE_EXIT
+    {
+        const FString Error = ActorLoad.Release();
+        if (!Error.IsEmpty()) FMessageDialog::Open(EAppMsgType::Ok, SaveText(Error), SaveText(TEXT("Git Workspace — WP copy loading")));
+    };
+    if (World && World->GetWorldPartition() && !FPackageName::IsTempPackage(World->GetPackage()->GetName()))
+    {
+        const auto Loading = ReviewWPMapCopyLoad(World, Local.Root, Content);
+        if (!Loading.Error.IsEmpty()) { Blocked(Loading.Error); return; }
+        if (!Loading.Missing.IsEmpty())
+        {
+            FString Text = FString::Printf(TEXT("Load %d missing WP actors to review a complete map copy?\n\nThe map stays open. This temporarily loads these actors and can increase memory use or run their construction scripts. It does not change loaded-region adapters, pins, source files or locks. Cancelling a later naming/lock review releases the temporary references. Actors edited by callbacks remain loaded so their unsaved work is kept.\n\n"), Loading.Missing.Num());
+            for (const auto& Descriptor : Loading.Source.SourceDescriptors) if (Loading.Missing.Contains(Descriptor.Guid)) Text += Descriptor.Label + TEXT("\n") + Descriptor.Package + TEXT("\n\n");
+            if (!ConfirmSaveReview(TEXT("Load WP actors to review copy"), Text, TEXT("Load actors"))) return;
+            FString Error;
+            {
+                FScopedSlowTask Task(1.f, SaveText(TEXT("Loading the reviewed WP actors for the copy…"))); Task.MakeDialog(false); Task.EnterProgressFrame(1.f);
+                Error = ActorLoad.Load(Loading, true);
+            }
+            if (!Error.IsEmpty()) { Blocked(Error); return; }
+        }
+    }
     const FString Error = ReviewMapSource(World); if (!Error.IsEmpty()) { Blocked(Error); return; }
     TStrongObjectPtr<UWorld> HoldWorld(World);
     const bool bNameCurrent = FPackageName::IsTempPackage(World->GetPackage()->GetName());
@@ -303,7 +335,6 @@ void ExecuteMapSaveAs(UWorld* World, const FExecuteAction& Original)
     Config.AssetClassNames.Add(UWorld::StaticClass()->GetClassPathName()); Config.ExistingAssetPolicy = ESaveAssetDialogExistingAssetPolicy::Disallow;
     const FString ObjectPath = FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get().CreateModalSaveAssetDialog(Config);
     if (ObjectPath.IsEmpty()) return;
-    const FString Content = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
     const auto Destination = ReviewMapDestination(World, FPackageName::ObjectPathToPackageName(ObjectPath), Local.Root, Content);
     if (!Destination.Error.IsEmpty()) { Blocked(Destination.Error); return; }
     const auto Paths = Destination.Paths(); const FString Remote = LockRemote();
@@ -319,7 +350,7 @@ void ExecuteMapSaveAs(UWorld* World, const FExecuteAction& Original)
     if (Destination.bExternalFirstSave || Destination.bExternalCopy)
     {
         Introduction = Destination.bExternalCopy ?
-            TEXT("This copies the fully loaded WP/OFPA map, external actors and modern build data into new locked files. Copied actors receive new identities. The original stays open with its unsaved edits and loaded actors; its files and locks are preserved. Open the copy from Content Browser to switch maps. Locks remain held.\n\n") :
+            TEXT("This copies the complete loaded WP/OFPA map, external actors and modern build data into new locked files. Copied actors receive new identities. The original stays open with its unsaved edits; temporary actor-load references are released afterwards. Its original loaded regions, pins, files and locks are preserved. Open the copy from Content Browser to switch maps. Locks remain held.\n\n") :
             TEXT("This names the current WP/OFPA map and remaps its external actors. Every new file is locked before naming; actors and build data are saved before the map. You keep editing this map. Locks remain held.\n\n");
         for (const auto& Actor : Destination.Actors) Introduction += TEXT("New actor: ") + Actor.Label + TEXT("\n") + Actor.Target.Path + TEXT("\n\n");
     }
@@ -338,7 +369,7 @@ void ExecuteMapSaveAs(UWorld* World, const FExecuteAction& Original)
         Blocked(Prepared.Result.Error); return;
     }
     UWorld* WrittenWorld = nullptr;
-    const auto Written = WriteMapDestination(World, Destination, *Repo, *Prepared.Permit, Access.Lease(), Content, WrittenWorld);
+    const auto Written = WriteMapDestination(World, Destination, *Repo, *Prepared.Permit, Access.Lease(), Content, WrittenWorld, [&ActorLoad] { return ActorLoad.Validate(); });
     if (!Written.Ok()) { Blocked(Written.Error); return; }
     FNotificationInfo Notice(SaveText(Destination.bNameCurrent ? TEXT("Current map named and saved. Locks remain held. Stage the new files when ready.") : TEXT("Map copy saved. The original stays open. Open the copy from Content Browser to switch maps. Locks remain held; stage when ready."))); Notice.ExpireDuration = 12.f; FSlateNotificationManager::Get().AddNotification(Notice);
 #else
