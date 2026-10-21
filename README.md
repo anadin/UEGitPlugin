@@ -1,216 +1,137 @@
-# Unreal Engine Git Plugin
+# Git Workspace
 
-This is a refactor of the [Git LFS 2 plugin by SRombauts](https://github.com/SRombauts/UE4GitPlugin), with lessons learned from production
-that include performance optimizations, new features and workflow improvements.
+Git and Git LFS for Unreal Editor, working the way Unreal's revision control already works:
 
-## Features
+- **Check out** an asset and Git Workspace takes its Git LFS lock, so nobody else edits it at the same time.
+- **Check in** (Submit Content) commits the files you choose, pushes them and releases their locks.
+- **Sync** brings in your team's commits and reloads the assets that changed.
+- **Revert** throws away your changes (keeping a backup) and gives the lock back.
 
-* Multi-threaded locking/unlocking, greatly improving performance when locking/unlocking many files
-* Remote lock status only checked when needed
-* Added local lock cache for speeding up local operations
-* Improved performance of repository file traversal
-* Improved initialization logic
-* Generally improved wording and UX throughout
-* Greatly improved pull within editor
-  * Only refreshes changed files, which prevents crashes in large projects
-  * Uses rebase workflow to properly manage local work
-* Added support for Status Branches, which check outdated files vs. remote across multiple branches
-* Periodic background remote refresh to keep remote file statuses up to date
-* Automatic handling of pushing from an outdated local copy
-* Optimized status updates for successful operations
-* Manage both lockable (assets, maps) and non-lockable files (configs, project file) in editor
-* Improved status display in editor
-* Integration with [PBSync](https://github.com/ProjectBorealis/PBSync) binaries syncing
-* General improvements to performance and memory usage
+Artists never need to leave those flows. For everything else there is the **Git panel**: staging, commits, history, branches, stashes and locks.
 
-## Installation
+> **Status: 4.0.0-alpha.** Built and tested on Unreal Engine 5.8 on macOS (Apple Silicon). Windows and Linux compile from the same code but have not been tested yet.
 
-Either install this into your project's `Plugins/` folder, or if you would like to install to the engine,
-rename `Engine/Plugins/Developer/GitSourceControl.uplugin` to `Engine/Plugins/Developer/GitSourceControl.uplugin.disabled` 
-and then install this plugin to the `Engine/Plugins` folder.
+## Requirements
 
-Please note that we do not provide precompiled binaries at this time, so you will need to use Visual Studio to compile the plugin.
+- Unreal Engine 5.8.
+- [Git](https://git-scm.com/) 2.38 or newer. Git Workspace checks the version when it connects.
+- [Git LFS](https://git-lfs.com/) 3.x installed and set up once with `git lfs install`. Git Workspace uses the Git LFS that comes with your Git installation; it does not ship its own.
+- For locking: a Git LFS server with the [locking API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/locking.md), such as GitHub, GitLab, Gitea or Bitbucket.
+- Credentials that work without prompting in a terminal (a credential manager, or SSH keys). Background checks never ask for a password; actions you start yourself, such as Push, may show your credential manager.
 
-### Note about .gitattributes and .gitignore
+## Install
 
-This plugin requires explicit file attributes for `*.umap` and `*.uasset`, rather than other approaches of using wildcards for the content folder (`Content/**`).
+1. Put the plugin in your project's `Plugins/UEGitPlugin` folder (for example as a Git submodule) and build the editor.
+2. Enable **Git Workspace** in **Edit > Plugins** and restart the editor.
+3. In the status bar, open **Revision Control > Connect to Revision Control**, choose **Git Workspace** and accept. Git is found automatically; set its path in the same dialog if needed.
 
-See [our own `.gitattributes`](https://github.com/ProjectBorealis/PBCore/blob/main/.gitattributes) for an example.
+Projects that used the older **Git LFS 2** provider switch to Git Workspace automatically.
 
-You may also want to check out [our robust `.gitignore`](https://github.com/ProjectBorealis/PBCore/blob/main/.gitignore) too.
+## Set up the project
 
-### Note about authentication
+Track Unreal packages with Git LFS and mark them `lockable` in `.gitattributes`:
 
-We would highly recommend using HTTPS authentication for your Git repo.
-
-This allows a single credential path to be used, with the robust and fast HTTPS support in LFS.
-
-With [Git Credential Manager](https://github.com/GitCredentialManager/git-credential-manager), authenticating with HTTPS is also much easier, with a GUI available to authenticate with any Git provider.
-
-### Note about Unreal configuration
-
-#### Required
-
-* The plugin makes the assumption that files are always explicitly added. We made this decision because it is beneficial for performance and our workflows. In `Config/DefaultEditorPerProjectUserSettings.ini`
-
-```ini
-[/Script/UnrealEd.EditorLoadingSavingSettings]
-bSCCAutoAddNewFiles=False
+```gitattributes
+*.uasset filter=lfs diff=lfs merge=lfs -text lockable
+*.umap filter=lfs diff=lfs merge=lfs -text lockable
 ```
 
-#### Recommended
+Ignore generated folders in `.gitignore` (`Binaries/`, `DerivedDataCache/`, `Intermediate/`, `Saved/`).
 
-* As a general revision control usability improvement, you can enable new checkout features in `Config/DefaultEditorPerProjectUserSettings.ini`. To enable auto-checkout on modification, which is great for OFPA and other workflows (but requires user attention to excessive locking of content):
+`lockable` is what turns on Check Out: files without it stay freely editable. When the project uses locks, Git Workspace offers once to turn on **Editor Preferences > Loading & Saving > Prompt for checkout on asset modification**, so Unreal asks to check out an asset the moment you start editing it. Turn it on for everyone on the team.
 
-```ini
-[/Script/UnrealEd.EditorLoadingSavingSettings]
-bAutomaticallyCheckoutOnAssetModification=True
-bPromptForCheckoutOnAssetModification=False
+## Everyday use
+
+The status bar shows what needs doing, next to Unreal's own revision control status:
+
+| Button | What it does |
+| --- | --- |
+| **main** (your branch) | Opens the Git panel. |
+| **Sync 3** | Gets 3 new commits. Unreal saves your work, updates the files and reloads the assets that changed. |
+| **Check in 2** | Opens Unreal's Submit Content dialog for your 2 changed assets. |
+| **Push 1** | Publishes a commit you made earlier (for example from the Git panel). |
+
+**Editing.** When you start editing a lockable asset, Unreal asks to check it out; Git Workspace takes the lock. If someone else holds it, the Content Browser shows who, and Check Out is refused. Saving never talks to the server: when you save an asset you have not checked out, Unreal's own dialog offers Check Out or Make Writable.
+
+**Checking in.** Check in commits exactly the files you leave ticked in the Submit dialog, using your description as the commit message, then pushes and releases their locks. Tick **Keep files checked out** to keep the locks. New assets are added when you check them in. If a teammate pushed first, your commit is kept and Git Workspace tells you to Sync and push again; your locks stay.
+
+**Syncing.** Sync fetches, then fast-forwards, or rebases your unpushed commits on top of the new ones. It stops before changing anything when you have local edits to files that also changed on the server, or when your unpushed commits would conflict. When C++ code, config or plugins changed, it tells you to rebuild and restart.
+
+**Reverting.** Revert restores the last committed version, keeps a copy of what it overwrote in `Saved/GitSourceControl/Backups` and releases the lock unless a commit you have not pushed still needs it.
+
+**Badges.** The Content Browser shows checked-out (locked by you), locked by someone else, locked by you in another clone, newer version on the server, new, modified and deleted files.
+
+## The Git panel
+
+Open it with **Window > Git**, the branch button in the status bar, **Revision Control > Git Panel**, or **Show in Git Panel** on assets in the Content Browser.
+
+- **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Sync** and **Push**. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
+- **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Lock, Release lock and Discard changes.
+- **History**: commits on your branch (unpushed ones are marked); select one to see its files and compare a file with its previous version.
+- **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes.
+- **Locks**: every lock on the server, yours first. Release your own locks, or someone else's when they cannot.
+
+Switching branches and restoring stashes refuse to overwrite local edits, download Git LFS files first, and reload any open assets that change.
+
+| Key | Action |
+| --- | --- |
+| Space | Stage or unstage the selected files |
+| Enter / double-click | Compare an edited file, or open a new one |
+| Ctrl+D | Compare with the last commit |
+| Delete | Discard changes to the selected files |
+| Ctrl+Enter | Commit (Ctrl+Shift+Enter: commit and push) |
+| F5 | Refresh |
+| Ctrl+1 … Ctrl+4 | Changes, History, Stashes, Locks |
+
+On macOS, use Cmd instead of Ctrl.
+
+## Settings
+
+**Revision Control > Change Revision Control Settings** (per project):
+
+- **Git executable**: leave empty to find it automatically.
+- **Use Git LFS locks**: turn Check Out locking on or off for this project.
+- **Lock server remote**: the remote whose LFS server holds locks; empty uses the branch's upstream remote (usually `origin`).
+
+**Editor Preferences > Revision Control > Git Workspace** (per user): how often status, locks and the server are checked (background fetching can be turned off), whether Check in pushes, and how many revert backups to keep.
+
+## Troubleshooting
+
+- **"… is locked by …"**: someone else holds the lock. Ask them to check in or release it; the Git panel's Locks tab can force-release it if they cannot.
+- **"Locked by you in another clone"**: you hold the lock from another copy of the project. Check Out takes it over for this copy.
+- **"The server has newer commits"**: your commit was kept locally. Sync, then Push.
+- **"Nothing was changed: you have local changes …"** during Sync or a branch switch: check in, stash or revert those files first.
+- **Fetch or push fails with an authentication error**: make sure `git fetch` works in a terminal for this repository without prompting. Background checks never prompt; they back off and retry.
+- **"Another git process seems to be running"** or a stale `index.lock`: close other Git tools working on this repository. If none are running, delete `.git/index.lock`.
+- **Offline**: editing and saving keep working. Lock owners shown are the last known ones, with their age; Check Out and Sync fail with a clear message until the server is back.
+- **Git LFS not installed**: install Git LFS and run `git lfs install`. The revision control status tooltip shows the Git and Git LFS versions in use.
+
+Detailed messages are in **Window > Message Log > Revision Control** (or via **Show log** in notifications).
+
+## Known limitations
+
+- Tested on macOS only so far.
+- Conflicts are not resolved inside Unreal: use a Git client, then mark files resolved.
+- No partial (line-by-line) staging, cherry-pick, interactive rebase or history graph.
+- Syncing to a specific revision is not supported; use branches instead.
+- Submodules show up as changes but are not managed.
+
+## Development
+
+The plugin's automation tests are named `GitWorkspace.*`. They create disposable repositories (and a loopback Git LFS server, which needs Python 3) and never touch your project's repository. Run them from the Session Frontend, or headless:
+
+```bash
+UnrealEditor-Cmd YourProject.uproject -unattended -nullrhi -ExecCmds="Automation RunTests GitWorkspace" -TestExit="Automation Test Queue Empty"
 ```
 
-* OR, to enable auto-prompt on modification, which is a bit more upfront/intrusive in user flows, but more conservative with locking, flip the settings:
+`GitWorkspace.Panel.Screenshots` only runs in an editor that renders; it saves images of the Git panel to `Saved/Automation/GitWorkspace/Screenshots`. `GitWorkspace.Editor.NativeFlows` drives Unreal's own check out, check in, revert and sync helpers; it only runs in a disposable project with its own repository and lock server (the development project's `Scripts/e2e-native-flows.sh` prepares one).
 
-```ini
-[/Script/UnrealEd.EditorLoadingSavingSettings]
-bAutomaticallyCheckoutOnAssetModification=False
-bPromptForCheckoutOnAssetModification=True
-```
+## Credits and licence
 
----
+Git Workspace continues the work of:
 
-* As another general usability improvement, you can set the editor to load any checked out packages for faster loading. In `Config/DefaultEditorPerProjectUserSettings.ini`: 
+- [Sébastien Rombauts](https://github.com/SRombauts/UE4GitPlugin), the original Unreal Git integration.
+- [Project Borealis](https://github.com/ProjectBorealis/UEGitPlugin), the Git LFS locking provider.
+- [Mighty Games Group](https://github.com/MightyGamesGroup/UEGitPlugin), whose Unreal Engine 5.8 fork this version started from.
 
-```ini
-[/Script/UnrealEd.EditorPerProjectUserSettings]
-bAutoloadCheckedOutPackages=True
-```
-
----
-
-* In `Config/DefaultEngine.ini` you can set this option to `1` to disable a feature that is unnecessary for Git (for performance):
-
-```ini
-[SystemSettingsEditor]
-r.Editor.SkipSourceControlCheckForEditablePackages=1
-```
-
-## Status Branches - Required Code Changes
-
-Epic Games added Status Branches in 4.20, and this plugin has implemented support for them. See [Workflow on Fortnite](https://youtu.be/p4RcDpGQ_tI?t=1443) for more information. Here is an example of how you may apply it to your own game.
-
-1. Make an `UUnrealEdEngine` subclass, preferrably in an editor only module, or guarded by `WITH_EDITOR`.
-2. Add the following:
-
-```cpp
-#include "ISourceControlModule.h"
-#include "ISourceControlProvider.h"
-
-void UMyEdEngine::Init(IEngineLoop* InEngineLoop)
-{
-	Super::Init(InEngineLoop);
-
-	// Register state branches
-	const ISourceControlModule& SourceControlModule = ISourceControlModule::Get();
-	{
-		ISourceControlProvider& SourceControlProvider = SourceControlModule.GetProvider();
-		// Order matters. Lower values are lower in the hierarchy, i.e., changes from higher branches get automatically merged down.
-		// (Automatic merging requires an appropriately configured CI pipeline)
-		// With this paradigm, the higher the branch is, the stabler it is, and has changes manually promoted up.
-		const TArray<FString> Branches {"origin/develop", "origin/promoted"};
-		SourceControlProvider.RegisterStateBranches(Branches, TEXT("Content"));
-	}
-}
-```
-
-3. Set to use the editor engine in `Config/DefaultEngine.ini` (make sure the class name is `MyUnrealEdEngine` for a class called `UMyUnrealEdEngine`!):
-
-```ini
-[/Script/Engine.Engine]
-UnrealEdEngine=/Script/MyModule.MyEdEngine
-```
-
-5. In this example, `origin/promoted` is the highest tested branch. Any changes in this branch are asset changes that do not need testing, and get automatically merged down to `origin/develop`. This may be extended to involve multiple branches, like `origin/trunk`, `origin/main`, or whatever you may prefer, where changes may be cascaded from most-stable to least-stable automatically. With this paradigm, changes from less-stable branches are manually promoted to more-stable branches after a merge review.   
-**NOTE**: The second argument in `RegisterStateBranches` is Perforce specific and is ignored, but is meant to point to the relative content path.
-
-6. If you decide to implement the status branch code in a editor-only module, ensure the loading phase in the editor module is set to `Default` in your .uproject settings, like so: (Otherwise, the editor will likely have difficulty finding your subclass'd UUnrealEdEngine class.)
-```json
-		{
-			"Name": "MyTestProjectEditor",
-			"Type": "Editor",
-			"LoadingPhase": "Default"
-		}
-```
-
-## Status Branches - Conceptual Overview  
-
-This feature helps ensure you're not locking and modifying files that are out-of-date.
-
-If a user is on **any** branch, regardless if it's tracking a branch included in the 'status branch' list, they will be **unable to checkout** files that have **more recent changes on the remote server** than they have on the local branch, **provided** those changes are in a branch in the **'status branch' list.**
-* **If** the **remote branch with the changes** is **not** in the status branch list, the user will **not be notified of remote changes.**
-* **If** the user makes changes to a **local branch** and **switches** to **another local branch**, the user will **not** be notified of their **own changes** to the other branch, **regardless** if it's in the 'status branch' list or not **(this feature only checks remote branches!)**
-* **If** the user is tracking a remote branch that is in the status branch list, they will be **unable to lock stale files** (files that are changed up-stream).
-
-![Status Branch Overview](https://i.imgur.com/bY3igQI.png)
-
-#### Note: 
-
-It's important to only release file locks after changes have been pushed to the server. The system has no way to determine that there are local changes to a file, so if you modify a locked file it's imperative that you push the changes to a remote branch included in the 'status branch' list so other users can see those changes and avoid modifying a stale file. Otherwise, you'll want to keep the file locked!
-
-Additionally, if you're switching back and forth between two or more branches locally you'll need to keep track of what branch you've made changes to locked files, as the system will not prevent you from modifying the same locked file on multiple different branches!
-
-#### Real-world example of the 'status branch' feature:
-
-* The user has checked out the `develop` branch, but there is an up-stream change on `origin/develop` for `FirstPersonProjectileMaterial`, indicated with the **yellow** exclamation mark.
-* There are also newer upstream changes on the `promoted` branch, indicated with the **red** exclamation mark. (NOTE: The plugin does not currently report the branch name the changes are on.)
-
-![Status Branch Feature in Action](https://iili.io/1HqPhg.webp)
-
-## General In-Editor Usage
-
-### Connecting to revision control:
-
-Generally speaking, the field next to `Uses Git LFS 2 File Locking workflow` should match your Git server's `User Name`, like so:
-(If you find that the checkmark turns blue shortly after checking out a file, then the LFS name is incorrect, update it to the name it says checked out the file)
-
-![Connecting to Revision Control](https://iili.io/1HzKep.webp)
-  
-### Checking out (locking) one or more assets:
-
-You can lock individual files or you can hold `shift` to select and lock multiple at once, which can be quite a bit faster than locking them individually.
-
-![Checking out Multiple Assets](https://iili.io/1HYog9.webp)
-  
-### Unlocking one or more un-changed assets:
-
-You can unlock individual files or you can hold `shift` to select and unlock multiple at once, which can be quite a bit faster than unlocking them individually.
-
-![Checking out Multiple Assets](https://iili.io/1HYzJe.webp)
-  
-### Locking every asset within a folder:
-
-You can lock every file in a folder by right clicking on the folder and clicking `Check Out`.
-
-![Lock every asset in a folder](https://iili.io/1HYCfS.webp)
-  
-### Viewing locks:
-
-View the owner of a file lock simply by hovering over the asset icon. Your locked files have a **red** check-mark, other user's locks will show up with a **blue** checkmark.
-
-![Viewing file locks](https://iili.io/1HYn07.webp)
-  
-### Pulling latest from within the editor:
-
-You can pull the latest changes from your currently checked-out branch within the editor. This doesn't always work smoothly, but effort has been made to improve this process. It is still recommended to always save changes before doing this, however.
-
-![Pulling latest](https://iili.io/1HhumN.webp)
-  
-### Submitting changes up-stream:
-
-`Submit to revision control` will create a local commit, push it, and release your file lock. 
-(While you cannot check out branches within the plugin, it is fully branch-aware! In this scenario, the user has checked out the `develop` branch, so their change is pushed to `origin/develop`.)
-   
-![Submitting to revision control](https://iili.io/1HhI7R.webp)
-  
-## Additional Resources
-
-You can learn more about how we set up our Git repository at [the PBCore wiki](https://github.com/ProjectBorealis/PBCore/wiki).
+MIT licence; see [LICENSE.txt](LICENSE.txt). Please report issues on [GitHub](https://github.com/anadin/UEGitPlugin/issues).

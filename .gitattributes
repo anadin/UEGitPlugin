@@ -1,0 +1,13 @@
+# Portable plugin source; image resources stay binary.
+* text=auto
+*.cpp text eol=lf
+*.h text eol=lf
+*.cs text eol=lf
+*.ini text eol=lf
+*.uplugin text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.png -text
