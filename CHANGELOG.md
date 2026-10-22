@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `Scripts/package.py` builds and checks a plugin package on Windows, macOS or Linux, replacing the macOS-only packaging scripts.
+- The tests' loopback Git LFS server runs on the engine's own Python first, so a Windows machine needs no separate Python install.
+
 ## 4.0.0-alpha
 
 A rework of the Git LFS 2 provider around Unreal's own revision control flows. Tested on Unreal Engine 5.8 on macOS.

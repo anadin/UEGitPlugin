@@ -9,7 +9,7 @@ Git and Git LFS for Unreal Editor, working the way Unreal's revision control alr
 
 Artists never need to leave those flows. For everything else there is the **Git panel**: staging, commits, history, branches, stashes and locks.
 
-> **Status: 4.0.0-alpha.** Built and tested on Unreal Engine 5.8 on macOS (Apple Silicon). Windows and Linux compile from the same code but have not been tested yet.
+> **Status: 4.0.0-alpha.** Built and tested on Unreal Engine 5.8 on macOS (Apple Silicon). Windows and Linux share the same code but have not been built or tested yet.
 
 ## Requirements
 
@@ -118,13 +118,15 @@ Detailed messages are in **Window > Message Log > Revision Control** (or via **S
 
 ## Development
 
-The plugin's automation tests are named `GitWorkspace.*`. They create disposable repositories (and a loopback Git LFS server, which needs Python 3) and never touch your project's repository. Run them from the Session Frontend, or headless:
+The plugin's automation tests are named `GitWorkspace.*`. They create disposable repositories (and a loopback Git LFS server, which runs on the engine's own Python) and never touch your project's repository. Run them from the Session Frontend, or headless:
 
 ```bash
 UnrealEditor-Cmd YourProject.uproject -unattended -nullrhi -ExecCmds="Automation RunTests GitWorkspace" -TestExit="Automation Test Queue Empty"
 ```
 
-`GitWorkspace.Panel.Screenshots` only runs in an editor that renders; it saves images of the Git panel to `Saved/Automation/GitWorkspace/Screenshots`. `GitWorkspace.Editor.NativeFlows` drives Unreal's own check out, check in, revert and sync helpers; it only runs in a disposable project with its own repository and lock server (the development project's `Scripts/e2e-native-flows.sh` prepares one).
+`GitWorkspace.Panel.Screenshots` only runs in an editor that renders; it saves images of the Git panel to `Saved/Automation/GitWorkspace/Screenshots`. `GitWorkspace.Editor.NativeFlows` drives Unreal's own check out, check in, revert and sync helpers; it only runs in a disposable project with its own repository and lock server (the development project's `Scripts/dev.sh e2e`, or `Scripts\dev.cmd e2e` on Windows, prepares one).
+
+To build a plugin package for your platform (Windows, macOS or Linux), see [Packaging](Docs/Packaging.md).
 
 ## Credits and licence
 

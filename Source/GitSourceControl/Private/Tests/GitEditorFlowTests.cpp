@@ -66,8 +66,8 @@ namespace
 /**
  * Unreal's own revision control helpers with Git Workspace as the active provider: check in a new
  * asset, check out (lock) and check in, revert with reload, and Sync of a teammate's change with
- * reload. Runs only in the disposable project that the host project's Scripts/e2e-native-flows.sh
- * prepares; skipped everywhere else.
+ * reload. Runs only in the disposable project that the host project's `Scripts/dev.py e2e` prepares;
+ * skipped everywhere else.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitEditorNativeFlowsTest, "GitWorkspace.Editor.NativeFlows", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FGitEditorNativeFlowsTest::RunTest(const FString&)
@@ -76,7 +76,7 @@ bool FGitEditorNativeFlowsTest::RunTest(const FString&)
 	FString Remote;
 	if (!FParse::Value(FCommandLine::Get(), TEXT("GitWorkspaceE2EBob="), Bob) || !FParse::Value(FCommandLine::Get(), TEXT("GitWorkspaceE2ERemote="), Remote))
 	{
-		AddInfo(TEXT("Runs in the disposable project prepared by Scripts/e2e-native-flows.sh; skipped here."));
+		AddInfo(TEXT("Runs in the disposable project prepared by the host project's Scripts/dev.py e2e; skipped here."));
 		return true;
 	}
 	ISourceControlProvider& Provider = ISourceControlModule::Get().GetProvider();

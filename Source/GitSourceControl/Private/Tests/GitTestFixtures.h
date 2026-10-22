@@ -169,6 +169,14 @@ namespace GitTest
 		{
 			return Configured;
 		}
+		// The engine ships its own Python on every platform. A PATH search can find stubs that do
+		// not run scripts, such as the Microsoft Store's python.exe on Windows.
+		const FString Bundled = FPaths::ConvertRelativePathToFull(FPaths::EngineDir() / TEXT("Binaries/ThirdParty/Python3") /
+			FPlatformProcess::GetBinariesSubdirectory() / (PLATFORM_WINDOWS ? TEXT("python.exe") : TEXT("bin/python3")));
+		if (IFileManager::Get().FileExists(*Bundled))
+		{
+			return Bundled;
+		}
 		TArray<FString> Candidates;
 		TArray<FString> SearchPath;
 		FPlatformMisc::GetEnvironmentVariable(TEXT("PATH")).ParseIntoArray(SearchPath, PLATFORM_WINDOWS ? TEXT(";") : TEXT(":"), true);
@@ -205,7 +213,7 @@ namespace GitTest
 			const FString Python = PythonExecutable();
 			if (!Plugin.IsValid() || Python.IsEmpty())
 			{
-				Test.AddError(TEXT("The LFS test server needs Python 3 (set GIT_WORKSPACE_TEST_PYTHON to override)."));
+				Test.AddError(TEXT("The LFS test server needs Python 3: the engine's own, one on PATH, or GIT_WORKSPACE_TEST_PYTHON."));
 				return;
 			}
 			const FString Script = FPaths::ConvertRelativePathToFull(Plugin->GetBaseDir() / TEXT("Source/GitSourceControl/Private/Tests/LockTestServer.py"));
