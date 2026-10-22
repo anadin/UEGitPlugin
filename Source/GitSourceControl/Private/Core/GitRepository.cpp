@@ -107,15 +107,15 @@ namespace GitCore
 		return Major > 2 || (Major == 2 && Minor >= 38);
 	}
 
-	FToolVersions FGitRepository::ReadToolVersions(const FString& GitBinary)
+	FToolVersions FGitRepository::ReadToolVersions(const FString& Binary)
 	{
 		FToolVersions Versions;
-		if (GitBinary.IsEmpty())
+		if (Binary.IsEmpty())
 		{
 			return Versions;
 		}
 		FGitRepository Probe;
-		Probe.GitBinary = GitBinary;
+		Probe.GitBinary = Binary;
 		const FProcessResult Git = Probe.Run(ECallKind::LocalQuick, {TEXT("version")});
 		if (Git.Succeeded())
 		{
@@ -129,9 +129,9 @@ namespace GitCore
 		return Versions;
 	}
 
-	FGitRepositoryPtr FGitRepository::Open(const FString& GitBinary, const FString& Path, FString& OutError)
+	FGitRepositoryPtr FGitRepository::Open(const FString& Binary, const FString& Path, FString& OutError)
 	{
-		if (GitBinary.IsEmpty())
+		if (Binary.IsEmpty())
 		{
 			OutError = TEXT("Git was not found. Install Git, or set its path in the revision control settings.");
 			return nullptr;
@@ -143,7 +143,7 @@ namespace GitCore
 		}
 
 		TSharedRef<FGitRepository, ESPMode::ThreadSafe> Repository = MakeShareable(new FGitRepository());
-		Repository->GitBinary = GitBinary;
+		Repository->GitBinary = Binary;
 		FGitCall Discover;
 		Discover.Kind = ECallKind::LocalQuick;
 		Discover.Args = {TEXT("-C"), Directory, TEXT("rev-parse"), TEXT("--path-format=absolute"), TEXT("--show-toplevel"),
@@ -167,7 +167,8 @@ namespace GitCore
 		if (PrefixDir.IsEmpty() || Directory.EndsWith(TEXT("/") + PrefixDir, PathCase()))
 		{
 			const FString Alias = NormalizeDirectory(PrefixDir.IsEmpty() ? Directory : Directory.LeftChop(PrefixDir.Len()));
-			if (!Alias.Equals(Repository->Root, PathCase()))
+			// Case counts here: on Windows git reports the on-disk case, the editor keeps the case it was given.
+			if (!Alias.Equals(Repository->Root, ESearchCase::CaseSensitive))
 			{
 				Repository->AliasRoot = Alias;
 			}

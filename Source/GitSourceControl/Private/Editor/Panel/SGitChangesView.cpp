@@ -759,11 +759,11 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 			FSlateIcon(StyleName, "RevisionControl.Actions.Diff"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::DiffSelection)));
 		Menu.AddMenuEntry(LOCTEXT("HistoryMenu", "Show history"), LOCTEXT("HistoryMenuTooltip", "Earlier versions of this asset."),
 			FSlateIcon(StyleName, "RevisionControl.Actions.History"),
-			FUIAction(FExecuteAction::CreateLambda([WeakModel = WeakModel, Path]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->ShowHistory(Path); } }),
+			FUIAction(FExecuteAction::CreateLambda([Weak = WeakModel, Path]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->ShowHistory(Path); } }),
 				FCanExecuteAction::CreateLambda([this, Path]() { return GetDisplay(Path).bPackage; })));
 		Menu.AddMenuEntry(LOCTEXT("OpenMenu", "Open"), LOCTEXT("OpenMenuTooltip", "Open the asset editor, or the file in its default application."),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.OpenInExternalEditor"),
-			FUIAction(FExecuteAction::CreateLambda([WeakModel = WeakModel, Path]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->OpenFile(Path); } })));
+			FUIAction(FExecuteAction::CreateLambda([Weak = WeakModel, Path]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->OpenFile(Path); } })));
 	}
 	Menu.AddMenuEntry(LOCTEXT("BrowseMenu", "Show in Content Browser"), LOCTEXT("BrowseMenuTooltip", "Select these assets in the Content Browser (other files open in the file browser)."),
 		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),

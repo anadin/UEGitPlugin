@@ -4,6 +4,9 @@
 
 - `Scripts/package.py` builds and checks a plugin package on Windows, macOS or Linux, replacing the macOS-only packaging scripts.
 - The tests' loopback Git LFS server runs on the engine's own Python first, so a Windows machine needs no separate Python install.
+- Windows, ahead of its first build: fixes for compile errors found by review against the engine's Windows headers and Visual Studio's stricter name-hiding rules, and two tests rewritten to work there.
+- Windows: helpers git leaves running on purpose, such as its file system monitor, are no longer stopped when a git command finishes.
+- Paths handed back to the editor keep the editor's spelling when it differs from Git's only in letter case.
 
 ## 4.0.0-alpha
 

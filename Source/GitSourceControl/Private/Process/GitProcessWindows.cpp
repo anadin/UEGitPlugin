@@ -10,6 +10,11 @@
 #include <windows.h>
 #include "Windows/HideWindowsPlatformTypes.h"
 
+// Windows maps API names to macros (GetUserName is GetUserNameW). In a unity build they would
+// rename ISourceControlRevision::GetUserName and this module's MessageBox in later files.
+#undef GetUserName
+#undef MessageBox
+
 namespace GitCore
 {
 	namespace
@@ -42,7 +47,8 @@ namespace GitCore
 		{
 			SECURITY_ATTRIBUTES Security = {};
 			Security.nLength = sizeof(Security);
-			Security.bInheritHandle = TRUE;
+			// TRUE is undefined again after HideWindowsPlatformTypes.h.
+			Security.bInheritHandle = true;
 			HANDLE ReadEnd = nullptr;
 			HANDLE WriteEnd = nullptr;
 			if (!::CreatePipe(&ReadEnd, &WriteEnd, &Security, PipeBufferSize))
@@ -162,7 +168,7 @@ namespace GitCore
 
 		PROCESS_INFORMATION Information = {};
 		const DWORD CreationFlags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
-		const BOOL bCreated = ::CreateProcessW(nullptr, CommandBuffer.GetData(), nullptr, nullptr, TRUE, CreationFlags, Environment.GetData(),
+		const BOOL bCreated = ::CreateProcessW(nullptr, CommandBuffer.GetData(), nullptr, nullptr, true, CreationFlags, Environment.GetData(),
 			Spec.WorkingDirectory.IsEmpty() ? nullptr : *Spec.WorkingDirectory, &Startup.StartupInfo, &Information);
 		const DWORD CreateError = ::GetLastError();
 		::DeleteProcThreadAttributeList(AttributeList);
@@ -347,6 +353,13 @@ namespace GitCore
 		if (StdinWriter.IsValid())
 		{
 			StdinWriter->Join();
+		}
+		if (!bStopping && Job.IsValid())
+		{
+			// Helpers git leaves running on purpose (its file system monitor, for one) outlive it,
+			// as they do on macOS and Linux. Cancels, timeouts and an editor crash still stop the tree.
+			JOBOBJECT_EXTENDED_LIMIT_INFORMATION Release = {};
+			::SetInformationJobObject(Job.Value, JobObjectExtendedLimitInformation, &Release, sizeof(Release));
 		}
 		DWORD ExitCode = 0;
 		::GetExitCodeProcess(Process.Value, &ExitCode);

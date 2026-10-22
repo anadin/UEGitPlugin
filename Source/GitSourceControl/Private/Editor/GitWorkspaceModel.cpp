@@ -633,16 +633,16 @@ void FGitWorkspaceModel::SwitchBranch(const FString& Name)
 		{
 			return FGitActionResult::Failure(LOCTEXT("SwitchMidOperation", "Finish the merge or rebase in progress before switching branches."));
 		}
-		TSet<FString> Changed;
+		TSet<FString> Switched;
 		FString Error;
-		if (!Repository.ChangedPaths(TEXT("HEAD"), Name, Changed, Error))
+		if (!Repository.ChangedPaths(TEXT("HEAD"), Name, Switched, Error))
 		{
 			return FGitActionResult::Failure(FText::FromString(Error));
 		}
 		TArray<FString> Overlap;
 		for (const GitCore::FStatusEntry& Entry : Snapshot->Status.Entries)
 		{
-			if (Changed.Contains(Entry.Path))
+			if (Switched.Contains(Entry.Path))
 			{
 				Overlap.Add(Entry.Path);
 			}
@@ -662,7 +662,7 @@ void FGitWorkspaceModel::SwitchBranch(const FString& Name)
 			}
 		}
 		FGitActionResult Prepared = FGitActionResult::Success();
-		Prepared.Paths = Changed.Array();
+		Prepared.Paths = Switched.Array();
 		return Prepared;
 	},
 	[this, Name, Doing](const FGitActionResult& Prepared)

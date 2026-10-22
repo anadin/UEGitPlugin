@@ -81,9 +81,9 @@ namespace GitCore
 	{
 	public:
 		/** Opens the worktree containing Path. Returns null with OutError when Path is not inside a repository. */
-		static TSharedPtr<FGitRepository, ESPMode::ThreadSafe> Open(const FString& GitBinary, const FString& Path, FString& OutError);
+		static TSharedPtr<FGitRepository, ESPMode::ThreadSafe> Open(const FString& Binary, const FString& Path, FString& OutError);
 		/** Asks the git executable (and git-lfs next to it) for their versions. */
-		static FToolVersions ReadToolVersions(const FString& GitBinary);
+		static FToolVersions ReadToolVersions(const FString& Binary);
 
 		const FString& GetGitBinary() const { return GitBinary; }
 		/** Absolute worktree root with forward slashes and no trailing slash. */

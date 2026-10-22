@@ -29,8 +29,9 @@ namespace
 	{
 		GitCore::FProcessSpec Spec;
 #if PLATFORM_WINDOWS
-		Spec.Executable = TEXT("C:/Windows/System32/cmd.exe");
-		Spec.Arguments = {TEXT("/c"), FString::Printf(TEXT("ping -n %d 127.0.0.1 >nul"), Seconds + 1)};
+		// Git for Windows brings a shell with sleep. cmd.exe cannot take its /c command quoted.
+		Spec.Executable = GitTest::GitBinary();
+		Spec.Arguments = {TEXT("-c"), FString::Printf(TEXT("alias.workspace-test-sleep=!sleep %d"), Seconds), TEXT("workspace-test-sleep")};
 #else
 		Spec.Executable = TEXT("/bin/sleep");
 		Spec.Arguments = {FString::FromInt(Seconds)};
@@ -151,14 +152,20 @@ bool FGitProcessEnvironmentTest::RunTest(const FString&)
 	const FString Repo = Fixture.InitRepo();
 	GitTest::Git(Repo, {TEXT("config"), TEXT("alias.showenv"), TEXT("!env")});
 
+	// A variable of our own: Git for Windows sets HOME for its children when it is missing.
+	const TCHAR* const Inherited = TEXT("GIT_WORKSPACE_TEST_INHERITED");
+	FPlatformMisc::SetEnvironmentVar(Inherited, TEXT("from the editor"));
 	GitCore::FProcessSpec Spec = GitSpec({TEXT("-C"), Repo, TEXT("showenv")});
+	const FString Before = GitCore::RunProcess(Spec).StdoutText();
 	Spec.SetEnvironment.Add(TEXT("GIT_WORKSPACE_TEST_VALUE"), TEXT("set by test"));
-	Spec.UnsetEnvironment.Add(TEXT("HOME"));
+	Spec.UnsetEnvironment.Add(Inherited);
 	const GitCore::FProcessResult Result = GitCore::RunProcess(Spec);
+	FPlatformMisc::SetEnvironmentVar(Inherited, TEXT(""));
 	const FString Environment = Result.StdoutText();
 	TestTrue(TEXT("The child runs"), Result.Succeeded());
+	TestTrue(TEXT("The child inherits the editor's variables"), Before.Contains(TEXT("GIT_WORKSPACE_TEST_INHERITED=from the editor")));
 	TestTrue(TEXT("Overrides reach the child"), Environment.Contains(TEXT("GIT_WORKSPACE_TEST_VALUE=set by test")));
-	TestFalse(TEXT("Removed variables are absent"), Environment.Contains(TEXT("\nHOME=")) || Environment.StartsWith(TEXT("HOME=")));
+	TestFalse(TEXT("Removed variables are absent"), Environment.Contains(TEXT("GIT_WORKSPACE_TEST_INHERITED=")));
 
 	// The repository layer scrubs variables that would redirect git elsewhere.
 	GitTest::WriteFile(Repo, TEXT("file.txt"), TEXT("text\n"));

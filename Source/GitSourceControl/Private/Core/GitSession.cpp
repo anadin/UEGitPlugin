@@ -513,7 +513,7 @@ namespace GitCore
 			FScopeLock Lock(&StateLock);
 			RemoteToken.Reset();
 		}
-		Publish(EChange::Remote, [&State](FSessionSnapshot& Snapshot) { Snapshot.Remote = MoveTemp(State); });
+		Publish(EChange::Remote, [&State](FSessionSnapshot& Next) { Next.Remote = MoveTemp(State); });
 		if (!Result.bOk && OutError)
 		{
 			*OutError = Result.Message;
@@ -534,7 +534,7 @@ namespace GitCore
 		{
 			State.Error = Error;
 		}
-		Publish(EChange::Remote, [&State](FSessionSnapshot& Snapshot) { Snapshot.Remote = MoveTemp(State); });
+		Publish(EChange::Remote, [&State](FSessionSnapshot& Next) { Next.Remote = MoveTemp(State); });
 	}
 
 	void FGitSession::RefreshStashes()
