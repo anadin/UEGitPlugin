@@ -3,12 +3,17 @@
 
 #include "GitTestFixtures.h"
 #include "Editor/GitWorkspaceModel.h"
+#include "Editor/Panel/GitFileTree.h"
+#include "Editor/Panel/SGitHistoryView.h"
 #include "Editor/Panel/SGitPanel.h"
+#include "Editor/Panel/SGitStashesView.h"
 
 #include "Framework/Application/SlateApplication.h"
 #include "ImageCore.h"
 #include "ImageUtils.h"
 #include "Misc/App.h"
+#include "Types/ISlateMetaData.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Widgets/SWindow.h"
 
 namespace
@@ -58,6 +63,39 @@ namespace
 	FString PanelStaged(const FString& Repo)
 	{
 		return GitTest::Output(GitTest::Git(Repo, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")}));
+	}
+
+	/** The widget below Root carrying Tag, whether or not it is showing. */
+	TSharedPtr<SWidget> FindTagged(const TSharedRef<SWidget>& Root, FName Tag)
+	{
+		const TSharedPtr<FTagMetaData> Meta = Root->GetMetaData<FTagMetaData>();
+		if (Meta.IsValid() && Meta->Tag == Tag)
+		{
+			return Root;
+		}
+		FChildren* Children = Root->GetAllChildren();
+		for (int32 Index = 0; Children && Index < Children->Num(); ++Index)
+		{
+			if (const TSharedPtr<SWidget> Found = FindTagged(Children->GetChildAt(Index), Tag))
+			{
+				return Found;
+			}
+		}
+		return nullptr;
+	}
+
+	/** Selects the first item of a tagged list in the panel. */
+	template<typename ItemType>
+	void SelectFirst(const TSharedRef<SWidget>& Panel, FName Tag)
+	{
+		if (const TSharedPtr<SWidget> Found = FindTagged(Panel, Tag))
+		{
+			const TSharedPtr<SListView<ItemType>> List = StaticCastSharedPtr<SListView<ItemType>>(Found);
+			if (!List->GetItems().IsEmpty())
+			{
+				List->SetSelection(List->GetItems()[0], ESelectInfo::OnMouseClick);
+			}
+		}
 	}
 }
 
@@ -214,6 +252,67 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelFileTreeTest, "GitWorkspace.Panel.FileTree", PanelTestFlags)
+bool FGitPanelFileTreeTest::RunTest(const FString&)
+{
+	TestEqual(TEXT("A World Partition actor is listed under its level"), GitWorkspaceText::TreeFolder(TEXT("Content/__ExternalActors__/Maps/Main/A/7Q/0F2KD8XN3PZ4W1.uasset")),
+		FString(TEXT("Content/__ExternalActors__/Maps/Main")));
+	TestEqual(TEXT("Other files are listed under their folder"), GitWorkspaceText::TreeFolder(TEXT("Content/Props/Barrel.uasset")), FString(TEXT("Content/Props")));
+	TestEqual(TEXT("Top-level files have no folder"), GitWorkspaceText::TreeFolder(TEXT("readme.txt")), FString());
+
+	const TArray<FString> Paths = {TEXT("Content/Props/Barrel.uasset"), TEXT("Content/Props/Crate.uasset"), TEXT("Content/Maps/Main.umap"),
+		TEXT("Content/__ExternalActors__/Maps/Main/A/7Q/0F2KD8XN3PZ4W1.uasset"), TEXT("Content/__ExternalActors__/Maps/Main/B/3X/1ABCDEF.uasset"),
+		TEXT("Source/Demo/Private/DemoCharacter.cpp"), TEXT("readme.txt")};
+	TArray<TSharedPtr<FGitPathItem>> Files;
+	for (const FString& Path : Paths)
+	{
+		const TSharedPtr<FGitPathItem> File = MakeShared<FGitPathItem>();
+		File->Path = Path;
+		Files.Add(File);
+	}
+	const TArray<TSharedPtr<FGitPathItem>> Roots = GitFileTree::Build(Files, true);
+	if (!TestEqual(TEXT("Two folders, then the top-level file"), Roots.Num(), 3))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Content comes first"), Roots[0]->bFolder && Roots[0]->Label == TEXT("Content") && Roots[0]->FileCount == 5);
+	TestTrue(TEXT("A chain of single folders is one row"), Roots[1]->bFolder && Roots[1]->Label == TEXT("Source/Demo/Private") && Roots[1]->Path == TEXT("Source/Demo/Private"));
+	TestTrue(TEXT("Files follow the folders"), !Roots[2]->bFolder && Roots[2]->Path == TEXT("readme.txt"));
+	auto Child = [](const TSharedPtr<FGitPathItem>& Folder, const TCHAR* Label)
+	{
+		const TSharedPtr<FGitPathItem>* Found = Folder->Children.FindByPredicate([Label](const TSharedPtr<FGitPathItem>& Item) { return Item->Label == Label; });
+		return Found ? *Found : TSharedPtr<FGitPathItem>();
+	};
+	const TSharedPtr<FGitPathItem> Actors = Child(Roots[0], TEXT("__ExternalActors__/Maps/Main"));
+	TestTrue(TEXT("A level's actors sit in one folder, without the hash folders"),
+		Actors.IsValid() && Actors->Path == TEXT("Content/__ExternalActors__/Maps/Main") && Actors->Children.Num() == 2 && !Actors->Children[0]->bFolder);
+	const TSharedPtr<FGitPathItem> Props = Child(Roots[0], TEXT("Props"));
+	if (!TestTrue(TEXT("Files keep the order given"), Props.IsValid() && Props->Children.Num() == 2 && Props->Children[0]->Path == TEXT("Content/Props/Barrel.uasset")))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Without folders the list is unchanged"), GitFileTree::Build(Files, false).Num(), Paths.Num());
+	TestEqual(TEXT("A selection means the files in it, each once"), GitFileTree::SelectedFiles<FGitPathItem>({Roots[0], Props, Props->Children[0]}).Num(), 5);
+
+	// Alt+click and Shift+click open or close a folder with everything in it.
+	TArray<TSharedPtr<FGitPathItem>> Shown = Roots;
+	const TSharedRef<STreeView<TSharedPtr<FGitPathItem>>> Tree = SNew(STreeView<TSharedPtr<FGitPathItem>>)
+		.TreeItemsSource(&Shown)
+		.OnGenerateRow_Lambda([](TSharedPtr<FGitPathItem>, const TSharedRef<STableViewBase>& Owner) { return SNew(STableRow<TSharedPtr<FGitPathItem>>, Owner); })
+		.OnGetChildren_Lambda([](TSharedPtr<FGitPathItem> Item, TArray<TSharedPtr<FGitPathItem>>& Out) { Out = Item->Children; });
+	GitFileTree::SetExpansionRecursive(*Tree, Roots[0], true);
+	TestTrue(TEXT("Opening a folder that way opens every folder in it"), Tree->IsItemExpanded(Roots[0]) && Tree->IsItemExpanded(Actors) && Tree->IsItemExpanded(Props));
+	GitFileTree::SetExpansionRecursive(*Tree, Roots[0], false);
+	TestTrue(TEXT("Closing it that way closes them all"), !Tree->IsItemExpanded(Roots[0]) && !Tree->IsItemExpanded(Actors));
+	// A rebuilt tree keeps the folders the user closed closed, except while searching.
+	const TSet<FString> Collapsed = {Props->Path};
+	GitFileTree::RestoreExpansion(*Tree, Roots, Collapsed, false);
+	TestTrue(TEXT("Folders open unless the user closed them"), Tree->IsItemExpanded(Roots[0]) && Tree->IsItemExpanded(Actors) && !Tree->IsItemExpanded(Props));
+	GitFileTree::RestoreExpansion(*Tree, Roots, Collapsed, true);
+	TestTrue(TEXT("A search opens every folder"), Tree->IsItemExpanded(Props));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelScreenshotsTest, "GitWorkspace.Panel.Screenshots", PanelTestFlags)
 bool FGitPanelScreenshotsTest::RunTest(const FString&)
 {
@@ -295,13 +394,30 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 	FSlateApplication::Get().AddWindow(State->Window.ToSharedRef());
 	State->Widget->ShowPaths({TEXT("Content/Hero.uasset")});
 
-	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-wide")); }, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("changes-wide"));
+		if (const TSharedPtr<SWidget> Search = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.Search")))
+		{
+			StaticCastSharedPtr<SSearchBox>(Search)->SetText(FText::FromString(TEXT("barrel")));
+		}
+	}, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("changes-search"));
+		if (const TSharedPtr<SWidget> Search = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.Search")))
+		{
+			StaticCastSharedPtr<SSearchBox>(Search)->SetText(FText::GetEmpty());
+		}
+	}, 1.0f));
 	// Resize takes screen pixels; sizes here are Slate units.
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Window->Resize(FVector2D(460.0f, 680.0f) * State->Window->GetDPIScaleFactor()); }, 0.1f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-narrow")); }, 1.0f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Window->Resize(FVector2D(1180.0f, 680.0f) * State->Window->GetDPIScaleFactor()); State->Widget->ShowTab(1); }, 0.1f));
-	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("history")); State->Widget->ShowTab(2); }, 2.0f));
-	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("stashes")); State->Widget->ShowTab(3); }, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { SelectFirst<SGitHistoryView::FCommitPtr>(State->Widget.ToSharedRef(), TEXT("GitPanel.History.Commits")); }, 2.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("history")); State->Widget->ShowTab(2); }, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { SelectFirst<SGitStashesView::FStashPtr>(State->Widget.ToSharedRef(), TEXT("GitPanel.Stashes.List")); }, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("stashes")); State->Widget->ShowTab(3); }, 1.5f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("locks")); State->Window->RequestDestroyWindow(); }, 1.0f));
 	return true;
 }

@@ -131,26 +131,46 @@ namespace
 		return Asset.AssetName.ToString();
 	}
 
-	/** "Content/__ExternalActors__/Maps/Main/0/AB/XYZ.uasset" belongs to the level "Maps/Main". */
-	FString ExternalPackageLevel(const FString& RelativePath)
+	/**
+	 * "Content/__ExternalActors__/Maps/Main/0/AB/XYZ.uasset" belongs to the level "Maps/Main", whose
+	 * packages are in "Content/__ExternalActors__/Maps/Main". False for other files.
+	 */
+	bool SplitExternalPackage(const FString& RelativePath, FString& OutLevelFolder, FString& OutLevel)
 	{
 		for (const TCHAR* Folder : {TEXT("/__ExternalActors__/"), TEXT("/__ExternalObjects__/")})
 		{
 			const int32 Start = RelativePath.Find(Folder);
 			if (Start != INDEX_NONE)
 			{
+				const int32 LevelStart = Start + FCString::Strlen(Folder);
 				TArray<FString> Parts;
-				RelativePath.Mid(Start + FCString::Strlen(Folder)).ParseIntoArray(Parts, TEXT("/"));
+				RelativePath.Mid(LevelStart).ParseIntoArray(Parts, TEXT("/"));
 				// Two hash folders and the file name follow the level path.
 				if (Parts.Num() > 3)
 				{
 					Parts.SetNum(Parts.Num() - 3);
-					return FString::Join(Parts, TEXT("/"));
+					OutLevel = FString::Join(Parts, TEXT("/"));
+					OutLevelFolder = RelativePath.Left(LevelStart) + OutLevel;
+					return true;
 				}
 			}
 		}
-		return FString();
+		return false;
 	}
+
+	FString ExternalPackageLevel(const FString& RelativePath)
+	{
+		FString LevelFolder;
+		FString Level;
+		return SplitExternalPackage(RelativePath, LevelFolder, Level) ? Level : FString();
+	}
+}
+
+FString GitWorkspaceText::TreeFolder(const FString& RelativePath)
+{
+	FString LevelFolder;
+	FString Level;
+	return SplitExternalPackage(RelativePath, LevelFolder, Level) ? LevelFolder : FPaths::GetPath(RelativePath);
 }
 
 FGitFileDisplay FGitFileDisplay::Make(const FString& AbsoluteFilename, const FString& RelativePath)

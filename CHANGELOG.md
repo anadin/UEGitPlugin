@@ -7,6 +7,8 @@
 - Windows, ahead of its first build: fixes for compile errors found by review against the engine's Windows headers and Visual Studio's stricter name-hiding rules, and two tests rewritten to work there.
 - Windows: helpers git leaves running on purpose, such as its file system monitor, are no longer stopped when a git command finishes.
 - Paths handed back to the editor keep the editor's spelling when it differs from Git's only in letter case.
+- Git panel: every file list (Changes, a commit's or stash's files, Locks) shows files in their folders. Single-folder chains share a row, World Partition actors sit under their level, and a folder's selection acts on its files. Alt+click (Option+click on macOS) or Shift+click on the arrow opens or closes a folder with everything in it; the folder button next to each search box switches back to one list of paths.
+- Git panel: search in every tab (Ctrl+F): commits by summary, author or id, stashes by name, locks by file or owner, and a filter for a commit's or stash's files. Matches are highlighted.
 
 ## 4.0.0-alpha
 

@@ -41,6 +41,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Backups", meta = (ClampMin = "1", ClampMax = "365"))
 	int32 BackupDays = 14;
 
+	/** The Git panel lists files in their folders. Off: one list of paths. */
+	UPROPERTY(config, EditAnywhere, Category = "Git Panel")
+	bool bShowFolders = true;
+
 	/** Set once the "prompt for check out" suggestion has been shown. */
 	UPROPERTY(config)
 	bool bOfferedCheckoutPrompt = false;

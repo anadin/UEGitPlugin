@@ -19,6 +19,11 @@ namespace GitWorkspaceText
 	FText FileList(const TArray<FString>& Paths, int32 Max = 3);
 	/** Commit ids are shown with eight characters. */
 	FString ShortId(const FString& Commit);
+	/**
+	 * The folder a file is listed under in the Git panel: its own, without the two hash folders
+	 * World Partition puts between a level's external actors (or objects) folder and the file.
+	 */
+	FString TreeFolder(const FString& RelativePath);
 }
 
 /** How a repository file is shown: the asset's name (an actor label for World Partition files), its class and icon. */

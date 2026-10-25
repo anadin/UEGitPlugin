@@ -5,11 +5,14 @@
 #include "Editor/GitWorkspaceText.h"
 #include "SGitDialogs.h"
 
+#include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "HAL/PlatformApplicationMisc.h"
 #include "RevisionControlStyle/RevisionControlStyle.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Widgets/Input/SSegmentedControl.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -24,59 +27,69 @@ namespace
 	const FName OwnerColumn(TEXT("Owner"));
 	const FName SinceColumn(TEXT("Since"));
 
-	class SGitLockRow : public SMultiColumnTableRow<SGitLocksView::FLockPtr>
+	class SGitLockRow : public SMultiColumnTableRow<SGitLocksView::FItemPtr>
 	{
 	public:
 		SLATE_BEGIN_ARGS(SGitLockRow) {}
-			SLATE_ARGUMENT(SGitLocksView::FLockPtr, Lock)
-			SLATE_ARGUMENT(bool, bHere)
+			SLATE_ARGUMENT(SGitLocksView::FItemPtr, Item)
+			SLATE_ARGUMENT(TWeakPtr<SGitLocksView>, View)
 		SLATE_END_ARGS()
 
 		void Construct(const FArguments& InArgs, const TSharedRef<STableViewBase>& Owner)
 		{
-			Lock = InArgs._Lock;
-			bHere = InArgs._bHere;
-			SMultiColumnTableRow<SGitLocksView::FLockPtr>::Construct(FSuperRowType::FArguments().Padding(FMargin(0.0f, 2.0f)), Owner);
+			Item = InArgs._Item;
+			View = InArgs._View;
+			SMultiColumnTableRow<SGitLocksView::FItemPtr>::Construct(FSuperRowType::FArguments().Padding(FMargin(0.0f, 2.0f)), Owner);
+		}
+
+		virtual FReply OnPreviewMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& Event) override
+		{
+			return Item->bFolder ? GitFileTree::ToggleOnAltClick(*this, Event) : FReply::Unhandled();
 		}
 
 		virtual TSharedRef<SWidget> GenerateWidgetForColumn(const FName& Column) override
 		{
+			const TSharedPtr<SGitLocksView> Pinned = View.Pin();
+			if (!Pinned.IsValid())
+			{
+				return SNullWidget::NullWidget;
+			}
+			const TAttribute<FText> Highlight = TAttribute<FText>::CreateLambda([Weak = View]()
+			{
+				const TSharedPtr<SGitLocksView> Owner = Weak.Pin();
+				return Owner.IsValid() ? Owner->GetFilterText() : FText::GetEmpty();
+			});
+			if (Item->bFolder)
+			{
+				return Column == FileColumn
+					? GitFileTree::MakeNameCell(SharedThis(this), true, FText::FromString(Item->Label), FText::AsNumber(Item->FileCount), nullptr,
+						FText::Format(LOCTEXT("FolderTooltip", "{0}\n{1} locked {1}|plural(one=file,other=files). Alt+click opens or closes everything in it."),
+							FText::FromString(Item->Path), Item->FileCount), Highlight)
+					: SNullWidget::NullWidget;
+			}
+			const GitCore::FLockInfo& Lock = *Item->Lock;
 			if (Column == FileColumn)
 			{
-				return SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
-					.Padding(4.0f, 0.0f, 6.0f, 0.0f)
-					[
-						SNew(SImage)
-						.Image(FRevisionControlStyleManager::Get().GetBrush(Lock->bOurs ? "RevisionControl.CheckedOut" : "RevisionControl.CheckedOutByOtherUser"))
-						.DesiredSizeOverride(FVector2D(16.0f, 16.0f))
-					]
-					+ SHorizontalBox::Slot()
-					.FillWidth(1.0f)
-					.VAlign(VAlign_Center)
-					[
-						SNew(STextBlock)
-						.Text(FText::FromString(Lock->Path))
-						.ToolTipText(FText::FromString(Lock->Path))
-						.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
-					];
+				const FGitFileDisplay& Display = Pinned->GetDisplay(Lock.Path);
+				const FSlateBrush* Icon = FRevisionControlStyleManager::Get().GetBrush(Lock.bOurs ? "RevisionControl.CheckedOut" : "RevisionControl.CheckedOutByOtherUser");
+				return GitFileTree::MakeNameCell(SharedThis(this), false, Display.Name, GitFileTree::ShowFolders() ? FText::GetEmpty() : Display.Folder, Icon,
+					FText::FromString(Lock.Path), Highlight);
 			}
 			if (Column == OwnerColumn)
 			{
-				const FText Owner = !Lock->bOurs ? FText::FromString(Lock->Owner)
-					: bHere ? LOCTEXT("OwnerYou", "You") : LOCTEXT("OwnerYouElsewhere", "You, in another clone");
-				return SNew(STextBlock).Text(Owner).OverflowPolicy(ETextOverflowPolicy::Ellipsis);
+				return SNew(STextBlock)
+					.Text(Pinned->GetOwnerText(Lock))
+					.HighlightText(Highlight)
+					.OverflowPolicy(ETextOverflowPolicy::Ellipsis);
 			}
 			return SNew(STextBlock)
-				.Text(Lock->LockedAt.GetTicks() > 0 ? GitWorkspaceText::Age(Lock->LockedAt) : FText::GetEmpty())
+				.Text(Lock.LockedAt.GetTicks() > 0 ? GitWorkspaceText::Age(Lock.LockedAt) : FText::GetEmpty())
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground());
 		}
 
 	private:
-		SGitLocksView::FLockPtr Lock;
-		bool bHere = false;
+		SGitLocksView::FItemPtr Item;
+		TWeakPtr<SGitLocksView> View;
 	};
 }
 
@@ -84,11 +97,12 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 {
 	WeakModel = InModel;
 	ChangedHandle = InModel->OnChanged().AddSP(this, &SGitLocksView::OnModelChanged);
-	auto Selected = [this]() { return List.IsValid() ? List->GetSelectedItems() : TArray<FLockPtr>(); };
+	bBuiltFolders = GitFileTree::ShowFolders();
 
 	ChildSlot
 	[
 		SNew(SVerticalBox)
+		// Which locks: everyone's or yours, a search, and folders or a flat list.
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		.Padding(4.0f)
@@ -96,6 +110,7 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 			SNew(SHorizontalBox)
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
+			.Padding(0.0f, 0.0f, 8.0f, 0.0f)
 			[
 				SNew(SSegmentedControl<bool>)
 				.Value_Lambda([this]() { return bMineOnly; })
@@ -112,8 +127,34 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 			]
 			+ SHorizontalBox::Slot()
 			.FillWidth(1.0f)
+			[
+				SAssignNew(SearchBox, SSearchBox)
+				.HintText(LOCTEXT("SearchHint", "Search locked files or owners (Ctrl+F)"))
+				.OnTextChanged_Lambda([this](const FText& Text)
+				{
+					Filter = Text.ToString().TrimStartAndEnd();
+					BuiltGeneration = MAX_uint64;
+					Rebuild();
+				})
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
 			.VAlign(VAlign_Center)
-			.Padding(8.0f, 0.0f)
+			.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+			[
+				GitFileTree::MakeFoldersToggle()
+			]
+		]
+		// When locks were last checked, and the actions.
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(4.0f, 0.0f, 4.0f, 4.0f)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			.VAlign(VAlign_Center)
+			.Padding(0.0f, 0.0f, 8.0f, 0.0f)
 			[
 				SNew(STextBlock)
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
@@ -155,11 +196,11 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 			[
 				SNew(SButton)
 				.Text(LOCTEXT("Release", "Release"))
-				.ToolTipText(LOCTEXT("ReleaseTooltip", "Release your selected locks. Local changes stay."))
-				.IsEnabled_Lambda([this, Selected]()
+				.ToolTipText(LOCTEXT("ReleaseTooltip", "Release your selected locks (in selected folders too). Local changes stay."))
+				.IsEnabled_Lambda([this]()
 				{
 					const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
-					return Model.IsValid() && !Model->IsBusy() && Selected().ContainsByPredicate([](const FLockPtr& Lock) { return Lock->bOurs; });
+					return Model.IsValid() && !Model->IsBusy() && SelectedLocks().ContainsByPredicate([](const TSharedPtr<GitCore::FLockInfo>& Lock) { return Lock->bOurs; });
 				})
 				.OnClicked_Lambda([this]() { Release(false); return FReply::Handled(); })
 			]
@@ -167,10 +208,14 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
 		[
-			SAssignNew(List, SListView<FLockPtr>)
-			.ListItemsSource(&Locks)
+			SAssignNew(Tree, STreeView<FItemPtr>)
+			.TreeItemsSource(&Items)
 			.SelectionMode(ESelectionMode::Multi)
 			.OnGenerateRow(this, &SGitLocksView::OnGenerateRow)
+			.OnGetChildren(this, &SGitLocksView::OnGetChildren)
+			.OnExpansionChanged(this, &SGitLocksView::OnExpansionChanged)
+			.OnSetExpansionRecursive(this, &SGitLocksView::OnSetExpansionRecursive)
+			.OnMouseButtonDoubleClick(this, &SGitLocksView::OnDoubleClick)
 			.OnContextMenuOpening(this, &SGitLocksView::OnContextMenu)
 			.HeaderRow
 			(
@@ -198,68 +243,214 @@ SGitLocksView::~SGitLocksView()
 	}
 }
 
+void SGitLocksView::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
+{
+	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+	// The folders preference is shared with the other tabs.
+	if (GitFileTree::ShowFolders() != bBuiltFolders)
+	{
+		Rebuild();
+	}
+}
+
+void SGitLocksView::FocusSearch()
+{
+	if (SearchBox.IsValid())
+	{
+		FSlateApplication::Get().SetKeyboardFocus(SearchBox, EFocusCause::SetDirectly);
+	}
+}
+
 void SGitLocksView::OnModelChanged()
 {
 	Rebuild();
 }
 
+const FGitFileDisplay& SGitLocksView::GetDisplay(const FString& Path)
+{
+	return Displays.Get(WeakModel.Pin().Get(), Path);
+}
+
+FText SGitLocksView::GetOwnerText(const GitCore::FLockInfo& Lock) const
+{
+	if (!Lock.bOurs)
+	{
+		return FText::FromString(Lock.Owner);
+	}
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	return Model.IsValid() && Model->GetSnapshot()->LocksTakenHere.Contains(Lock.Id) ? LOCTEXT("OwnerYou", "You") : LOCTEXT("OwnerYouElsewhere", "You, in another clone");
+}
+
 void SGitLocksView::Rebuild()
 {
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
-	if (!Model.IsValid() || !List.IsValid())
+	if (!Model.IsValid() || !Tree.IsValid())
 	{
 		return;
 	}
 	const GitCore::FSessionSnapshotRef Snapshot = Model->GetSnapshot();
-	if (Snapshot->Generation == BuiltGeneration)
+	const bool bFolders = GitFileTree::ShowFolders();
+	if (Snapshot->Generation == BuiltGeneration && bFolders == bBuiltFolders)
 	{
 		return;
 	}
-	BuiltGeneration = Snapshot->Generation;
-	TSet<FString> Selected;
-	for (const FLockPtr& Lock : List->GetSelectedItems())
+	if (Snapshot->Generation != BuiltGeneration)
 	{
-		Selected.Add(Lock->Id);
+		Displays.Reset();
 	}
-	Locks.Reset();
-	TArray<FLockPtr> Reselect;
+	BuiltGeneration = Snapshot->Generation;
+	bBuiltFolders = bFolders;
+	TSet<FString> Selected;
+	for (const FItemPtr& Item : Tree->GetSelectedItems())
+	{
+		Selected.Add(Item->Path);
+	}
+
+	struct FSortable
+	{
+		bool bOurs = false;
+		FString Key;
+		FItemPtr Item;
+	};
+	TArray<FSortable> Sortable;
 	for (const TPair<FString, GitCore::FLockInfo>& Pair : Snapshot->Locks.ByPath)
 	{
-		if (bMineOnly && !Pair.Value.bOurs)
+		const GitCore::FLockInfo& Lock = Pair.Value;
+		if (bMineOnly && !Lock.bOurs)
 		{
 			continue;
 		}
-		Locks.Add(MakeShared<GitCore::FLockInfo>(Pair.Value));
-		if (Selected.Contains(Pair.Value.Id))
+		const FString Name = GetDisplay(Lock.Path).Name.ToString();
+		if (!Filter.IsEmpty() && !Lock.Path.Contains(Filter) && !Name.Contains(Filter) && !GetOwnerText(Lock).ToString().Contains(Filter))
 		{
-			Reselect.Add(Locks.Last());
+			continue;
 		}
+		const FItemPtr Item = MakeShared<FGitLockItem>();
+		Item->Path = Lock.Path;
+		Item->Lock = MakeShared<GitCore::FLockInfo>(Lock);
+		Sortable.Add({Lock.bOurs, bFolders ? Name : Lock.Path, Item});
 	}
-	// Your locks first, then by file.
-	Locks.Sort([](const FLockPtr& A, const FLockPtr& B) { return A->bOurs != B->bOurs ? A->bOurs : A->Path < B->Path; });
-	List->RequestListRefresh();
-	List->ClearSelection();
-	List->SetItemSelection(Reselect, true);
+	// Your locks first, then by the name shown (by path in a flat list).
+	Sortable.Sort([](const FSortable& A, const FSortable& B)
+	{
+		if (A.bOurs != B.bOurs)
+		{
+			return A.bOurs;
+		}
+		const int32 Order = A.Key.Compare(B.Key, ESearchCase::IgnoreCase);
+		return Order != 0 ? Order < 0 : A.Item->Path < B.Item->Path;
+	});
+	TArray<FItemPtr> Files;
+	for (const FSortable& Entry : Sortable)
+	{
+		Files.Add(Entry.Item);
+	}
+	Items = GitFileTree::Build(Files, bFolders);
+	bRestoringExpansion = true;
+	GitFileTree::RestoreExpansion(*Tree, Items, CollapsedFolders, !Filter.IsEmpty());
+	bRestoringExpansion = false;
+	TArray<FItemPtr> Reselect;
+	TFunction<void(const TArray<FItemPtr>&)> Visit = [&Visit, &Selected, &Reselect](const TArray<FItemPtr>& Level)
+	{
+		for (const FItemPtr& Item : Level)
+		{
+			if (Selected.Contains(Item->Path))
+			{
+				Reselect.Add(Item);
+			}
+			Visit(Item->Children);
+		}
+	};
+	Visit(Items);
+	Tree->RequestTreeRefresh();
+	Tree->ClearSelection();
+	Tree->SetItemSelection(Reselect, true);
 }
 
-TSharedRef<ITableRow> SGitLocksView::OnGenerateRow(FLockPtr Lock, const TSharedRef<STableViewBase>& Owner)
+TSharedRef<ITableRow> SGitLocksView::OnGenerateRow(FItemPtr Item, const TSharedRef<STableViewBase>& Owner)
 {
-	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
-	const bool bHere = Model.IsValid() && Model->GetSnapshot()->LocksTakenHere.Contains(Lock->Id);
 	return SNew(SGitLockRow, Owner)
-		.Lock(Lock)
-		.bHere(bHere);
+		.Item(Item)
+		.View(SharedThis(this));
+}
+
+void SGitLocksView::OnGetChildren(FItemPtr Item, TArray<FItemPtr>& OutChildren) const
+{
+	if (Item.IsValid())
+	{
+		OutChildren = Item->Children;
+	}
+}
+
+void SGitLocksView::OnExpansionChanged(FItemPtr Item, bool bExpanded)
+{
+	if (!Item.IsValid() || !Item->bFolder || bRestoringExpansion)
+	{
+		return;
+	}
+	if (bExpanded)
+	{
+		CollapsedFolders.Remove(Item->Path);
+	}
+	else
+	{
+		CollapsedFolders.Add(Item->Path);
+	}
+}
+
+void SGitLocksView::OnSetExpansionRecursive(FItemPtr Item, bool bExpand)
+{
+	if (Tree.IsValid())
+	{
+		GitFileTree::SetExpansionRecursive(*Tree, Item, bExpand);
+	}
+}
+
+void SGitLocksView::OnDoubleClick(FItemPtr Item)
+{
+	if (Item.IsValid() && Item->bFolder)
+	{
+		Tree->SetItemExpansion(Item, !Tree->IsItemExpanded(Item));
+	}
+}
+
+TArray<TSharedPtr<GitCore::FLockInfo>> SGitLocksView::SelectedLocks() const
+{
+	TArray<TSharedPtr<GitCore::FLockInfo>> Locks;
+	if (Tree.IsValid())
+	{
+		for (const FItemPtr& File : GitFileTree::SelectedFiles(Tree->GetSelectedItems()))
+		{
+			Locks.Add(File->Lock);
+		}
+	}
+	return Locks;
 }
 
 TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 {
-	const TArray<FLockPtr> Selected = List->GetSelectedItems();
+	const TArray<TSharedPtr<GitCore::FLockInfo>> Selected = SelectedLocks();
 	if (Selected.IsEmpty())
 	{
 		return nullptr;
 	}
-	const bool bAnyMine = Selected.ContainsByPredicate([](const FLockPtr& Lock) { return Lock->bOurs; });
-	const bool bAnyTheirs = Selected.ContainsByPredicate([](const FLockPtr& Lock) { return !Lock->bOurs; });
+	const bool bAnyMine = Selected.ContainsByPredicate([](const TSharedPtr<GitCore::FLockInfo>& Lock) { return Lock->bOurs; });
+	const bool bAnyTheirs = Selected.ContainsByPredicate([](const TSharedPtr<GitCore::FLockInfo>& Lock) { return !Lock->bOurs; });
+	TArray<FString> Paths;
+	for (const TSharedPtr<GitCore::FLockInfo>& Lock : Selected)
+	{
+		Paths.Add(Lock->Path);
+	}
+	TArray<FString> ItemPaths;
+	TArray<FItemPtr> Folders;
+	for (const FItemPtr& Item : Tree->GetSelectedItems())
+	{
+		ItemPaths.Add(Item->Path);
+		if (Item->bFolder)
+		{
+			Folders.Add(Item);
+		}
+	}
 	FMenuBuilder Menu(true, nullptr);
 	if (bAnyMine)
 	{
@@ -272,18 +463,19 @@ TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 			FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Unlocked"), FUIAction(FExecuteAction::CreateSP(this, &SGitLocksView::Release, true)));
 	}
 	Menu.AddMenuEntry(LOCTEXT("BrowseMenu", "Show in Content Browser"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),
-		FUIAction(FExecuteAction::CreateLambda([this, Selected]()
-		{
-			if (const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin())
-			{
-				TArray<FString> Paths;
-				for (const FLockPtr& Lock : Selected)
-				{
-					Paths.Add(Lock->Path);
-				}
-				Model->BrowseTo(Paths);
-			}
-		})));
+		FUIAction(FExecuteAction::CreateLambda([this, Paths]() { if (const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin()) { Model->BrowseTo(Paths); } })));
+	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
+		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
+	if (!Folders.IsEmpty())
+	{
+		Menu.AddMenuSeparator();
+		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"), LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. (Alt+click)"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
+			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, true); } })));
+		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"), LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. (Alt+click)"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
+			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, false); } })));
+	}
 	return Menu.MakeWidget();
 }
 
@@ -297,7 +489,7 @@ void SGitLocksView::Release(bool bForce)
 	const GitCore::FSessionSnapshotRef Snapshot = Model->GetSnapshot();
 	TArray<FString> Paths;
 	TArray<FString> Changed;
-	for (const FLockPtr& Lock : List->GetSelectedItems())
+	for (const TSharedPtr<GitCore::FLockInfo>& Lock : SelectedLocks())
 	{
 		if (Lock->bOurs != bForce)
 		{

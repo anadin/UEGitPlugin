@@ -4,12 +4,16 @@
 #include "Editor/GitWorkspaceModel.h"
 #include "SGitDialogs.h"
 
+#include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "HAL/PlatformApplicationMisc.h"
 #include "RevisionControlStyle/RevisionControlStyle.h"
 #include "Styling/AppStyle.h"
+#include "Types/ISlateMetaData.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/Layout/SSplitter.h"
@@ -23,6 +27,7 @@ void SGitStashesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 {
 	WeakModel = InModel;
 	ChangedHandle = InModel->OnChanged().AddSP(this, &SGitStashesView::OnModelChanged);
+	bBuiltFolders = GitFileTree::ShowFolders();
 	auto HasSelection = [this]() { return Selection().IsValid() && WeakModel.IsValid() && !WeakModel.Pin()->IsBusy(); };
 
 	ChildSlot
@@ -87,9 +92,22 @@ void SGitStashesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 			[
 				SNew(SVerticalBox)
 				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(4.0f, 0.0f, 4.0f, 4.0f)
+				[
+					SAssignNew(SearchBox, SSearchBox)
+					.HintText(LOCTEXT("SearchHint", "Search stashes (Ctrl+F)"))
+					.OnTextChanged_Lambda([this](const FText& Text)
+					{
+						StashFilter = Text.ToString().TrimStartAndEnd();
+						ApplyStashFilter();
+					})
+				]
+				+ SVerticalBox::Slot()
 				.FillHeight(1.0f)
 				[
 					SAssignNew(List, SListView<FStashPtr>)
+					.AddMetaData<FTagMetaData>(TEXT("GitPanel.Stashes.List"))
 					.ListItemsSource(&Stashes)
 					.SelectionMode(ESelectionMode::Single)
 					.OnGenerateRow(this, &SGitStashesView::OnGenerateRow)
@@ -102,7 +120,11 @@ void SGitStashesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 				[
 					SNew(STextBlock)
 					.Visibility_Lambda([this]() { return Stashes.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
-					.Text(LOCTEXT("NoStashes", "No stashes. Stash your changes to switch tasks, sync, or try something without committing."))
+					.Text_Lambda([this]()
+					{
+						return AllStashes.IsEmpty() ? LOCTEXT("NoStashes", "No stashes. Stash your changes to switch tasks, sync, or try something without committing.")
+							: LOCTEXT("NoMatchingStashes", "No stash matches the search.");
+					})
 					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 					.AutoWrapText(true)
 				]
@@ -114,30 +136,58 @@ void SGitStashesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 				.BorderImage(FAppStyle::GetBrush("Brushes.Recessed"))
 				.Padding(6.0f)
 				[
-					SNew(SOverlay)
-					+ SOverlay::Slot()
-					.Padding(4.0f)
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 0.0f, 0.0f, 4.0f)
 					[
-						SNew(STextBlock)
-						.Visibility_Lambda([this]() { return SelectedPaths.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
-						.Text(LOCTEXT("SelectStash", "Select a stash to see its files."))
-						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-						.AutoWrapText(true)
+						SNew(SHorizontalBox)
+						.Visibility_Lambda([this]() { return StashPaths.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible; })
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.0f)
+						[
+							SNew(SSearchBox)
+							.HintText_Lambda([this]() { return FText::Format(LOCTEXT("FileSearchHint", "Filter {0} {0}|plural(one=file,other=files)"), StashPaths.Num()); })
+							.OnTextChanged_Lambda([this](const FText& Text)
+							{
+								FileFilter = Text.ToString().TrimStartAndEnd();
+								RebuildFiles();
+							})
+						]
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+						[
+							GitFileTree::MakeFoldersToggle()
+						]
 					]
-					+ SOverlay::Slot()
+					+ SVerticalBox::Slot()
+					.FillHeight(1.0f)
 					[
-					SAssignNew(PathList, SListView<TSharedPtr<FString>>)
-					.ListItemsSource(&SelectedPaths)
-					.SelectionMode(ESelectionMode::None)
-					.OnGenerateRow_Lambda([](TSharedPtr<FString> Path, const TSharedRef<STableViewBase>& Owner)
-					{
-						return SNew(STableRow<TSharedPtr<FString>>, Owner)
-							[
-								SNew(STextBlock)
-								.Text(FText::FromString(*Path))
-								.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
-							];
-					})
+						SNew(SOverlay)
+						+ SOverlay::Slot()
+						.Padding(4.0f)
+						[
+							SNew(STextBlock)
+							.Visibility_Lambda([this]() { return StashPaths.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+							.Text(LOCTEXT("SelectStash", "Select a stash to see its files."))
+							.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+							.AutoWrapText(true)
+						]
+						+ SOverlay::Slot()
+						[
+							SAssignNew(FileTree, STreeView<FPathItemPtr>)
+							.Visibility_Lambda([this]() { return StashPaths.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible; })
+							.TreeItemsSource(&Files)
+							.SelectionMode(ESelectionMode::Multi)
+							.OnGenerateRow(this, &SGitStashesView::OnGenerateFileRow)
+							.OnGetChildren(this, &SGitStashesView::OnGetFileChildren)
+							.OnExpansionChanged(this, &SGitStashesView::OnFileExpansionChanged)
+							.OnSetExpansionRecursive(this, &SGitStashesView::OnSetFileExpansionRecursive)
+							.OnMouseButtonDoubleClick(this, &SGitStashesView::OnFileDoubleClick)
+							.OnContextMenuOpening(this, &SGitStashesView::OnFileMenu)
+						]
 					]
 				]
 			]
@@ -154,6 +204,24 @@ SGitStashesView::~SGitStashesView()
 	}
 }
 
+void SGitStashesView::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
+{
+	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+	// The folders preference is shared with the other tabs.
+	if (GitFileTree::ShowFolders() != bBuiltFolders)
+	{
+		RebuildFiles();
+	}
+}
+
+void SGitStashesView::FocusSearch()
+{
+	if (SearchBox.IsValid())
+	{
+		FSlateApplication::Get().SetKeyboardFocus(SearchBox, EFocusCause::SetDirectly);
+	}
+}
+
 void SGitStashesView::OnModelChanged()
 {
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
@@ -167,26 +235,34 @@ void SGitStashesView::OnModelChanged()
 		return;
 	}
 	BuiltGeneration = Snapshot->Generation;
-	const FString SelectedOid = Selection().IsValid() ? Selection()->Oid : FString();
-	Stashes.Reset();
-	FStashPtr Reselect;
+	AllStashes.Reset();
 	for (const GitCore::FStashEntry& Stash : Snapshot->Stashes)
 	{
-		Stashes.Add(MakeShared<GitCore::FStashEntry>(Stash));
-		if (Stash.Oid == SelectedOid)
-		{
-			Reselect = Stashes.Last();
-		}
+		AllStashes.Add(MakeShared<GitCore::FStashEntry>(Stash));
 	}
+	ApplyStashFilter();
+}
+
+void SGitStashesView::ApplyStashFilter()
+{
+	const FStashPtr Current = Selection();
+	const FString SelectedOid = Current.IsValid() ? Current->Oid : FString();
+	Stashes = AllStashes.FilterByPredicate([this](const FStashPtr& Stash) { return StashFilter.IsEmpty() || Stash->Message.Contains(StashFilter); });
 	List->RequestListRefresh();
-	if (Reselect.IsValid())
+	if (Current.IsValid() && Stashes.Contains(Current))
 	{
-		List->SetSelection(Reselect, ESelectInfo::Direct);
+		// Still listed: its files are already shown.
+		return;
+	}
+	if (const FStashPtr* Reselect = Stashes.FindByPredicate([&SelectedOid](const FStashPtr& Stash) { return Stash->Oid == SelectedOid; }))
+	{
+		List->SetSelection(*Reselect, ESelectInfo::Direct);
 	}
 	else
 	{
-		SelectedPaths.Reset();
-		PathList->RequestListRefresh();
+		List->ClearSelection();
+		StashPaths.Reset();
+		RebuildFiles();
 	}
 }
 
@@ -198,8 +274,8 @@ SGitStashesView::FStashPtr SGitStashesView::Selection() const
 
 void SGitStashesView::OnSelected(FStashPtr Stash, ESelectInfo::Type SelectInfo)
 {
-	SelectedPaths.Reset();
-	PathList->RequestListRefresh();
+	StashPaths.Reset();
+	RebuildFiles();
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
 	if (!Stash.IsValid() || !Model.IsValid())
 	{
@@ -212,12 +288,47 @@ void SGitStashesView::OnSelected(FStashPtr Stash, ESelectInfo::Type SelectInfo)
 		{
 			return;
 		}
-		for (FString& Path : Paths)
-		{
-			Self->SelectedPaths.Add(MakeShared<FString>(MoveTemp(Path)));
-		}
-		Self->PathList->RequestListRefresh();
+		Self->StashPaths = MoveTemp(Paths);
+		Self->RebuildFiles();
 	});
+}
+
+void SGitStashesView::RebuildFiles()
+{
+	if (!FileTree.IsValid())
+	{
+		return;
+	}
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	bBuiltFolders = GitFileTree::ShowFolders();
+	TArray<TPair<FString, FPathItemPtr>> Named;
+	for (const FString& Path : StashPaths)
+	{
+		const FString Name = Displays.Get(Model.Get(), Path).Name.ToString();
+		if (!FileFilter.IsEmpty() && !Path.Contains(FileFilter) && !Name.Contains(FileFilter))
+		{
+			continue;
+		}
+		const FPathItemPtr Item = MakeShared<FGitPathItem>();
+		Item->Path = Path;
+		// In folders, files go by the name shown; a flat list goes by path.
+		Named.Emplace(bBuiltFolders ? Name : Path, Item);
+	}
+	Named.Sort([](const TPair<FString, FPathItemPtr>& A, const TPair<FString, FPathItemPtr>& B)
+	{
+		const int32 Order = A.Key.Compare(B.Key, ESearchCase::IgnoreCase);
+		return Order != 0 ? Order < 0 : A.Value->Path < B.Value->Path;
+	});
+	TArray<FPathItemPtr> Flat;
+	for (const TPair<FString, FPathItemPtr>& Pair : Named)
+	{
+		Flat.Add(Pair.Value);
+	}
+	Files = GitFileTree::Build(Flat, bBuiltFolders);
+	bRestoringExpansion = true;
+	GitFileTree::RestoreExpansion(*FileTree, Files, CollapsedFolders, !FileFilter.IsEmpty());
+	bRestoringExpansion = false;
+	FileTree->RequestTreeRefresh();
 }
 
 TSharedRef<ITableRow> SGitStashesView::OnGenerateRow(FStashPtr Stash, const TSharedRef<STableViewBase>& Owner)
@@ -251,6 +362,7 @@ TSharedRef<ITableRow> SGitStashesView::OnGenerateRow(FStashPtr Stash, const TSha
 			[
 				SNew(STextBlock)
 				.Text(FText::FromString(Message))
+				.HighlightText(this, &SGitStashesView::GetStashFilterText)
 				.ToolTipText(FText::FromString(Stash->Message))
 				.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
 			]
@@ -261,9 +373,67 @@ TSharedRef<ITableRow> SGitStashesView::OnGenerateRow(FStashPtr Stash, const TSha
 			[
 				SNew(STextBlock)
 				.Text(Branch.IsEmpty() ? FText::GetEmpty() : FText::Format(LOCTEXT("StashBranch", "on {0}"), FText::FromString(Branch)))
+				.HighlightText(this, &SGitStashesView::GetStashFilterText)
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 			]
 		];
+}
+
+TSharedRef<ITableRow> SGitStashesView::OnGenerateFileRow(FPathItemPtr Item, const TSharedRef<STableViewBase>& Owner)
+{
+	const TSharedRef<GitFileTree::STreeRow<FGitPathItem>> Row = SNew(GitFileTree::STreeRow<FGitPathItem>, Owner).Item(Item);
+	const TAttribute<FText> Highlight(this, &SGitStashesView::GetFileFilterText);
+	if (Item->bFolder)
+	{
+		Row->SetCell(GitFileTree::MakeNameCell(Row, true, FText::FromString(Item->Label), FText::AsNumber(Item->FileCount), nullptr,
+			FText::Format(LOCTEXT("FolderTooltip", "{0}\n{1} {1}|plural(one=file,other=files). Alt+click opens or closes everything in it."), FText::FromString(Item->Path), Item->FileCount),
+			Highlight));
+		return Row;
+	}
+	const FGitFileDisplay& Display = Displays.Get(WeakModel.Pin().Get(), Item->Path);
+	Row->SetCell(GitFileTree::MakeNameCell(Row, false, Display.Name, bBuiltFolders ? FText::GetEmpty() : Display.Folder, Display.Icon,
+		FText::FromString(Item->Path), Highlight));
+	return Row;
+}
+
+void SGitStashesView::OnGetFileChildren(FPathItemPtr Item, TArray<FPathItemPtr>& OutChildren) const
+{
+	if (Item.IsValid())
+	{
+		OutChildren = Item->Children;
+	}
+}
+
+void SGitStashesView::OnFileExpansionChanged(FPathItemPtr Item, bool bExpanded)
+{
+	if (!Item.IsValid() || !Item->bFolder || bRestoringExpansion)
+	{
+		return;
+	}
+	if (bExpanded)
+	{
+		CollapsedFolders.Remove(Item->Path);
+	}
+	else
+	{
+		CollapsedFolders.Add(Item->Path);
+	}
+}
+
+void SGitStashesView::OnSetFileExpansionRecursive(FPathItemPtr Item, bool bExpand)
+{
+	if (FileTree.IsValid())
+	{
+		GitFileTree::SetExpansionRecursive(*FileTree, Item, bExpand);
+	}
+}
+
+void SGitStashesView::OnFileDoubleClick(FPathItemPtr Item)
+{
+	if (Item.IsValid() && Item->bFolder)
+	{
+		FileTree->SetItemExpansion(Item, !FileTree->IsItemExpanded(Item));
+	}
 }
 
 TSharedPtr<SWidget> SGitStashesView::OnContextMenu()
@@ -280,6 +450,46 @@ TSharedPtr<SWidget> SGitStashesView::OnContextMenu()
 	Menu.AddMenuSeparator();
 	Menu.AddMenuEntry(LOCTEXT("DropMenu", "Delete…"), LOCTEXT("DropMenuTooltip", "Throw these changes away."), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Delete"),
 		FUIAction(FExecuteAction::CreateSP(this, &SGitStashesView::Drop)));
+	return Menu.MakeWidget();
+}
+
+TSharedPtr<SWidget> SGitStashesView::OnFileMenu()
+{
+	const TArray<FPathItemPtr> Picked = FileTree->GetSelectedItems();
+	if (Picked.IsEmpty())
+	{
+		return nullptr;
+	}
+	TArray<FString> FilePaths;
+	for (const FPathItemPtr& File : GitFileTree::SelectedFiles(Picked))
+	{
+		FilePaths.Add(File->Path);
+	}
+	TArray<FString> ItemPaths;
+	TArray<FPathItemPtr> Folders;
+	for (const FPathItemPtr& Item : Picked)
+	{
+		ItemPaths.Add(Item->Path);
+		if (Item->bFolder)
+		{
+			Folders.Add(Item);
+		}
+	}
+	FMenuBuilder Menu(true, nullptr);
+	Menu.AddMenuEntry(LOCTEXT("BrowseMenu", "Show in Content Browser"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),
+		FUIAction(FExecuteAction::CreateLambda([this, FilePaths]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->BrowseTo(FilePaths); } })));
+	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
+		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
+	if (!Folders.IsEmpty())
+	{
+		Menu.AddMenuSeparator();
+		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"), LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. (Alt+click)"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
+			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FPathItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, true); } })));
+		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"), LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. (Alt+click)"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
+			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FPathItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, false); } })));
+	}
 	return Menu.MakeWidget();
 }
 
@@ -317,13 +527,8 @@ void SGitStashesView::Drop()
 	{
 		return;
 	}
-	TArray<FString> Paths;
-	for (const TSharedPtr<FString>& Path : SelectedPaths)
-	{
-		Paths.Add(*Path);
-	}
 	if (GitWorkspaceDialogs::Confirm(LOCTEXT("DropTitle", "Delete stash"),
-		FText::Format(LOCTEXT("DropMessage", "Delete \"{0}\"? Its changes cannot be recovered."), FText::FromString(Stash->Message)), Paths, LOCTEXT("DropButton", "Delete")))
+		FText::Format(LOCTEXT("DropMessage", "Delete \"{0}\"? Its changes cannot be recovered."), FText::FromString(Stash->Message)), StashPaths, LOCTEXT("DropButton", "Delete")))
 	{
 		Model->DropStash(Stash->Selector);
 	}

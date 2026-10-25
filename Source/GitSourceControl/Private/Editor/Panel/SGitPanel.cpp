@@ -105,11 +105,11 @@ void SGitPanel::Construct(const FArguments& InArgs, const TSharedRef<FGitWorkspa
 				]
 				+ SWidgetSwitcher::Slot()
 				[
-					SNew(SGitStashesView, InModel)
+					SAssignNew(StashesView, SGitStashesView, InModel)
 				]
 				+ SWidgetSwitcher::Slot()
 				[
-					SNew(SGitLocksView, InModel)
+					SAssignNew(LocksView, SGitLocksView, InModel)
 				]
 			]
 		]
@@ -636,6 +636,25 @@ FReply SGitPanel::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyE
 	}
 	if (InKeyEvent.IsControlDown() || InKeyEvent.IsCommandDown())
 	{
+		if (Key == EKeys::F)
+		{
+			switch (Tab)
+			{
+			case ETab::Changes:
+				ChangesView->FocusSearch();
+				break;
+			case ETab::History:
+				HistoryView->FocusSearch();
+				break;
+			case ETab::Stashes:
+				StashesView->FocusSearch();
+				break;
+			case ETab::Locks:
+				LocksView->FocusSearch();
+				break;
+			}
+			return FReply::Handled();
+		}
 		const TArray<FKey> TabKeys = {EKeys::One, EKeys::Two, EKeys::Three, EKeys::Four};
 		const int32 Index = TabKeys.IndexOfByKey(Key);
 		if (Index != INDEX_NONE)

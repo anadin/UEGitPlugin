@@ -7,6 +7,8 @@
 class FGitWorkspaceModel;
 class SGitChangesView;
 class SGitHistoryView;
+class SGitLocksView;
+class SGitStashesView;
 
 /**
  * The Git panel: one toolbar row (branch, sync state, Fetch / Sync / Push), an error banner
@@ -56,4 +58,6 @@ private:
 	ETab Tab = ETab::Changes;
 	TSharedPtr<SGitChangesView> ChangesView;
 	TSharedPtr<SGitHistoryView> HistoryView;
+	TSharedPtr<SGitStashesView> StashesView;
+	TSharedPtr<SGitLocksView> LocksView;
 };

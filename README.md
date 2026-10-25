@@ -67,16 +67,22 @@ Open it with **Window > Git**, the branch button in the status bar, **Revision C
 
 - **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Sync** and **Push**. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
 - **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Lock, Release lock and Discard changes.
-- **History**: commits on your branch (unpushed ones are marked); select one to see its files and compare a file with its previous version.
-- **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes.
-- **Locks**: every lock on the server, yours first. Release your own locks, or someone else's when they cannot.
+- **History**: commits on your branch (unpushed ones are marked), searchable by summary, author or commit id; select one to see its files and compare a file with its previous version.
+- **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes. Search them by name.
+- **Locks**: every lock on the server, yours first, searchable by file or owner. Release your own locks, or someone else's when they cannot.
+
+Every file list shows files in their folders. Folders that only hold one folder share a row (`Source/Demo`), and World Partition actors sit under their level, without the hash folders. Selecting a folder selects its files: Stage, Discard, Lock and Release act on all of them. Alt+click a folder (Option+click on macOS), or Shift+click its arrow, to open or close everything in it. The folder button next to each search box switches every list between folders and one list of paths.
+
+Each tab has a search box (Ctrl+F); matches are highlighted and their folders open. The files of a commit or stash have their own filter.
 
 Switching branches and restoring stashes refuse to overwrite local edits, download Git LFS files first, and reload any open assets that change.
 
 | Key | Action |
 | --- | --- |
+| Ctrl+F | Search the current tab |
 | Space | Stage or unstage the selected files |
-| Enter / double-click | Compare an edited file, or open a new one |
+| Enter / double-click | Compare an edited file, or open a new one; open or close a folder |
+| Left / Right | Close or open a folder (with Shift: everything in it) |
 | Ctrl+D | Compare with the last commit |
 | Delete | Discard changes to the selected files |
 | Ctrl+Enter | Commit (Ctrl+Shift+Enter: commit and push) |
@@ -93,7 +99,7 @@ On macOS, use Cmd instead of Ctrl.
 - **Use Git LFS locks**: turn Check Out locking on or off for this project.
 - **Lock server remote**: the remote whose LFS server holds locks; empty uses the branch's upstream remote (usually `origin`).
 
-**Editor Preferences > Revision Control > Git Workspace** (per user): how often status, locks and the server are checked (background fetching can be turned off), whether Check in pushes, and how many revert backups to keep.
+**Editor Preferences > Revision Control > Git Workspace** (per user): how often status, locks and the server are checked (background fetching can be turned off), whether Check in pushes, how many revert backups to keep, and whether the Git panel shows folders.
 
 ## Troubleshooting
 
