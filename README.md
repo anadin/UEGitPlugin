@@ -75,7 +75,7 @@ Every file list shows files in their folders. Folders that only hold one folder 
 
 Each tab has a search box (Ctrl+F); matches are highlighted and their folders open. The files of a commit or stash have their own filter.
 
-Text changes are colored: added lines green, removed lines red, and in an edited line the part that changed is highlighted. Each line shows its old and new line number; select lines and press Ctrl+C to copy them. **Compare** (Ctrl+D) opens the same view in its own window. For Unreal assets, Compare opens Unreal's own diff instead: Blueprints (including Animation and Widget Blueprints), materials, data tables, curves, behavior trees and other types with a diff view show their own comparison, and other assets open as text in the **Tool for diffing text** set under Editor Preferences > Loading & Saving. New and deleted assets, and World Partition actors on their own, cannot be compared.
+Text changes are colored: added lines green, removed lines red, and in an edited line the part that changed is highlighted. Each line shows its old and new line number; select lines and press Ctrl+C to copy them. **Wrap lines**, above each diff next to the count of added and removed lines, wraps long lines instead of scrolling sideways, in every diff view. **Compare** (Ctrl+D) opens the same view in its own window. For Unreal assets, Compare opens Unreal's own diff instead: Blueprints (including Animation and Widget Blueprints), materials, data tables, curves, behavior trees and other types with a diff view show their own comparison, and other assets open as text in the **Tool for diffing text** set under Editor Preferences > Loading & Saving. New and deleted assets, and World Partition actors on their own, cannot be compared.
 
 Switching branches and restoring stashes refuse to overwrite local edits, download Git LFS files first, and reload any open assets that change.
 
@@ -102,7 +102,7 @@ On macOS, use Cmd instead of Ctrl.
 - **Use Git LFS locks**: turn Check Out locking on or off for this project.
 - **Lock server remote**: the remote whose LFS server holds locks; empty uses the branch's upstream remote (usually `origin`).
 
-**Editor Preferences > Revision Control > Git Workspace** (per user): how often status, locks and the server are checked (background fetching can be turned off), whether Check in pushes, how many revert backups to keep, and whether the Git panel shows folders.
+**Editor Preferences > Revision Control > Git Workspace** (per user): how often status, locks and the server are checked (background fetching can be turned off), whether Check in pushes, how many revert backups to keep, whether the Git panel shows folders, and whether diffs wrap long lines.
 
 ## Troubleshooting
 

@@ -351,6 +351,18 @@ bool FGitPanelTextDiffTest::RunTest(const FString&)
 	TestTrue(TEXT("A new file is all added lines"), NewFile.Num() == 3 && NewFile[1]->Kind == EKind::Added && NewFile[1]->NewLine == 1 && NewFile[2]->Text == TEXT("two"));
 	const TArray<TSharedPtr<FGitDiffLine>> NewBinary = GitDiff::Parse(GitDiff::FromNewFile({0x89, 'P', 'N', 'G', 0, 1}));
 	TestTrue(TEXT("A new binary file is one note"), NewBinary.Num() == 1 && NewBinary[0]->Kind == EKind::Note);
+
+	// Lines are shown as rich text, so code must not read as markup.
+	FGitDiffLine Code;
+	Code.Kind = EKind::Added;
+	Code.Text = TEXT("if (A < B && C > \"D\")");
+	Code.ChangeStart = 4;
+	Code.ChangeEnd = 5;
+	TestEqual(TEXT("Rich text escapes code and tags the changed part"), GitDiff::ToMarkup(Code), FString(TEXT("if (<add>A</> &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
+	Code.Kind = EKind::Removed;
+	TestEqual(TEXT("A removed line's change is tagged del"), GitDiff::ToMarkup(Code), FString(TEXT("if (<del>A</> &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
+	Code.Kind = EKind::Context;
+	TestEqual(TEXT("Context lines carry no tags"), GitDiff::ToMarkup(Code), FString(TEXT("if (A &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
 	return true;
 }
 
@@ -414,6 +426,7 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		TUniquePtr<FPanelFixture> Panel;
 		TSharedPtr<SWindow> Window;
 		TSharedPtr<SGitPanel> Widget;
+		bool bWrapWas = false;
 		FString Folder = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Automation/GitWorkspace/Screenshots"));
 
 		explicit FState(FAutomationTestBase& Test)
@@ -497,7 +510,17 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		}
 		State->Widget->ShowPaths({TEXT("Config/DefaultGame.ini")});
 	}, 1.0f));
-	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-diff")); }, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("changes-diff"));
+		State->bWrapWas = GetDefault<UGitSourceControlUserSettings>()->bWrapDiffLines;
+		GetMutableDefault<UGitSourceControlUserSettings>()->bWrapDiffLines = true;
+	}, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("changes-diff-wrapped"));
+		GetMutableDefault<UGitSourceControlUserSettings>()->bWrapDiffLines = State->bWrapWas;
+	}, 1.0f));
 	// Resize takes screen pixels; sizes here are Slate units.
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Window->Resize(FVector2D(460.0f, 680.0f) * State->Window->GetDPIScaleFactor()); }, 0.1f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-narrow")); }, 1.0f));

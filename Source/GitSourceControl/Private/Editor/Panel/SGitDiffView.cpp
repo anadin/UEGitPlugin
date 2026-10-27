@@ -1,20 +1,28 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "SGitDiffView.h"
 
+#include "Provider/GitSourceControlUserSettings.h"
+
 #include "Fonts/FontMeasure.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "Framework/Text/ILayoutBlock.h"
+#include "Framework/Text/ITextDecorator.h"
+#include "Framework/Text/SlateTextRun.h"
 #include "HAL/PlatformApplicationMisc.h"
 #include "Misc/FileHelper.h"
+#include "Rendering/DrawElements.h"
 #include "Rendering/SlateRenderer.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
+#include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SScrollBar.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SOverlay.h"
+#include "Widgets/Text/SRichTextBlock.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/STableRow.h"
 
@@ -108,6 +116,82 @@ namespace
 	{
 		return Text.StartsWith(TEXT("version https://git-lfs.github.com/spec/")) || Text.StartsWith(TEXT("oid sha256:")) || Text.StartsWith(TEXT("size "));
 	}
+
+	FString EscapeMarkup(const FString& Text)
+	{
+		return Text.Replace(TEXT("&"), TEXT("&amp;")).Replace(TEXT("<"), TEXT("&lt;")).Replace(TEXT(">"), TEXT("&gt;")).Replace(TEXT("\""), TEXT("&quot;"));
+	}
+
+	/** Text on a tinted background; each wrapped piece paints its own. */
+	class FTintedRun : public FSlateTextRun
+	{
+	public:
+		static TSharedRef<FTintedRun> Create(const FRunInfo& InRunInfo, const TSharedRef<const FString>& InText, const FTextBlockStyle& InStyle, const FTextRange& InRange,
+			const FLinearColor& InTint)
+		{
+			return MakeShareable(new FTintedRun(InRunInfo, InText, InStyle, InRange, InTint));
+		}
+
+		virtual int32 OnPaint(const FPaintArgs& PaintArgs, const FTextArgs& TextArgs, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
+			FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
+		{
+			// Block sizes and offsets are pre-scaled, as in FSlateTextRun::OnPaint.
+			const float InverseScale = Inverse(AllottedGeometry.Scale);
+			const TSharedRef<ILayoutBlock>& Block = TextArgs.Block;
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
+				AllottedGeometry.ToPaintGeometry(TransformVector(InverseScale, Block->GetSize()), FSlateLayoutTransform(TransformPoint(InverseScale, Block->GetLocationOffset()))),
+				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, Tint);
+			return FSlateTextRun::OnPaint(PaintArgs, TextArgs, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1, InWidgetStyle, bParentEnabled);
+		}
+
+		virtual TSharedRef<IRun> Clone() const override
+		{
+			return MakeShareable(new FTintedRun(*this));
+		}
+
+	private:
+		FTintedRun(const FRunInfo& InRunInfo, const TSharedRef<const FString>& InText, const FTextBlockStyle& InStyle, const FTextRange& InRange, const FLinearColor& InTint)
+			: FSlateTextRun(InRunInfo, InText, InStyle, InRange)
+			, Tint(InTint)
+		{
+		}
+
+		FTintedRun(const FTintedRun& Other) = default;
+
+		FLinearColor Tint;
+	};
+
+	/** Makes <add> and <del> runs: the changed part of an added or removed line. */
+	class FTintDecorator : public ITextDecorator
+	{
+	public:
+		FTintDecorator(const FString& InName, const FTextBlockStyle& InStyle, const FLinearColor& InTint)
+			: Name(InName)
+			, Style(InStyle)
+			, Tint(InTint)
+		{
+		}
+
+		virtual bool Supports(const FTextRunParseResults& RunParseResult, const FString& Text) const override
+		{
+			return RunParseResult.Name == Name;
+		}
+
+		virtual TSharedRef<ISlateRun> Create(const TSharedRef<FTextLayout>& TextLayout, const FTextRunParseResults& RunParseResult, const FString& OriginalText,
+			const TSharedRef<FString>& InOutModelText, const ISlateStyle* SlateStyle) override
+		{
+			FTextRange ModelRange;
+			ModelRange.BeginIndex = InOutModelText->Len();
+			*InOutModelText += OriginalText.Mid(RunParseResult.ContentRange.BeginIndex, RunParseResult.ContentRange.Len());
+			ModelRange.EndIndex = InOutModelText->Len();
+			return FTintedRun::Create(FRunInfo(RunParseResult.Name), InOutModelText, Style, ModelRange, Tint);
+		}
+
+	private:
+		FString Name;
+		FTextBlockStyle Style;
+		FLinearColor Tint;
+	};
 }
 
 TArray<TSharedPtr<FGitDiffLine>> GitDiff::Parse(const FString& UnifiedDiff)
@@ -244,9 +328,41 @@ FString GitDiff::FromNewFile(const TArray<uint8>& Bytes)
 	return Diff;
 }
 
+FString GitDiff::ToMarkup(const FGitDiffLine& Line)
+{
+	if (!Line.HasChange() || (Line.Kind != FGitDiffLine::EKind::Added && Line.Kind != FGitDiffLine::EKind::Removed))
+	{
+		return EscapeMarkup(Line.Text);
+	}
+	const TCHAR* Tag = Line.Kind == FGitDiffLine::EKind::Added ? TEXT("add") : TEXT("del");
+	return EscapeMarkup(Line.Text.Left(Line.ChangeStart))
+		+ FString::Printf(TEXT("<%s>"), Tag) + EscapeMarkup(Line.Text.Mid(Line.ChangeStart, Line.ChangeEnd - Line.ChangeStart)) + TEXT("</>")
+		+ EscapeMarkup(Line.Text.Mid(Line.ChangeEnd));
+}
+
+bool GitDiff::WrapLines()
+{
+	return GetDefault<UGitSourceControlUserSettings>()->bWrapDiffLines;
+}
+
+void GitDiff::SetWrapLines(bool bWrap)
+{
+	UGitSourceControlUserSettings* Settings = GetMutableDefault<UGitSourceControlUserSettings>();
+	if (Settings->bWrapDiffLines != bWrap)
+	{
+		Settings->bWrapDiffLines = bWrap;
+		Settings->SaveConfig();
+	}
+}
+
 void SGitDiffView::Construct(const FArguments& InArgs)
 {
 	Font = FCoreStyle::GetDefaultFontStyle("Mono", 9);
+	TextStyle = FTextBlockStyle(FAppStyle::GetWidgetStyle<FTextBlockStyle>("NormalText")).SetFont(Font).SetColorAndOpacity(FSlateColor::UseForeground());
+	NoteStyle = FTextBlockStyle(TextStyle).SetColorAndOpacity(FSlateColor::UseSubduedForeground());
+	AddedDecorator = MakeShared<FTintDecorator>(TEXT("add"), TextStyle, AddedPart);
+	RemovedDecorator = MakeShared<FTintDecorator>(TEXT("del"), TextStyle, RemovedPart);
+	bBuiltWrapped = GitDiff::WrapLines();
 	if (FSlateApplication::IsInitialized() && FSlateApplication::Get().GetRenderer())
 	{
 		CharWidth = FSlateApplication::Get().GetRenderer()->GetFontMeasureService()->Measure(TEXT("0000000000"), Font).X / 10.0f;
@@ -261,6 +377,47 @@ void SGitDiffView::Construct(const FArguments& InArgs)
 		[
 			SNew(SVerticalBox)
 			.Visibility_Lambda([this]() { return Message.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+			// How much changed, and the wrap switch.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(4.0f, 2.0f)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				[
+					SNew(STextBlock)
+					.Font(Font)
+					.ColorAndOpacity(AddedMarker)
+					.Text_Lambda([this]() { return FText::Format(INVTEXT("+{0}"), AddedCount); })
+					.ToolTipText(LOCTEXT("AddedCountTooltip", "Lines added"))
+				]
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
+				.VAlign(VAlign_Center)
+				.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+				[
+					SNew(STextBlock)
+					.Font(Font)
+					.ColorAndOpacity(RemovedMarker)
+					.Text_Lambda([this]() { return FText::Format(INVTEXT("\u2212{0}"), RemovedCount); })
+					.ToolTipText(LOCTEXT("RemovedCountTooltip", "Lines removed"))
+				]
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				[
+					SNew(SCheckBox)
+					.ToolTipText(LOCTEXT("WrapTooltip", "Wrap long lines instead of scrolling sideways. Applies to every diff."))
+					.IsChecked_Lambda([]() { return GitDiff::WrapLines() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([](ECheckBoxState State) { GitDiff::SetWrapLines(State == ECheckBoxState::Checked); })
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("WrapLines", "Wrap lines"))
+					]
+				]
+			]
 			+ SVerticalBox::Slot()
 			.FillHeight(1.0f)
 			[
@@ -268,14 +425,14 @@ void SGitDiffView::Construct(const FArguments& InArgs)
 				+ SHorizontalBox::Slot()
 				.FillWidth(1.0f)
 				[
-					// Long lines scroll sideways; the gutter scrolls with them.
+					// Long lines scroll sideways unless they wrap; the gutter scrolls with them.
 					SAssignNew(Scroll, SScrollBox)
 					.Orientation(Orient_Horizontal)
 					.ExternalScrollbar(Horizontal)
 					+ SScrollBox::Slot()
 					[
 						SNew(SBox)
-						.MinDesiredWidth_Lambda([this]() { return FOptionalSize(GetContentWidth()); })
+						.WidthOverride(this, &SGitDiffView::GetContentWidth)
 						[
 							SAssignNew(List, SListView<FLinePtr>)
 							.ListItemsSource(&Lines)
@@ -296,7 +453,11 @@ void SGitDiffView::Construct(const FArguments& InArgs)
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			[
-				Horizontal
+				SNew(SBox)
+				.Visibility_Lambda([]() { return GitDiff::WrapLines() ? EVisibility::Collapsed : EVisibility::Visible; })
+				[
+					Horizontal
+				]
 			]
 		]
 		+ SOverlay::Slot()
@@ -324,10 +485,14 @@ void SGitDiffView::SetDiff(const FString& UnifiedDiff)
 	}
 	int32 HighestLine = 0;
 	LongestLine = 0;
+	AddedCount = 0;
+	RemovedCount = 0;
 	for (const FLinePtr& Line : Lines)
 	{
 		HighestLine = FMath::Max3(HighestLine, Line->OldLine, Line->NewLine);
 		LongestLine = FMath::Max(LongestLine, Line->Text.Len());
+		AddedCount += Line->Kind == FGitDiffLine::EKind::Added ? 1 : 0;
+		RemovedCount += Line->Kind == FGitDiffLine::EKind::Removed ? 1 : 0;
 	}
 	GutterWidth = (FString::FromInt(FMath::Max(HighestLine, 99)).Len() + 1) * CharWidth + 6.0f;
 	Message = Lines.IsEmpty() ? LOCTEXT("NoDifferences", "No differences.") : FText::GetEmpty();
@@ -343,39 +508,58 @@ void SGitDiffView::SetMessage(const FText& InMessage)
 	List->RequestListRefresh();
 }
 
-float SGitDiffView::GetContentWidth() const
+float SGitDiffView::GetViewportWidth() const
 {
-	const float Content = GutterWidth * 2.0f + CharWidth * (LongestLine + 4);
-	return FMath::Max(Content, Scroll.IsValid() ? static_cast<float>(Scroll->GetCachedGeometry().GetLocalSize().X) : 0.0f);
+	return Scroll.IsValid() ? static_cast<float>(Scroll->GetCachedGeometry().GetLocalSize().X) : 0.0f;
+}
+
+FOptionalSize SGitDiffView::GetContentWidth() const
+{
+	const float Viewport = GetViewportWidth();
+	if (bBuiltWrapped)
+	{
+		// Before the first layout the width is unknown; the rows wrap once it is.
+		return Viewport > 0.0f ? FOptionalSize(Viewport) : FOptionalSize();
+	}
+	return FMath::Max(GutterWidth * 2.0f + CharWidth * (LongestLine + 4), Viewport);
+}
+
+void SGitDiffView::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
+{
+	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+	// The wrap preference is shared by every diff view.
+	if (GitDiff::WrapLines() != bBuiltWrapped)
+	{
+		bBuiltWrapped = GitDiff::WrapLines();
+		List->RebuildList();
+		Scroll->ScrollToStart();
+	}
 }
 
 TSharedRef<ITableRow> SGitDiffView::OnGenerateRow(FLinePtr Line, const TSharedRef<STableViewBase>& Owner)
 {
 	FLinearColor Background = FLinearColor::Transparent;
-	FLinearColor Part = FLinearColor::Transparent;
 	FText Marker;
 	FSlateColor MarkerColor = FSlateColor::UseSubduedForeground();
-	FSlateColor TextColor = FSlateColor::UseForeground();
+	bool bNote = false;
 	switch (Line->Kind)
 	{
 	case FGitDiffLine::EKind::Added:
 		Background = AddedLine;
-		Part = AddedPart;
 		Marker = INVTEXT("+");
 		MarkerColor = AddedMarker;
 		break;
 	case FGitDiffLine::EKind::Removed:
 		Background = RemovedLine;
-		Part = RemovedPart;
 		Marker = INVTEXT("-");
 		MarkerColor = RemovedMarker;
 		break;
 	case FGitDiffLine::EKind::Hunk:
 		Background = HunkLine;
-		TextColor = FSlateColor::UseSubduedForeground();
+		bNote = true;
 		break;
 	case FGitDiffLine::EKind::Note:
-		TextColor = FSlateColor::UseSubduedForeground();
+		bNote = true;
 		break;
 	default:
 		break;
@@ -393,34 +577,15 @@ TSharedRef<ITableRow> SGitDiffView::OnGenerateRow(FLinePtr Line, const TSharedRe
 				.Text(Value > 0 ? FText::AsNumber(Value, &FNumberFormattingOptions::DefaultNoGrouping()) : FText::GetEmpty())
 			];
 	};
-	auto Segment = [this, &TextColor](const FString& Text)
-	{
-		return SNew(STextBlock)
-			.Font(Font)
-			.ColorAndOpacity(TextColor)
-			.Text(FText::FromString(Text));
-	};
-	const TSharedRef<SHorizontalBox> Content = SNew(SHorizontalBox);
-	if (Line->HasChange())
-	{
-		// The unchanged start, the part that changed on a stronger tint, the unchanged end.
-		Content->AddSlot().AutoWidth()[Segment(Line->Text.Left(Line->ChangeStart))];
-		Content->AddSlot().AutoWidth()
-		[
-			SNew(SBorder)
-			.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
-			.BorderBackgroundColor(Part)
-			.Padding(0.0f)
-			[
-				Segment(Line->Text.Mid(Line->ChangeStart, Line->ChangeEnd - Line->ChangeStart))
-			]
-		];
-		Content->AddSlot().AutoWidth()[Segment(Line->Text.Mid(Line->ChangeEnd))];
-	}
-	else
-	{
-		Content->AddSlot().AutoWidth()[Segment(Line->Text)];
-	}
+	// Rich text, so the changed part keeps its tint when the line wraps.
+	const FString Markup = GitDiff::ToMarkup(*Line);
+	const TSharedRef<SWidget> Content = SNew(SRichTextBlock)
+		.Text(FText::FromString(Markup.IsEmpty() ? FString(TEXT(" ")) : Markup))
+		.TextStyle(bNote ? &NoteStyle : &TextStyle)
+		.AutoWrapText(bBuiltWrapped)
+		.WrappingPolicy(ETextWrappingPolicy::AllowPerCharacterWrapping)
+		+ SRichTextBlock::Decorator(AddedDecorator.ToSharedRef())
+		+ SRichTextBlock::Decorator(RemovedDecorator.ToSharedRef());
 	return SNew(STableRow<FLinePtr>, Owner)
 		.Padding(0.0f)
 		[
@@ -473,6 +638,11 @@ TSharedPtr<SWidget> SGitDiffView::OnContextMenu()
 		FUIAction(FExecuteAction::CreateSP(this, &SGitDiffView::CopySelection), FCanExecuteAction::CreateLambda([this]() { return List->GetNumItemsSelected() > 0; })));
 	Menu.AddMenuEntry(LOCTEXT("SelectAllLines", "Select all"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.SelectAll"),
 		FUIAction(FExecuteAction::CreateLambda([this]() { List->SetItemSelection(Lines, true); })));
+	Menu.AddMenuSeparator();
+	Menu.AddMenuEntry(LOCTEXT("WrapLinesMenu", "Wrap lines"), LOCTEXT("WrapLinesMenuTooltip", "Wrap long lines instead of scrolling sideways."), FSlateIcon(),
+		FUIAction(FExecuteAction::CreateLambda([]() { GitDiff::SetWrapLines(!GitDiff::WrapLines()); }), FCanExecuteAction(),
+			FIsActionChecked::CreateLambda([]() { return GitDiff::WrapLines(); })),
+		NAME_None, EUserInterfaceActionType::ToggleButton);
 	return Menu.MakeWidget();
 }
 

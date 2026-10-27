@@ -45,6 +45,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Git Panel")
 	bool bShowFolders = true;
 
+	/** Diffs wrap long lines instead of scrolling sideways. */
+	UPROPERTY(config, EditAnywhere, Category = "Git Panel")
+	bool bWrapDiffLines = false;
+
 	/** Set once the "prompt for check out" suggestion has been shown. */
 	UPROPERTY(config)
 	bool bOfferedCheckoutPrompt = false;
