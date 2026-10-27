@@ -3,6 +3,7 @@
 
 #include "Editor/GitWorkspaceModel.h"
 #include "Editor/GitWorkspaceText.h"
+#include "SGitDiffView.h"
 
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
@@ -331,18 +332,38 @@ void SGitHistoryView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 						GitFileTree::MakeFoldersToggle()
 					]
 				]
+				// The files, and below them how the selected one changed.
 				+ SVerticalBox::Slot()
 				.FillHeight(1.0f)
 				[
-					SAssignNew(FileTree, STreeView<FFileItemPtr>)
-					.TreeItemsSource(&Files)
-					.SelectionMode(ESelectionMode::Multi)
-					.OnGenerateRow(this, &SGitHistoryView::OnGenerateFileRow)
-					.OnGetChildren(this, &SGitHistoryView::OnGetFileChildren)
-					.OnExpansionChanged(this, &SGitHistoryView::OnFileExpansionChanged)
-					.OnSetExpansionRecursive(this, &SGitHistoryView::OnSetFileExpansionRecursive)
-					.OnMouseButtonDoubleClick(this, &SGitHistoryView::OnFileDoubleClick)
-					.OnContextMenuOpening(this, &SGitHistoryView::OnFileMenu)
+					SNew(SSplitter)
+					.Orientation(Orient_Vertical)
+					+ SSplitter::Slot()
+					.Value(0.4f)
+					[
+						SAssignNew(FileTree, STreeView<FFileItemPtr>)
+						.AddMetaData<FTagMetaData>(TEXT("GitPanel.History.Files"))
+						.TreeItemsSource(&Files)
+						.SelectionMode(ESelectionMode::Multi)
+						.OnGenerateRow(this, &SGitHistoryView::OnGenerateFileRow)
+						.OnGetChildren(this, &SGitHistoryView::OnGetFileChildren)
+						.OnExpansionChanged(this, &SGitHistoryView::OnFileExpansionChanged)
+						.OnSetExpansionRecursive(this, &SGitHistoryView::OnSetFileExpansionRecursive)
+						.OnSelectionChanged(this, &SGitHistoryView::OnFileSelected)
+						.OnMouseButtonDoubleClick(this, &SGitHistoryView::OnFileDoubleClick)
+						.OnContextMenuOpening(this, &SGitHistoryView::OnFileMenu)
+					]
+					+ SSplitter::Slot()
+					.Value(0.6f)
+					[
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("Brushes.Panel"))
+						.Padding(2.0f)
+						.Visibility_Lambda([this]() { return Selected.IsValid() ? EVisibility::Visible : EVisibility::Collapsed; })
+						[
+							SAssignNew(FileDiff, SGitDiffView)
+						]
+					]
 				]
 			]
 		]
@@ -532,6 +553,7 @@ void SGitHistoryView::RebuildFiles()
 	GitFileTree::RestoreExpansion(*FileTree, Files, CollapsedFolders, !FileFilter.IsEmpty());
 	bRestoringExpansion = false;
 	FileTree->RequestTreeRefresh();
+	bRebuildingFiles = true;
 	TArray<FFileItemPtr> Reselect;
 	TFunction<void(const TArray<FFileItemPtr>&)> Visit = [&Visit, &Picked, &Reselect](const TArray<FFileItemPtr>& Items)
 	{
@@ -547,6 +569,62 @@ void SGitHistoryView::RebuildFiles()
 	Visit(Files);
 	FileTree->ClearSelection();
 	FileTree->SetItemSelection(Reselect, true);
+	bRebuildingFiles = false;
+	UpdateFileDiff();
+}
+
+void SGitHistoryView::OnFileSelected(FFileItemPtr Item, ESelectInfo::Type SelectInfo)
+{
+	if (!bRebuildingFiles)
+	{
+		UpdateFileDiff();
+	}
+}
+
+void SGitHistoryView::UpdateFileDiff()
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	if (!FileDiff.IsValid() || !Model.IsValid())
+	{
+		return;
+	}
+	const TArray<FFileItemPtr> Picked = FileTree->GetSelectedItems();
+	if (Picked.Num() != 1 || Picked[0]->bFolder || !Selected.IsValid())
+	{
+		FileDiffKey.Reset();
+		FileDiff->SetMessage(LOCTEXT("SelectFileDiff", "Select a file to see how it changed."));
+		return;
+	}
+	const GitCore::FHistoryChange& Change = *Picked[0]->Change;
+	if (Displays.Get(Model.Get(), Change.Path).bPackage)
+	{
+		FileDiffKey.Reset();
+		FileDiff->SetMessage(LOCTEXT("AssetFileDiff", "Unreal asset: double-click it to compare the two versions in Unreal's own diff."));
+		return;
+	}
+	const FString Key = Selected->Oid + TEXT("|") + Change.Path;
+	if (Key == FileDiffKey)
+	{
+		return;
+	}
+	FileDiffKey = Key;
+	FileDiff->SetMessage(LOCTEXT("DiffLoading", "Loading changes…"));
+	Model->LoadCommitDiff(Selected->Oid, Change.Path, [WeakThis = TWeakPtr<SGitHistoryView>(SharedThis(this)), Key](FString&& Diff, const FString& DiffError)
+	{
+		const TSharedPtr<SGitHistoryView> Self = WeakThis.Pin();
+		if (!Self.IsValid() || Self->FileDiffKey != Key)
+		{
+			return;
+		}
+		if (DiffError.IsEmpty())
+		{
+			Self->FileDiff->SetDiff(Diff);
+		}
+		else
+		{
+			Self->FileDiff->SetMessage(FText::FromString(DiffError));
+		}
+	});
 }
 
 TSharedRef<ITableRow> SGitHistoryView::OnGenerateFileRow(FFileItemPtr Item, const TSharedRef<STableViewBase>& Owner)

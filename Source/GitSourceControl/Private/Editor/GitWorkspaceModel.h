@@ -86,6 +86,10 @@ public:
 	void LoadHistory(int32 Limit, TFunction<void(TArray<GitCore::FHistoryCommit>&& Commits, bool bHasMore, const FString& Error)> OnLoaded);
 	void LoadCommit(const FString& Oid, TFunction<void(GitCore::FCommitDetails&& Details, const FString& Error)> OnLoaded);
 	void LoadStashPaths(const FString& Selector, TFunction<void(TArray<FString>&& Paths, const FString& Error)> OnLoaded);
+	/** A changed file's text diff, staged or unstaged side; a new file shows its whole content. OnLoaded runs on the game thread. */
+	void LoadDiff(const FString& RelativePath, bool bStaged, TFunction<void(FString&& Diff, const FString& Error)> OnLoaded);
+	/** How a file changed in a commit, as a text diff. OnLoaded runs on the game thread. */
+	void LoadCommitDiff(const FString& Oid, const FString& RelativePath, TFunction<void(FString&& Diff, const FString& Error)> OnLoaded);
 
 	FString ToAbsolute(const FString& RelativePath) const;
 	void OpenFile(const FString& RelativePath);
@@ -120,7 +124,7 @@ private:
 	 * unloads, then reloads, the packages of Paths (the world too when one of its packages is affected).
 	 */
 	void ApplyAndReload(const FText& InActivity, const TArray<FString>& Paths, FWork Op);
-	void ShowTextDiff(const FText& Title, const FString& Text) const;
+	void ShowTextDiff(const FText& Title, const FString& Diff, const FString& Error) const;
 
 	FGitSourceControlProvider* BoundProvider = nullptr;
 	FDelegateHandle RepositoryChangedHandle;

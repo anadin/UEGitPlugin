@@ -9,6 +9,7 @@
 - Paths handed back to the editor keep the editor's spelling when it differs from Git's only in letter case.
 - Git panel: every file list (Changes, a commit's or stash's files, Locks) shows files in their folders. Single-folder chains share a row, World Partition actors sit under their level, and a folder's selection acts on its files. Alt+click (Option+click on macOS) or Shift+click on the arrow opens or closes a folder with everything in it; the folder button next to each search box switches back to one list of paths.
 - Git panel: search in every tab (Ctrl+F): commits by summary, author or id, stashes by name, locks by file or owner, and a filter for a commit's or stash's files. Matches are highlighted.
+- Git panel: a text file's changes show below its details in Changes, and below a commit's files in History. Diffs are colored (added green, removed red, the changed part of an edited line highlighted), numbered, and copyable; Compare opens the same view in a window. New text files show their content.
 
 ## 4.0.0-alpha
 

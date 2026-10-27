@@ -66,14 +66,16 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 Open it with **Window > Git**, the branch button in the status bar, **Revision Control > Git Panel**, or **Show in Git Panel** on assets in the Content Browser.
 
 - **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Sync** and **Push**. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
-- **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Lock, Release lock and Discard changes.
-- **History**: commits on your branch (unpushed ones are marked), searchable by summary, author or commit id; select one to see its files and compare a file with its previous version.
+- **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file; a text file's changes show below its details. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Lock, Release lock and Discard changes.
+- **History**: commits on your branch (unpushed ones are marked), searchable by summary, author or commit id; select one to see its files, and a text file to see how the commit changed it.
 - **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes. Search them by name.
 - **Locks**: every lock on the server, yours first, searchable by file or owner. Release your own locks, or someone else's when they cannot.
 
 Every file list shows files in their folders. Folders that only hold one folder share a row (`Source/Demo`), and World Partition actors sit under their level, without the hash folders. Selecting a folder selects its files: Stage, Discard, Lock and Release act on all of them. Alt+click a folder (Option+click on macOS), or Shift+click its arrow, to open or close everything in it. The folder button next to each search box switches every list between folders and one list of paths.
 
 Each tab has a search box (Ctrl+F); matches are highlighted and their folders open. The files of a commit or stash have their own filter.
+
+Text changes are colored: added lines green, removed lines red, and in an edited line the part that changed is highlighted. Each line shows its old and new line number; select lines and press Ctrl+C to copy them. **Compare** (Ctrl+D) opens the same view in its own window. For Unreal assets, Compare opens Unreal's own diff instead: Blueprints (including Animation and Widget Blueprints), materials, data tables, curves, behavior trees and other types with a diff view show their own comparison, and other assets open as text in the **Tool for diffing text** set under Editor Preferences > Loading & Saving. New and deleted assets, and World Partition actors on their own, cannot be compared.
 
 Switching branches and restoring stashes refuse to overwrite local edits, download Git LFS files first, and reload any open assets that change.
 
@@ -83,7 +85,8 @@ Switching branches and restoring stashes refuse to overwrite local edits, downlo
 | Space | Stage or unstage the selected files |
 | Enter / double-click | Compare an edited file, or open a new one; open or close a folder |
 | Left / Right | Close or open a folder (with Shift: everything in it) |
-| Ctrl+D | Compare with the last commit |
+| Ctrl+D | Compare with the last commit, in its own window |
+| Ctrl+C | Copy the selected lines of a diff |
 | Delete | Discard changes to the selected files |
 | Ctrl+Enter | Commit (Ctrl+Shift+Enter: commit and push) |
 | F5 | Refresh |

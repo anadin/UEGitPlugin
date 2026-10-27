@@ -8,6 +8,7 @@
 #include "Widgets/Views/STreeView.h"
 
 class FGitWorkspaceModel;
+class SGitDiffView;
 class SHeaderRow;
 class SMultiLineEditableTextBox;
 class SSearchBox;
@@ -79,7 +80,12 @@ private:
 	void OnGetChildren(FItemPtr Item, TArray<FItemPtr>& OutChildren) const;
 	void OnExpansionChanged(FItemPtr Item, bool bExpanded);
 	void OnSetExpansionRecursive(FItemPtr Item, bool bExpand);
+	void OnSelectionChanged(FItemPtr Item, ESelectInfo::Type SelectInfo);
 	void OnDoubleClick(FItemPtr Item);
+	/** Shows what changed in the single selected text file, below its details. */
+	void UpdateDiff();
+	/** What Compare does for the selected asset, which has no text diff. */
+	FText GetAssetDiffHint() const;
 	TSharedPtr<SWidget> OnContextMenu();
 	TSharedRef<SWidget> MakeInspector();
 	TSharedRef<SWidget> MakeCommitBar();
@@ -105,6 +111,11 @@ private:
 	TSharedPtr<SHeaderRow> HeaderRow;
 	TSharedPtr<SSearchBox> SearchBox;
 	TSharedPtr<SMultiLineEditableTextBox> MessageBox;
+	TSharedPtr<SGitDiffView> DiffView;
+	/** The file, side and repository state of the diff shown. */
+	FString DiffKey;
+	/** The selection is a text file, so the inspector shows its diff. */
+	bool bDiffShown = false;
 	TArray<FItemPtr> Groups;
 	TSet<FGitChangeItem::EGroup> CollapsedGroups;
 	/** Folders the user closed, by group and path. */

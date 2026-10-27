@@ -3,6 +3,7 @@
 
 #include "Editor/GitWorkspaceModel.h"
 #include "SGitDialogs.h"
+#include "SGitDiffView.h"
 
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
@@ -21,6 +22,7 @@
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Layout/SWrapBox.h"
 #include "Widgets/SBoxPanel.h"
+#include "Widgets/SOverlay.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SExpanderArrow.h"
 #include "Widgets/Views/SHeaderRow.h"
@@ -334,6 +336,7 @@ void SGitChangesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 				.OnGetChildren(this, &SGitChangesView::OnGetChildren)
 				.OnExpansionChanged(this, &SGitChangesView::OnExpansionChanged)
 				.OnSetExpansionRecursive(this, &SGitChangesView::OnSetExpansionRecursive)
+				.OnSelectionChanged(this, &SGitChangesView::OnSelectionChanged)
 				.OnMouseButtonDoubleClick(this, &SGitChangesView::OnDoubleClick)
 				.OnContextMenuOpening(this, &SGitChangesView::OnContextMenu)
 				.OnIsSelectableOrNavigable_Lambda([](FItemPtr Item) { return Item.IsValid() && !Item->bGroup; })
@@ -733,6 +736,73 @@ void SGitChangesView::OnSetExpansionRecursive(FItemPtr Item, bool bExpand)
 	{
 		GitFileTree::SetExpansionRecursive(*Tree, Item, bExpand);
 	}
+}
+
+void SGitChangesView::OnSelectionChanged(FItemPtr Item, ESelectInfo::Type SelectInfo)
+{
+	UpdateDiff();
+}
+
+void SGitChangesView::UpdateDiff()
+{
+	const FItemPtr Item = SingleSelection();
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	if (!Item.IsValid() || !Model.IsValid() || !DiffView.IsValid())
+	{
+		// Keep the key: a rebuild clears and restores the selection, and the same file should not flash "Loading".
+		return;
+	}
+	bDiffShown = !GetDisplay(Item->Path).bPackage;
+	if (!bDiffShown)
+	{
+		return;
+	}
+	// The repository state is part of the key, so a refresh shows the file's latest edits.
+	const FString File = FString::Printf(TEXT("%d|%s|"), Item->IsStagedSide() ? 1 : 0, *Item->Path);
+	const FString Key = File + LexToString(BuiltGeneration);
+	if (Key == DiffKey)
+	{
+		return;
+	}
+	if (!DiffKey.StartsWith(File))
+	{
+		DiffView->SetMessage(LOCTEXT("DiffLoading", "Loading changes…"));
+	}
+	DiffKey = Key;
+	Model->LoadDiff(Item->Path, Item->IsStagedSide(), [WeakThis = TWeakPtr<SGitChangesView>(SharedThis(this)), Key](FString&& Diff, const FString& Error)
+	{
+		const TSharedPtr<SGitChangesView> Self = WeakThis.Pin();
+		if (!Self.IsValid() || Self->DiffKey != Key)
+		{
+			return;
+		}
+		if (Error.IsEmpty())
+		{
+			Self->DiffView->SetDiff(Diff);
+		}
+		else
+		{
+			Self->DiffView->SetMessage(FText::FromString(Error));
+		}
+	});
+}
+
+FText SGitChangesView::GetAssetDiffHint() const
+{
+	const FItemPtr Item = SingleSelection();
+	if (!Item.IsValid())
+	{
+		return FText::GetEmpty();
+	}
+	if (Item->Path.Contains(TEXT("/__ExternalActors__/")) || Item->Path.Contains(TEXT("/__ExternalObjects__/")))
+	{
+		return LOCTEXT("ExternalAssetDiff", "World Partition actors cannot be compared on their own.");
+	}
+	if (Item->Entry.IsAdded() || Item->Entry.IsDeleted())
+	{
+		return LOCTEXT("NewAssetDiff", "New and deleted assets have no other version to compare.");
+	}
+	return LOCTEXT("AssetDiff", "Compare opens this asset in Unreal's own diff: a Blueprint's graphs side by side, a material's nodes, a data table's rows. Other assets open as text in the Tool for diffing text set in Editor Preferences > Loading & Saving.");
 }
 
 void SGitChangesView::OnDoubleClick(FItemPtr Item)
@@ -1176,6 +1246,33 @@ TSharedRef<SWidget> SGitChangesView::MakeInspector()
 						Button(LOCTEXT("InspectorOpen", "Open"), LOCTEXT("InspectorOpenTooltip", "Open the asset editor, or the file in its default application."),
 							[this, Selected]() { const FItemPtr Item = Selected(); if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin(); M && Item) { M->OpenFile(Item->Entry.Path); } })
 					]
+				]
+			]
+			// What changed: a text file's lines, or what Compare does for an asset
+			+ SVerticalBox::Slot()
+			.FillHeight(1.0f)
+			.Padding(0.0f, 12.0f, 0.0f, 0.0f)
+			[
+				SNew(SOverlay)
+				.Visibility_Lambda([Selected]() { return Selected().IsValid() ? EVisibility::Visible : EVisibility::Collapsed; })
+				+ SOverlay::Slot()
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("Brushes.Panel"))
+					.Padding(2.0f)
+					.Visibility_Lambda([this]() { return bDiffShown ? EVisibility::Visible : EVisibility::Collapsed; })
+					[
+						SAssignNew(DiffView, SGitDiffView)
+					]
+				]
+				+ SOverlay::Slot()
+				.VAlign(VAlign_Top)
+				[
+					SNew(STextBlock)
+					.Visibility_Lambda([this]() { return bDiffShown ? EVisibility::Collapsed : EVisibility::Visible; })
+					.Text(this, &SGitChangesView::GetAssetDiffHint)
+					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					.AutoWrapText(true)
 				]
 			]
 		];

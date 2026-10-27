@@ -9,6 +9,7 @@
 #include "Widgets/Views/STreeView.h"
 
 class FGitWorkspaceModel;
+class SGitDiffView;
 class SSearchBox;
 class SSplitter;
 
@@ -56,6 +57,9 @@ private:
 	void OnFileExpansionChanged(FFileItemPtr Item, bool bExpanded);
 	void OnSetFileExpansionRecursive(FFileItemPtr Item, bool bExpand);
 	void OnFileDoubleClick(FFileItemPtr Item);
+	void OnFileSelected(FFileItemPtr Item, ESelectInfo::Type SelectInfo);
+	/** Shows how the single selected text file changed in the commit, below the files. */
+	void UpdateFileDiff();
 	TSharedPtr<SWidget> OnCommitMenu();
 	TSharedPtr<SWidget> OnFileMenu();
 	void CompareChange(const TSharedPtr<GitCore::FHistoryChange>& Change);
@@ -72,6 +76,11 @@ private:
 	TSharedPtr<SListView<FCommitPtr>> CommitList;
 	TSharedPtr<STreeView<FFileItemPtr>> FileTree;
 	TSharedPtr<SSearchBox> CommitSearch;
+	TSharedPtr<SGitDiffView> FileDiff;
+	/** The commit and file of the diff shown. */
+	FString FileDiffKey;
+	/** Set while the file list is rebuilt, which clears and restores the selection. */
+	bool bRebuildingFiles = false;
 	TSharedPtr<SSplitter> Splitter;
 	FCommitPtr Selected;
 	GitCore::FCommitDetails Details;

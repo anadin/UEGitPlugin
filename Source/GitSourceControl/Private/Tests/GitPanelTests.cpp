@@ -4,6 +4,7 @@
 #include "GitTestFixtures.h"
 #include "Editor/GitWorkspaceModel.h"
 #include "Editor/Panel/GitFileTree.h"
+#include "Editor/Panel/SGitDiffView.h"
 #include "Editor/Panel/SGitHistoryView.h"
 #include "Editor/Panel/SGitPanel.h"
 #include "Editor/Panel/SGitStashesView.h"
@@ -313,6 +314,90 @@ bool FGitPanelFileTreeTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelTextDiffTest, "GitWorkspace.Panel.TextDiff", PanelTestFlags)
+bool FGitPanelTextDiffTest::RunTest(const FString&)
+{
+	using EKind = FGitDiffLine::EKind;
+	const TArray<TSharedPtr<FGitDiffLine>> Lines = GitDiff::Parse(TEXT("diff --git a/Config/DefaultGame.ini b/Config/DefaultGame.ini\n")
+		TEXT("index 1111111..2222222 100644\n--- a/Config/DefaultGame.ini\n+++ b/Config/DefaultGame.ini\n")
+		TEXT("@@ -1,3 +1,4 @@ [Settings]\n [Settings]\n-ProjectName=Demo\n+ProjectName=Demo Two\n+CompanyName=Pippin\n \tIndented=1\n\\ No newline at end of file\n"));
+	if (!TestEqual(TEXT("File headers are dropped; the hunk and its lines stay"), Lines.Num(), 7))
+	{
+		return false;
+	}
+	TestTrue(TEXT("The hunk header comes first"), Lines[0]->Kind == EKind::Hunk);
+	TestTrue(TEXT("Context lines carry both line numbers"), Lines[1]->Kind == EKind::Context && Lines[1]->OldLine == 1 && Lines[1]->NewLine == 1);
+	TestTrue(TEXT("Removed lines carry the old number"), Lines[2]->Kind == EKind::Removed && Lines[2]->OldLine == 2 && Lines[2]->NewLine == 0);
+	TestTrue(TEXT("Added lines carry the new number"), Lines[3]->Kind == EKind::Added && Lines[3]->OldLine == 0 && Lines[3]->NewLine == 2);
+	TestTrue(TEXT("An edited line marks the part that changed"), Lines[3]->HasChange() && Lines[3]->Text.Mid(Lines[3]->ChangeStart, Lines[3]->ChangeEnd - Lines[3]->ChangeStart) == TEXT(" Two"));
+	TestFalse(TEXT("Nothing was taken out of the old line"), Lines[2]->HasChange());
+	TestTrue(TEXT("An added line without a partner is not marked"), Lines[4]->Kind == EKind::Added && Lines[4]->NewLine == 3 && !Lines[4]->HasChange());
+	TestTrue(TEXT("Tabs are expanded"), Lines[5]->Kind == EKind::Context && Lines[5]->Text == TEXT("    Indented=1") && Lines[5]->OldLine == 3 && Lines[5]->NewLine == 4);
+	TestTrue(TEXT("Remarks are kept"), Lines[6]->Kind == EKind::Note && Lines[6]->Text == TEXT("No newline at end of file"));
+
+	const TArray<TSharedPtr<FGitDiffLine>> Rewritten = GitDiff::Parse(TEXT("@@ -1 +1 @@\n-alpha\n+zzzzzzzz\n"));
+	TestTrue(TEXT("A rewritten line is not marked part by part"), Rewritten.Num() == 3 && !Rewritten[1]->HasChange() && !Rewritten[2]->HasChange());
+	const TArray<TSharedPtr<FGitDiffLine>> Pointer = GitDiff::Parse(TEXT("@@ -1,3 +1,3 @@\n version https://git-lfs.github.com/spec/v1\n-oid sha256:aaaa\n-size 10\n+oid sha256:bbbb\n+size 12\n"));
+	TestTrue(TEXT("A Git LFS pointer change is one note"), Pointer.Num() == 1 && Pointer[0]->Kind == EKind::Note);
+	const TArray<TSharedPtr<FGitDiffLine>> Binary = GitDiff::Parse(TEXT("diff --git a/x.png b/x.png\nindex 1111111..2222222 100644\nBinary files a/x.png and b/x.png differ\n"));
+	TestTrue(TEXT("A binary file is one note"), Binary.Num() == 1 && Binary[0]->Kind == EKind::Note);
+	TestEqual(TEXT("No output means no differences"), GitDiff::Parse(FString()).Num(), 0);
+	const TArray<TSharedPtr<FGitDiffLine>> Merge = GitDiff::Parse(TEXT("@@@ -1,1 -1,1 +1,3 @@@\n  shared\n+ ours\n ++both\n"));
+	TestTrue(TEXT("A merge commit's combined diff reads both marker columns"),
+		Merge.Num() == 4 && Merge[1]->Kind == EKind::Context && Merge[2]->Kind == EKind::Added && Merge[2]->Text == TEXT("ours") && Merge[3]->Kind == EKind::Added && Merge[3]->NewLine == 3);
+
+	const FTCHARToUTF8 Utf8(TEXT("one\ntwo\n"));
+	const TArray<TSharedPtr<FGitDiffLine>> NewFile = GitDiff::Parse(GitDiff::FromNewFile(TArray<uint8>(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length())));
+	TestTrue(TEXT("A new file is all added lines"), NewFile.Num() == 3 && NewFile[1]->Kind == EKind::Added && NewFile[1]->NewLine == 1 && NewFile[2]->Text == TEXT("two"));
+	const TArray<TSharedPtr<FGitDiffLine>> NewBinary = GitDiff::Parse(GitDiff::FromNewFile({0x89, 'P', 'N', 'G', 0, 1}));
+	TestTrue(TEXT("A new binary file is one note"), NewBinary.Num() == 1 && NewBinary[0]->Kind == EKind::Note);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelFileDiffsTest, "GitWorkspace.Panel.FileDiffs", PanelTestFlags)
+bool FGitPanelFileDiffsTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Repo = Fixture.InitRepo();
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("one\ntwo\n"));
+	const FString Base = GitTest::CommitAll(Repo, TEXT("base"));
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("one\ntwo too\nthree\n"));
+	GitTest::WriteFile(Repo, TEXT("b.txt"), TEXT("staged\n"));
+	GitTest::Git(Repo, {TEXT("add"), TEXT("b.txt")});
+	GitTest::WriteFile(Repo, TEXT("new.txt"), TEXT("hello\n"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	Panel.Refresh();
+	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.Find(TEXT("new.txt")) != nullptr; });
+
+	auto Load = [this, &Panel](TFunction<void(TFunction<void(FString&&, const FString&)>)> Start)
+	{
+		bool bDone = false;
+		FString Result;
+		Start([&bDone, &Result](FString&& Diff, const FString& Error)
+		{
+			Result = Error.IsEmpty() ? MoveTemp(Diff) : TEXT("error: ") + Error;
+			bDone = true;
+		});
+		TestTrue(TEXT("The diff loads"), GitTest::WaitFor([&Panel, &bDone]() { Panel.Provider->Tick(); return bDone; }));
+		return GitDiff::Parse(Result);
+	};
+	auto Has = [](const TArray<TSharedPtr<FGitDiffLine>>& Lines, FGitDiffLine::EKind Kind, const TCHAR* Text)
+	{
+		return Lines.ContainsByPredicate([Kind, Text](const TSharedPtr<FGitDiffLine>& Line) { return Line->Kind == Kind && Line->Text == Text; });
+	};
+	const TArray<TSharedPtr<FGitDiffLine>> Edited = Load([&Panel](auto Done) { Panel.Model->LoadDiff(TEXT("a.txt"), false, MoveTemp(Done)); });
+	TestTrue(TEXT("An edit shows the old and the new line"), Has(Edited, FGitDiffLine::EKind::Removed, TEXT("two")) && Has(Edited, FGitDiffLine::EKind::Added, TEXT("two too")));
+	TestTrue(TEXT("Added lines show"), Has(Edited, FGitDiffLine::EKind::Added, TEXT("three")));
+	const TArray<TSharedPtr<FGitDiffLine>> Staged = Load([&Panel](auto Done) { Panel.Model->LoadDiff(TEXT("b.txt"), true, MoveTemp(Done)); });
+	TestTrue(TEXT("A staged new file shows its staged content"), Has(Staged, FGitDiffLine::EKind::Added, TEXT("staged")));
+	const TArray<TSharedPtr<FGitDiffLine>> Untracked = Load([&Panel](auto Done) { Panel.Model->LoadDiff(TEXT("new.txt"), false, MoveTemp(Done)); });
+	TestTrue(TEXT("A file Git does not track yet shows its content"), Has(Untracked, FGitDiffLine::EKind::Added, TEXT("hello")));
+	const TArray<TSharedPtr<FGitDiffLine>> Committed = Load([&Panel, &Base](auto Done) { Panel.Model->LoadCommitDiff(Base, TEXT("a.txt"), MoveTemp(Done)); });
+	TestTrue(TEXT("A commit shows how it changed the file"), Has(Committed, FGitDiffLine::EKind::Added, TEXT("one")) && Has(Committed, FGitDiffLine::EKind::Added, TEXT("two")));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelScreenshotsTest, "GitWorkspace.Panel.Screenshots", PanelTestFlags)
 bool FGitPanelScreenshotsTest::RunTest(const FString&)
 {
@@ -366,10 +451,11 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 	GitTest::WriteFile(Bob, TEXT("Docs/Notes.txt"), TEXT("notes\n"));
 	GitTest::CommitAll(Bob, TEXT("Add level notes"));
 	GitTest::Git(Bob, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
-	GitTest::WriteFile(Alice, TEXT("Config/DefaultGame.ini"), TEXT("[/Script/EngineSettings.GeneralProjectSettings]\nProjectName=Demo\n"));
+	GitTest::WriteFile(Alice, TEXT("Config/DefaultGame.ini"), TEXT("[/Script/EngineSettings.GeneralProjectSettings]\nProjectName=Demo\nProjectVersion=1.0\n"));
 	GitTest::CommitAll(Alice, TEXT("Name the project"));
 	GitTest::WriteFile(Alice, TEXT("readme.txt"), TEXT("lighting experiment\n"));
 	GitTest::Git(Alice, {TEXT("stash"), TEXT("push"), TEXT("-m"), TEXT("Lighting experiment")});
+	GitTest::WriteFile(Alice, TEXT("Config/DefaultGame.ini"), TEXT("[/Script/EngineSettings.GeneralProjectSettings]\nProjectName=Demo Two\nProjectVersion=1.1\nCompanyName=Pippin Games\n"));
 	GitTest::WriteFile(Alice, TEXT("readme.txt"), TEXT("updated readme\n"));
 	GitTest::Git(Alice, {TEXT("add"), TEXT("readme.txt")});
 	GitTest::WriteFile(Alice, TEXT("Content/Hero.uasset"), TEXT("hero v2\n"));
@@ -409,12 +495,31 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		{
 			StaticCastSharedPtr<SSearchBox>(Search)->SetText(FText::GetEmpty());
 		}
+		State->Widget->ShowPaths({TEXT("Config/DefaultGame.ini")});
 	}, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-diff")); }, 1.5f));
 	// Resize takes screen pixels; sizes here are Slate units.
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Window->Resize(FVector2D(460.0f, 680.0f) * State->Window->GetDPIScaleFactor()); }, 0.1f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-narrow")); }, 1.0f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Window->Resize(FVector2D(1180.0f, 680.0f) * State->Window->GetDPIScaleFactor()); State->Widget->ShowTab(1); }, 0.1f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { SelectFirst<SGitHistoryView::FCommitPtr>(State->Widget.ToSharedRef(), TEXT("GitPanel.History.Commits")); }, 2.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		// The commit's first file, inside its folders.
+		if (const TSharedPtr<SWidget> Found = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.History.Files")))
+		{
+			const TSharedPtr<STreeView<SGitHistoryView::FFileItemPtr>> Tree = StaticCastSharedPtr<STreeView<SGitHistoryView::FFileItemPtr>>(Found);
+			SGitHistoryView::FFileItemPtr Item = Tree->GetRootItems().IsEmpty() ? nullptr : Tree->GetRootItems()[0];
+			while (Item.IsValid() && Item->bFolder && !Item->Children.IsEmpty())
+			{
+				Item = Item->Children[0];
+			}
+			if (Item.IsValid())
+			{
+				Tree->SetSelection(Item, ESelectInfo::OnMouseClick);
+			}
+		}
+	}, 1.5f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("history")); State->Widget->ShowTab(2); }, 1.5f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { SelectFirst<SGitStashesView::FStashPtr>(State->Widget.ToSharedRef(), TEXT("GitPanel.Stashes.List")); }, 1.0f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("stashes")); State->Widget->ShowTab(3); }, 1.5f));

@@ -5,6 +5,7 @@
 #include "GitWorkspaceText.h"
 #include "Provider/GitProviderIdentity.h"
 #include "Provider/GitSourceControlRevision.h"
+#include "Editor/Panel/SGitDiffView.h"
 
 #include "AssetDefinition.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -21,6 +22,7 @@
 #include "IContentBrowserSingleton.h"
 #include "ISourceControlModule.h"
 #include "Logging/MessageLog.h"
+#include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopedSlowTask.h"
@@ -28,10 +30,8 @@
 #include "SourceControlOperations.h"
 #include "SourceControlWindows.h"
 #include "Styling/AppStyle.h"
-#include "Styling/CoreStyle.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "UObject/Package.h"
-#include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/SWindow.h"
@@ -895,6 +895,72 @@ void FGitWorkspaceModel::LoadStashPaths(const FString& Selector, TFunction<void(
 	});
 }
 
+void FGitWorkspaceModel::LoadDiff(const FString& RelativePath, bool bStaged, TFunction<void(FString&&, const FString&)> OnLoaded)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		OnLoaded(FString(), FString());
+		return;
+	}
+	// Git has nothing to compare a new file with; its content is the change.
+	const GitCore::FStatusEntry* Entry = GetSnapshot()->Status.Find(RelativePath);
+	const FString NewFile = !bStaged && Entry && Entry->bUntracked ? ToAbsolute(RelativePath) : FString();
+	Session->EnqueueRead([Session, RelativePath, bStaged, NewFile, OnLoaded]()
+	{
+		FString Diff;
+		FString Error;
+		if (!NewFile.IsEmpty())
+		{
+			constexpr int64 MaxNewFileBytes = 4 * 1024 * 1024;
+			TArray<uint8> Bytes;
+			if (IFileManager::Get().FileSize(*NewFile) > MaxNewFileBytes)
+			{
+				Error = LOCTEXT("NewFileTooLarge", "This new file is too large to show.").ToString();
+			}
+			else if (FFileHelper::LoadFileToArray(Bytes, *NewFile, FILEREAD_Silent))
+			{
+				Diff = GitDiff::FromNewFile(Bytes);
+			}
+			else
+			{
+				Error = LOCTEXT("NewFileUnreadable", "This new file could not be read.").ToString();
+			}
+		}
+		else
+		{
+			const GitCore::FOpResult Result = Session->GetRepository().Diff(RelativePath, bStaged, Diff);
+			if (!Result.bOk)
+			{
+				Error = Result.Message;
+			}
+		}
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Diff = MoveTemp(Diff), Error]() mutable
+		{
+			OnLoaded(MoveTemp(Diff), Error);
+		});
+	});
+}
+
+void FGitWorkspaceModel::LoadCommitDiff(const FString& Oid, const FString& RelativePath, TFunction<void(FString&&, const FString&)> OnLoaded)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		OnLoaded(FString(), FString());
+		return;
+	}
+	Session->EnqueueRead([Session, Oid, RelativePath, OnLoaded]()
+	{
+		FString Diff;
+		const GitCore::FOpResult Result = Session->GetRepository().CommitDiff(Oid, RelativePath, Diff);
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Diff = MoveTemp(Diff), Error = Result.bOk ? FString() : Result.Message]() mutable
+		{
+			OnLoaded(MoveTemp(Diff), Error);
+		});
+	});
+}
+
 FString FGitWorkspaceModel::ToAbsolute(const FString& RelativePath) const
 {
 	const GitCore::FGitSessionPtr Session = GetSession();
@@ -974,17 +1040,12 @@ void FGitWorkspaceModel::ShowDiff(const FString& RelativePath, bool bStaged)
 	}
 	const FText Title = FText::Format(LOCTEXT("DiffTitle", "{0} ({1})"), FText::FromString(FPaths::GetCleanFilename(RelativePath)),
 		bStaged ? LOCTEXT("StagedSide", "staged") : LOCTEXT("WorkingSide", "not staged"));
-	Session->EnqueueRead([Weak = AsWeak(), Session, RelativePath, bStaged, Title]()
+	LoadDiff(RelativePath, bStaged, [Weak = AsWeak(), Title](FString&& Diff, const FString& Error)
 	{
-		FString Text;
-		const GitCore::FOpResult Result = Session->GetRepository().Diff(RelativePath, bStaged, Text);
-		AsyncTask(ENamedThreads::GameThread, [Weak, Title, Text = Result.bOk ? MoveTemp(Text) : Result.Message]()
+		if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
 		{
-			if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
-			{
-				Self->ShowTextDiff(Title, Text);
-			}
-		});
+			Self->ShowTextDiff(Title, Diff, Error);
+		}
 	});
 }
 
@@ -1008,17 +1069,12 @@ void FGitWorkspaceModel::ShowCommitDiff(const GitCore::FHistoryCommit& Commit, c
 	{
 		const FText Title = FText::Format(LOCTEXT("CommitDiffTitle", "{0} in {1}"), FText::FromString(FPaths::GetCleanFilename(Change.Path)),
 			FText::FromString(GitWorkspaceText::ShortId(Commit.Oid)));
-		Session->EnqueueRead([Weak = AsWeak(), Session, Oid = Commit.Oid, Path = Change.Path, Title]()
+		LoadCommitDiff(Commit.Oid, Change.Path, [Weak = AsWeak(), Title](FString&& Diff, const FString& Error)
 		{
-			FString Text;
-			const GitCore::FOpResult Result = Session->GetRepository().CommitDiff(Oid, Path, Text);
-			AsyncTask(ENamedThreads::GameThread, [Weak, Title, Text = Result.bOk ? MoveTemp(Text) : Result.Message]()
+			if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
 			{
-				if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
-				{
-					Self->ShowTextDiff(Title, Text);
-				}
-			});
+				Self->ShowTextDiff(Title, Diff, Error);
+			}
 		});
 		return;
 	}
@@ -1050,27 +1106,27 @@ void FGitWorkspaceModel::ShowCommitDiff(const GitCore::FHistoryCommit& Commit, c
 	FAssetToolsModule::GetModule().Get().DiffAssets(OldAsset, NewAsset, OldRevision, NewRevision);
 }
 
-void FGitWorkspaceModel::ShowTextDiff(const FText& Title, const FString& Text) const
+void FGitWorkspaceModel::ShowTextDiff(const FText& Title, const FString& Diff, const FString& Error) const
 {
-	constexpr int32 MaxCharacters = 2 * 1024 * 1024;
-	FString Shown = Text.IsEmpty() ? LOCTEXT("NoTextDifferences", "No differences.").ToString() : Text.Left(MaxCharacters);
-	if (Text.Len() > MaxCharacters)
+	const TSharedRef<SGitDiffView> View = SNew(SGitDiffView);
+	if (Error.IsEmpty())
 	{
-		Shown += TEXT("\n…");
+		View->SetDiff(Diff);
+	}
+	else
+	{
+		View->SetMessage(FText::FromString(Error));
 	}
 	const TSharedRef<SWindow> Window = SNew(SWindow)
 		.Title(Title)
-		.ClientSize(FVector2D(900.0f, 640.0f))
+		.ClientSize(FVector2D(1000.0f, 680.0f))
 		.SupportsMinimize(false);
 	Window->SetContent(
 		SNew(SBorder)
-		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+		.BorderImage(FAppStyle::GetBrush("Brushes.Panel"))
 		.Padding(4.0f)
 		[
-			SNew(SMultiLineEditableTextBox)
-			.Text(FText::FromString(Shown))
-			.IsReadOnly(true)
-			.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
+			View
 		]);
 	FSlateApplication::Get().AddWindow(Window);
 }
