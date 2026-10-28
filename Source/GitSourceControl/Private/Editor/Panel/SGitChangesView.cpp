@@ -330,6 +330,7 @@ void SGitChangesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 			.Value(0.68f)
 			[
 				SAssignNew(Tree, STreeView<FItemPtr>)
+				.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.List"))
 				.TreeItemsSource(&Groups)
 				.SelectionMode(ESelectionMode::Multi)
 				.OnGenerateRow(this, &SGitChangesView::OnGenerateRow)
@@ -566,13 +567,17 @@ void SGitChangesView::Rebuild()
 	}
 	bRestoringExpansion = false;
 
-	ForEachItem(Groups, [this, &Selected, &Reselect](const FItemPtr& Item)
+	// Files shown on request replace the selection; otherwise the selection survives the rebuild.
+	if (Reselect.IsEmpty())
 	{
-		if (!Item->bGroup && Selected.Contains(ExpansionKey(*Item)))
+		ForEachItem(Groups, [this, &Selected, &Reselect](const FItemPtr& Item)
 		{
-			Reselect.AddUnique(Item);
-		}
-	});
+			if (!Item->bGroup && Selected.Contains(ExpansionKey(*Item)))
+			{
+				Reselect.AddUnique(Item);
+			}
+		});
+	}
 	Tree->ClearSelection();
 	Tree->RequestTreeRefresh();
 	if (!Reselect.IsEmpty())

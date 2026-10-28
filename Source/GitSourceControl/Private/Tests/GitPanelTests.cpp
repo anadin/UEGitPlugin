@@ -4,6 +4,7 @@
 #include "GitTestFixtures.h"
 #include "Editor/GitWorkspaceModel.h"
 #include "Editor/Panel/GitFileTree.h"
+#include "Editor/Panel/SGitChangesView.h"
 #include "Editor/Panel/SGitDiffView.h"
 #include "Editor/Panel/SGitHistoryView.h"
 #include "Editor/Panel/SGitPanel.h"
@@ -123,6 +124,19 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	GitTest::WriteFile(Repo, TEXT("Content/Hero.uasset"), TEXT("hero changed\n"));
 	Panel.Refresh();
 	TestEqual(TEXT("Both changes are listed"), Panel.Provider.Snapshot()->Status.Entries.Num(), 2);
+
+	// Show in Git Panel replaces the selection instead of adding to it.
+	Widget->ShowPaths({TEXT("a.txt")});
+	Widget->ShowPaths({TEXT("Content/Hero.uasset")});
+	if (const TSharedPtr<SWidget> Found = FindTagged(Widget, TEXT("GitPanel.Changes.List")))
+	{
+		const TArray<SGitChangesView::FItemPtr> Selected = StaticCastSharedPtr<STreeView<SGitChangesView::FItemPtr>>(Found)->GetSelectedItems();
+		TestTrue(TEXT("Only the file shown last is selected"), Selected.Num() == 1 && Selected[0]->Path == TEXT("Content/Hero.uasset"));
+	}
+	else
+	{
+		AddError(TEXT("The Changes list is not tagged."));
+	}
 
 	Panel.Model->Stage({TEXT("a.txt")});
 	TestTrue(TEXT("Staging shows up"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
