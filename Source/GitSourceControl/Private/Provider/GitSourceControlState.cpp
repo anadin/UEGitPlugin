@@ -250,7 +250,7 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	}
 	if (LockState == EGitLockState::LockedElsewhere)
 	{
-		return LOCTEXT("LockedElsewhereTooltip", "You hold this lock in another clone or worktree. Check Out to use it here.");
+		return LOCTEXT("LockedElsewhereTooltip", "You took this lock in another clone, worktree or computer. Claim Lock (or Check Out) to use it here.");
 	}
 	if (LockState == EGitLockState::LockedHere)
 	{

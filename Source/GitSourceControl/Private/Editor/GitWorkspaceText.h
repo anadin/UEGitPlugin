@@ -19,6 +19,8 @@ namespace GitWorkspaceText
 	FText FileList(const TArray<FString>& Paths, int32 Max = 3);
 	/** Commit ids are shown with eight characters. */
 	FString ShortId(const FString& Commit);
+	/** What a lock you took elsewhere (another clone, worktree or computer) means, and what claiming it does. */
+	FText ClaimLockTooltip();
 	/**
 	 * The folder a file is listed under in the Git panel: its own, without the two hash folders
 	 * World Partition puts between a level's external actors (or objects) folder and the file.

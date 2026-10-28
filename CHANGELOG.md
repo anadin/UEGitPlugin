@@ -11,6 +11,7 @@
 - Git panel: search in every tab (Ctrl+F): commits by summary, author or id, stashes by name, locks by file or owner, and a filter for a commit's or stash's files. Matches are highlighted.
 - Git panel: a text file's changes show below its details in Changes, and below a commit's files in History. Diffs are colored (added green, removed red, the changed part of an edited line highlighted), numbered, and copyable; Compare opens the same view in a window. New text files show their content.
 - Diffs can wrap long lines (Wrap lines, above each diff and in its right-click menu, saved in Editor Preferences); the changed part of a line stays highlighted across the wrap. A count of added and removed lines sits beside the switch.
+- **Claim lock** takes over a lock you took in another clone, worktree or computer, so this copy can save and check in the file. It is in the Content Browser's asset menu, the Git panel's Changes tab (right-click, or the button next to the lock in the details) and its Locks tab, which also counts such locks. Nothing is sent to the server. These locks now read "Locked by you elsewhere" / "You, elsewhere", and Lock in the Changes tab only appears for unlocked files.
 - Git panel: Show in Git Panel selects only the files asked for; it used to add them to whatever was already selected.
 
 ## 4.0.0-alpha

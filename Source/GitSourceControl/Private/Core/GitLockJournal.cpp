@@ -70,7 +70,7 @@ namespace GitCore
 			!IFileManager::Get().Move(*Final, *Temporary, true, true))
 		{
 			IFileManager::Get().Delete(*Temporary, false, true, true);
-			OutError = TEXT("The lock was taken, but this editor could not record it locally.");
+			OutError = FString::Printf(TEXT("Could not write the lock record %s."), *Final);
 			return false;
 		}
 		return true;

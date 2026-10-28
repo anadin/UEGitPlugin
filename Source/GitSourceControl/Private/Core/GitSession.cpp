@@ -557,7 +557,7 @@ namespace GitCore
 		}
 	}
 
-	void FGitSession::RecordLockTaken(const FLockInfo& Lock)
+	bool FGitSession::RecordLockTaken(const FLockInfo& Lock, FString* OutError)
 	{
 		FString Endpoint = GetSnapshot()->Locks.Endpoint;
 		const FString Remote = ResolveLockRemote();
@@ -566,9 +566,10 @@ namespace GitCore
 		{
 			Repository->ResolveLockEndpoint(Remote, Endpoint, Error);
 		}
-		if (!Endpoint.IsEmpty())
+		const bool bRecorded = !Endpoint.IsEmpty() && Journal->Record(Endpoint, Lock, Error);
+		if (!bRecorded && OutError)
 		{
-			Journal->Record(Endpoint, Lock, Error);
+			*OutError = Error.IsEmpty() ? TEXT("The lock server's address is unknown.") : Error;
 		}
 		Publish(EChange::Locks, [&Lock, &Endpoint, &Remote](FSessionSnapshot& State)
 		{
@@ -582,6 +583,7 @@ namespace GitCore
 				State.Locks.Remote = Remote;
 			}
 		});
+		return bRecorded;
 	}
 
 	void FGitSession::RecordLockReleased(const FString& Path)

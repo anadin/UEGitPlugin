@@ -75,6 +75,11 @@ public:
 	void Lock(const TArray<FString>& Paths);
 	/** Releases locks held on Paths; bForce also releases other people's locks. */
 	void Unlock(const TArray<FString>& Paths, bool bForce);
+	/**
+	 * Takes over your locks on Paths that were taken in another clone, worktree or computer, so the
+	 * files can be saved and checked in here. Nothing is sent to the server.
+	 */
+	void ClaimLocks(const TArray<FString>& Paths);
 
 	void CreateBranch(const FString& Name);
 	void SwitchBranch(const FString& Name);

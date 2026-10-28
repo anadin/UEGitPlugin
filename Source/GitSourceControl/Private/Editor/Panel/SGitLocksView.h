@@ -37,8 +37,10 @@ public:
 	FText GetFilterText() const { return FText::FromString(Filter); }
 	/** Name and icon of a file, cached until the locks change. */
 	const FGitFileDisplay& GetDisplay(const FString& Path);
-	/** "You", "You, in another clone" or the owner's name. */
+	/** "You", "You, elsewhere" or the owner's name. */
 	FText GetOwnerText(const GitCore::FLockInfo& Lock) const;
+	/** Yours, but taken in another clone, worktree or computer. */
+	bool IsElsewhere(const GitCore::FLockInfo& Lock) const;
 
 private:
 	void OnModelChanged();
@@ -52,6 +54,9 @@ private:
 	/** Selected locks, and the locks in selected folders. */
 	TArray<TSharedPtr<GitCore::FLockInfo>> SelectedLocks() const;
 	void Release(bool bForce);
+	/** Takes over the selected locks you took elsewhere (another clone, worktree or computer). */
+	void Claim();
+	bool CanClaim() const;
 
 	TWeakPtr<FGitWorkspaceModel> WeakModel;
 	FDelegateHandle ChangedHandle;
@@ -62,6 +67,8 @@ private:
 	TSet<FString> CollapsedFolders;
 	FString Filter;
 	uint64 BuiltGeneration = MAX_uint64;
+	/** Your locks taken elsewhere, in the whole list (not only the ones shown). */
+	int32 ElsewhereCount = 0;
 	bool bBuiltFolders = true;
 	bool bRestoringExpansion = false;
 	bool bMineOnly = false;

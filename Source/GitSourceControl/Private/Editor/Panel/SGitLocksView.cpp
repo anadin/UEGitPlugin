@@ -10,6 +10,7 @@
 #include "HAL/PlatformApplicationMisc.h"
 #include "RevisionControlStyle/RevisionControlStyle.h"
 #include "Styling/AppStyle.h"
+#include "Types/ISlateMetaData.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SSearchBox.h"
@@ -68,10 +69,13 @@ namespace
 					: SNullWidget::NullWidget;
 			}
 			const GitCore::FLockInfo& Lock = *Item->Lock;
+			const bool bElsewhere = Pinned->IsElsewhere(Lock);
 			if (Column == FileColumn)
 			{
+				// Same icons as the Content Browser: checked out here, locked by you elsewhere, or someone else's.
 				const FGitFileDisplay& Display = Pinned->GetDisplay(Lock.Path);
-				const FSlateBrush* Icon = FRevisionControlStyleManager::Get().GetBrush(Lock.bOurs ? "RevisionControl.CheckedOut" : "RevisionControl.CheckedOutByOtherUser");
+				const FSlateBrush* Icon = FRevisionControlStyleManager::Get().GetBrush(
+					bElsewhere ? "RevisionControl.Locked" : Lock.bOurs ? "RevisionControl.CheckedOut" : "RevisionControl.CheckedOutByOtherUser");
 				return GitFileTree::MakeNameCell(SharedThis(this), false, Display.Name, GitFileTree::ShowFolders() ? FText::GetEmpty() : Display.Folder, Icon,
 					FText::FromString(Lock.Path), Highlight);
 			}
@@ -79,6 +83,7 @@ namespace
 			{
 				return SNew(STextBlock)
 					.Text(Pinned->GetOwnerText(Lock))
+					.ToolTipText(bElsewhere ? GitWorkspaceText::ClaimLockTooltip() : FText::GetEmpty())
 					.HighlightText(Highlight)
 					.OverflowPolicy(ETextOverflowPolicy::Ellipsis);
 			}
@@ -171,14 +176,21 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 						return LOCTEXT("LockingOff", "This project does not use locks: no .gitattributes file marks files lockable, or locking is turned off in the revision control settings.");
 					}
 					const GitCore::FLockSnapshot& Snapshot = Model->GetSnapshot()->Locks;
+					FText Checked;
 					if (!Snapshot.Error.IsEmpty())
 					{
-						return Snapshot.bVerified
+						Checked = Snapshot.bVerified
 							? FText::Format(LOCTEXT("LocksStale", "Checked {0}; the last check failed: {1}"), GitWorkspaceText::Age(Snapshot.VerifiedAtUtc), FText::FromString(Snapshot.Error))
 							: FText::FromString(Snapshot.Error);
 					}
-					return Snapshot.bVerified ? FText::Format(LOCTEXT("LocksChecked", "Checked {0}."), GitWorkspaceText::Age(Snapshot.VerifiedAtUtc))
-						: LOCTEXT("LocksNotChecked", "Not checked yet.");
+					else
+					{
+						Checked = Snapshot.bVerified ? FText::Format(LOCTEXT("LocksChecked", "Checked {0}."), GitWorkspaceText::Age(Snapshot.VerifiedAtUtc))
+							: LOCTEXT("LocksNotChecked", "Not checked yet.");
+					}
+					return ElsewhereCount == 0 ? Checked
+						: FText::Format(LOCTEXT("LocksElsewhere", "{0} You hold {1} {1}|plural(one=lock,other=locks) taken elsewhere; Claim makes {1}|plural(one=it,other=them) usable here."),
+							Checked, ElsewhereCount);
 				})
 			]
 			+ SHorizontalBox::Slot()
@@ -189,6 +201,17 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 				.ToolTipText(LOCTEXT("CheckNowTooltip", "Ask the server who holds which locks."))
 				.IsEnabled_Lambda([this]() { const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin(); return Model.IsValid() && Model->IsLockingEnabled() && !Model->IsBusy(); })
 				.OnClicked_Lambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin()) { Model->CheckLocks(); } return FReply::Handled(); })
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("Claim", "Claim"))
+				.ToolTipText(GitWorkspaceText::ClaimLockTooltip())
+				.Visibility_Lambda([this]() { return ElsewhereCount > 0 ? EVisibility::Visible : EVisibility::Collapsed; })
+				.IsEnabled(this, &SGitLocksView::CanClaim)
+				.OnClicked_Lambda([this]() { Claim(); return FReply::Handled(); })
 			]
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
@@ -209,6 +232,7 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 		.FillHeight(1.0f)
 		[
 			SAssignNew(Tree, STreeView<FItemPtr>)
+			.AddMetaData<FTagMetaData>(TEXT("GitPanel.Locks.List"))
 			.TreeItemsSource(&Items)
 			.SelectionMode(ESelectionMode::Multi)
 			.OnGenerateRow(this, &SGitLocksView::OnGenerateRow)
@@ -277,8 +301,13 @@ FText SGitLocksView::GetOwnerText(const GitCore::FLockInfo& Lock) const
 	{
 		return FText::FromString(Lock.Owner);
 	}
+	return IsElsewhere(Lock) ? LOCTEXT("OwnerYouElsewhere", "You, elsewhere") : LOCTEXT("OwnerYou", "You");
+}
+
+bool SGitLocksView::IsElsewhere(const GitCore::FLockInfo& Lock) const
+{
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
-	return Model.IsValid() && Model->GetSnapshot()->LocksTakenHere.Contains(Lock.Id) ? LOCTEXT("OwnerYou", "You") : LOCTEXT("OwnerYouElsewhere", "You, in another clone");
+	return Model.IsValid() && Model->GetSnapshot()->IsOursElsewhere(Lock);
 }
 
 void SGitLocksView::Rebuild()
@@ -313,9 +342,11 @@ void SGitLocksView::Rebuild()
 		FItemPtr Item;
 	};
 	TArray<FSortable> Sortable;
+	ElsewhereCount = 0;
 	for (const TPair<FString, GitCore::FLockInfo>& Pair : Snapshot->Locks.ByPath)
 	{
 		const GitCore::FLockInfo& Lock = Pair.Value;
+		ElsewhereCount += Snapshot->IsOursElsewhere(Lock) ? 1 : 0;
 		if (bMineOnly && !Lock.bOurs)
 		{
 			continue;
@@ -452,6 +483,12 @@ TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 		}
 	}
 	FMenuBuilder Menu(true, nullptr);
+	if (Selected.ContainsByPredicate([this](const TSharedPtr<GitCore::FLockInfo>& Lock) { return IsElsewhere(*Lock); }))
+	{
+		Menu.AddMenuEntry(LOCTEXT("ClaimMenu", "Claim lock"), GitWorkspaceText::ClaimLockTooltip(),
+			FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Actions.CheckOut"),
+			FUIAction(FExecuteAction::CreateSP(this, &SGitLocksView::Claim), FCanExecuteAction::CreateSP(this, &SGitLocksView::CanClaim)));
+	}
 	if (bAnyMine)
 	{
 		Menu.AddMenuEntry(LOCTEXT("ReleaseMenu", "Release"), LOCTEXT("ReleaseMenuTooltip", "Release your selected locks. Local changes stay."),
@@ -520,6 +557,29 @@ void SGitLocksView::Release(bool bForce)
 		return;
 	}
 	Model->Unlock(Paths, bForce);
+}
+
+bool SGitLocksView::CanClaim() const
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	return Model.IsValid() && !Model->IsBusy() && SelectedLocks().ContainsByPredicate([this](const TSharedPtr<GitCore::FLockInfo>& Lock) { return IsElsewhere(*Lock); });
+}
+
+void SGitLocksView::Claim()
+{
+	TArray<FString> Paths;
+	for (const TSharedPtr<GitCore::FLockInfo>& Lock : SelectedLocks())
+	{
+		if (IsElsewhere(*Lock))
+		{
+			Paths.Add(Lock->Path);
+		}
+	}
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	if (Model.IsValid() && !Paths.IsEmpty())
+	{
+		Model->ClaimLocks(Paths);
+	}
 }
 
 #undef LOCTEXT_NAMESPACE

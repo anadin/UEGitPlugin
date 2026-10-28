@@ -51,7 +51,7 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 | **Check in 2** | Opens Unreal's Submit Content dialog for your 2 changed assets. |
 | **Push 1** | Publishes a commit you made earlier (for example from the Git panel). |
 
-**Editing.** When you start editing a lockable asset, Unreal asks to check it out; Git Workspace takes the lock. If someone else holds it, the Content Browser shows who, and Check Out is refused. Saving never talks to the server: when you save an asset you have not checked out, Unreal's own dialog offers Check Out or Make Writable.
+**Editing.** When you start editing a lockable asset, Unreal asks to check it out; Git Workspace takes the lock. If someone else holds it, the Content Browser shows who, and Check Out is refused. If you took the lock yourself in another clone, worktree or computer, the asset shows **Locked by you elsewhere**: right-click it and choose **Claim Lock** (Check Out does the same) to save and check it in from this copy; nothing is sent to the server, so stop editing it in the other copy. Saving never talks to the server: when you save an asset you have not checked out, Unreal's own dialog offers Check Out or Make Writable.
 
 **Checking in.** Check in commits exactly the files you leave ticked in the Submit dialog, using your description as the commit message, then pushes and releases their locks. Tick **Keep files checked out** to keep the locks. New assets are added when you check them in. If a teammate pushed first, your commit is kept and Git Workspace tells you to Sync and push again; your locks stay.
 
@@ -59,17 +59,17 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 
 **Reverting.** Revert restores the last committed version, keeps a copy of what it overwrote in `Saved/GitSourceControl/Backups` and releases the lock unless a commit you have not pushed still needs it.
 
-**Badges.** The Content Browser shows checked-out (locked by you), locked by someone else, locked by you in another clone, newer version on the server, new, modified and deleted files.
+**Badges.** The Content Browser shows checked-out (locked by you), locked by someone else, locked by you elsewhere, newer version on the server, new, modified and deleted files.
 
 ## The Git panel
 
 Open it with **Window > Git**, the branch button in the status bar, **Revision Control > Git Panel**, or **Show in Git Panel** on assets in the Content Browser.
 
 - **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Sync** and **Push**. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
-- **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file; a text file's changes show below its details. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Lock, Release lock and Discard changes.
+- **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file; a text file's changes show below its details. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Lock, Claim lock, Release lock and Discard changes.
 - **History**: commits on your branch (unpushed ones are marked), searchable by summary, author or commit id; select one to see its files, and a text file to see how the commit changed it.
 - **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes. Search them by name.
-- **Locks**: every lock on the server, yours first, searchable by file or owner. Release your own locks, or someone else's when they cannot.
+- **Locks**: every lock on the server, yours first, searchable by file or owner. Release your own locks, or someone else's when they cannot. Locks you took in another clone, worktree or computer show as **You, elsewhere**; select them and **Claim** to use them in this copy.
 
 Every file list shows files in their folders. Folders that only hold one folder share a row (`Source/Demo`), and World Partition actors sit under their level, without the hash folders. Selecting a folder selects its files: Stage, Discard, Lock and Release act on all of them. Alt+click a folder (Option+click on macOS), or Shift+click its arrow, to open or close everything in it. The folder button next to each search box switches every list between folders and one list of paths.
 
@@ -107,7 +107,7 @@ On macOS, use Cmd instead of Ctrl.
 ## Troubleshooting
 
 - **"… is locked by …"**: someone else holds the lock. Ask them to check in or release it; the Git panel's Locks tab can force-release it if they cannot.
-- **"Locked by you in another clone"**: you hold the lock from another copy of the project. Check Out takes it over for this copy.
+- **"Locked by you elsewhere"**: you took the lock in another copy of the project (a clone, a worktree or another computer). **Claim lock** (Content Browser, or the Git panel's Changes and Locks tabs) or Check Out takes it over for this copy without contacting the server. The other copy may still treat the lock as its own, so finish or drop the work there.
 - **"The server has newer commits"**: your commit was kept locally. Sync, then Push.
 - **"Nothing was changed: you have local changes …"** during Sync or a branch switch: check in, stash or revert those files first.
 - **Fetch or push fails with an authentication error**: make sure `git fetch` works in a terminal for this repository without prompting. Background checks never prompt; they back off and retry.

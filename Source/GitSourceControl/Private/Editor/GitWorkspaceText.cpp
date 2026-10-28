@@ -106,6 +106,12 @@ namespace GitWorkspaceText
 	{
 		return Commit.Left(8);
 	}
+
+	FText ClaimLockTooltip()
+	{
+		return LOCTEXT("ClaimLockTooltip", "Locked by you in another clone, worktree or computer. Claim the lock to save and check in the file here; "
+			"nothing is sent to the server. Stop editing the file in the other copy.");
+	}
 }
 
 namespace

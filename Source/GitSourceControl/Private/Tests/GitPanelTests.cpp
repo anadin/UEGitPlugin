@@ -7,10 +7,12 @@
 #include "Editor/Panel/SGitChangesView.h"
 #include "Editor/Panel/SGitDiffView.h"
 #include "Editor/Panel/SGitHistoryView.h"
+#include "Editor/Panel/SGitLocksView.h"
 #include "Editor/Panel/SGitPanel.h"
 #include "Editor/Panel/SGitStashesView.h"
 
 #include "Framework/Application/SlateApplication.h"
+#include "HAL/PlatformFileManager.h"
 #include "ImageCore.h"
 #include "ImageUtils.h"
 #include "Misc/App.h"
@@ -251,6 +253,43 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 		const GitCore::FLockInfo* Lock = Snapshot.Locks.Find(TEXT("Content/Hero.uasset"));
 		return Lock && Lock->bOurs;
 	}));
+
+	// A lock you took in another clone: the server says it is yours, but this clone has no record of taking it.
+	const FString HeroFile = Team.Alice / TEXT("Content/Hero.uasset");
+	auto IsElsewhere = [&Panel]()
+	{
+		const GitCore::FSessionSnapshotRef Snapshot = Panel.Provider.Snapshot();
+		const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(TEXT("Content/Hero.uasset"));
+		return Lock && Snapshot->IsOursElsewhere(*Lock);
+	};
+	{
+		const GitCore::FSessionSnapshotRef Snapshot = Panel.Provider.Snapshot();
+		if (const GitCore::FLockInfo* Taken = Snapshot->Locks.Find(TEXT("Content/Hero.uasset")))
+		{
+			Panel.Provider->GetSession()->GetJournal().Remove(Snapshot->Locks.Endpoint, Taken->Id);
+		}
+	}
+	Panel.Model->CheckLocks();
+	TestTrue(TEXT("Checking locks finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("The lock shows as yours from elsewhere"), IsElsewhere());
+	FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*HeroFile, true);
+	Panel.Model->ClaimLocks({TEXT("Content/Hero.uasset"), TEXT("readme.txt")});
+	TestTrue(TEXT("Claiming finishes"), Panel.WaitIdle());
+	TestFalse(TEXT("The claim succeeded"), Panel.Model->GetLastFailure().IsSet());
+	TestFalse(TEXT("The claimed lock is used here"), IsElsewhere());
+	TestFalse(TEXT("The claimed file is writable"), FPlatformFileManager::Get().GetPlatformFile().IsReadOnly(*HeroFile));
+	Panel.Model->CheckLocks();
+	TestTrue(TEXT("Checking locks again finishes"), Panel.WaitIdle());
+	TestFalse(TEXT("The claim survives a lock check"), IsElsewhere());
+	TArray<FSourceControlStateRef> States;
+	Panel.Provider->GetState({HeroFile}, States, EStateCacheUsage::Use);
+	TestTrue(TEXT("The editor shows the claimed file as checked out"), States.Num() == 1 && States[0]->IsCheckedOut());
+	AddExpectedErrorPlain(TEXT("None of these locks is yours from elsewhere"), EAutomationExpectedErrorFlags::Contains, 1);
+	Panel.Model->ClaimLocks({TEXT("Content/Hero.uasset")});
+	TestTrue(TEXT("Claiming again finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("Nothing is left to claim"), Panel.Model->GetLastFailure().IsSet());
+	Panel.Model->DismissFailure();
+
 	Panel.Model->Unlock({TEXT("Content/Hero.uasset")}, false);
 	TestTrue(TEXT("Releasing finishes"), Panel.WaitIdle());
 	GitCore::FLockSnapshot Server;
@@ -560,7 +599,25 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("history")); State->Widget->ShowTab(2); }, 1.5f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { SelectFirst<SGitStashesView::FStashPtr>(State->Widget.ToSharedRef(), TEXT("GitPanel.Stashes.List")); }, 1.0f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("stashes")); State->Widget->ShowTab(3); }, 1.5f));
-	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("locks")); State->Window->RequestDestroyWindow(); }, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("locks"));
+		// Alice's lock on Hero as if she took it in another clone: the server says it is hers, but this clone has no record of it.
+		const GitCore::FGitSessionPtr Session = State->Panel->Provider->GetSession();
+		const GitCore::FSessionSnapshotRef Snapshot = Session->GetSnapshot();
+		if (const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(TEXT("Content/Hero.uasset")))
+		{
+			Session->GetJournal().Remove(Snapshot->Locks.Endpoint, Lock->Id);
+		}
+		State->Panel->Model->CheckLocks();
+	}, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { SelectFirst<SGitLocksView::FItemPtr>(State->Widget.ToSharedRef(), TEXT("GitPanel.Locks.List")); }, 2.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("locks-elsewhere"));
+		State->Widget->ShowPaths({TEXT("Content/Hero.uasset")});
+	}, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-claim")); State->Window->RequestDestroyWindow(); }, 1.5f));
 	return true;
 }
 

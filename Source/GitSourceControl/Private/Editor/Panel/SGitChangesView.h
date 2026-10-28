@@ -66,6 +66,8 @@ public:
 	const FGitFileDisplay& GetDisplay(const FString& Path);
 	/** "You", "Alice · 12 min ago" or empty. */
 	FText GetLockText(const FString& Path) const;
+	/** The file is locked by you, but the lock was taken in another clone, worktree or computer. */
+	bool IsLockedElsewhere(const FString& Path) const;
 	/** The search text, highlighted in the rows. */
 	FText GetFilterText() const { return FText::FromString(Filter); }
 	/** Stages or unstages a file, or every file in a folder. */
@@ -102,6 +104,8 @@ private:
 	void DiscardSelection();
 	void DiffSelection();
 	void LockSelection(bool bLock, bool bForce);
+	/** Takes over the selected files' locks you took in another clone, worktree or computer. */
+	void ClaimSelection();
 	void Commit(bool bPush);
 	bool CanCommit() const;
 

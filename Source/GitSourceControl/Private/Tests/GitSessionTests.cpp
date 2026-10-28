@@ -145,9 +145,18 @@ bool FGitSessionLockJournalTest::RunTest(const FString&)
 		ON_SCOPE_EXIT { OtherSession->Close(); };
 		OnMutationLane(*OtherSession, [&]() { OtherSession->RefreshStatus(nullptr, &Error); });
 		TestTrue(TEXT("The other worktree verifies"), OtherSession->RefreshLocks(GitCore::ECallKind::UserNetwork, &Error));
-		const GitCore::FLockInfo* Seen = OtherSession->GetSnapshot()->Locks.Find(TEXT("Content/Hero.uasset"));
+		const GitCore::FSessionSnapshotRef OtherSnapshot = OtherSession->GetSnapshot();
+		const GitCore::FLockInfo* Seen = OtherSnapshot->Locks.Find(TEXT("Content/Hero.uasset"));
 		TestTrue(TEXT("The server says the lock is ours"), Seen && Seen->bOurs);
-		TestFalse(TEXT("But it was not taken in this worktree"), OtherSession->GetSnapshot()->LocksTakenHere.Contains(Lock.Id));
+		TestFalse(TEXT("But it was not taken in this worktree"), OtherSnapshot->LocksTakenHere.Contains(Lock.Id));
+		TestTrue(TEXT("So it is yours from elsewhere"), Seen && OtherSnapshot->IsOursElsewhere(*Seen));
+
+		// Claiming moves the record to the other worktree: the first one now sees the lock as taken elsewhere.
+		TestTrue(TEXT("Claim the lock in the other worktree"), Seen && OtherSession->RecordLockTaken(*Seen, &Error));
+		TestTrue(TEXT("The other worktree verifies again"), OtherSession->RefreshLocks(GitCore::ECallKind::UserNetwork, &Error));
+		TestTrue(TEXT("The claim survives a lock check"), OtherSession->GetSnapshot()->LocksTakenHere.Contains(Lock.Id));
+		TestTrue(TEXT("The first worktree verifies"), Session->RefreshLocks(GitCore::ECallKind::UserNetwork, &Error));
+		TestFalse(TEXT("The first worktree no longer holds it here"), Session->GetSnapshot()->LocksTakenHere.Contains(Lock.Id));
 	}
 
 	TestTrue(TEXT("Release the lock"), Session->GetRepository().Unlock(TEXT("origin"), Lock.Id, false).bOk);

@@ -3,6 +3,7 @@
 
 #include "GitSourceControlModule.h"
 #include "GitWorkspaceModel.h"
+#include "GitWorkspaceText.h"
 #include "Panel/SGitPanel.h"
 #include "Provider/GitSourceControlUserSettings.h"
 
@@ -226,6 +227,36 @@ namespace
 			{
 				GitEditorIntegration::ShowInPanel(Files);
 			})));
+
+		const GitCore::FGitSessionPtr Session = Workspace->GetSession();
+		const GitCore::FSessionSnapshotRef Snapshot = Workspace->GetSnapshot();
+		TArray<FString> Claimable;
+		for (const FString& File : Files)
+		{
+			const FString Path = Session.IsValid() ? Session->GetRepository().ToRelative(File) : FString();
+			const GitCore::FLockInfo* Lock = Path.IsEmpty() ? nullptr : Snapshot->Locks.Find(Path);
+			if (Lock && Snapshot->IsOursElsewhere(*Lock))
+			{
+				Claimable.Add(Path);
+			}
+		}
+		if (!Claimable.IsEmpty())
+		{
+			Section.AddMenuEntry("GitClaimLock", LOCTEXT("ClaimLock", "Claim Lock"), GitWorkspaceText::ClaimLockTooltip(),
+				FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Actions.CheckOut"),
+				FUIAction(FExecuteAction::CreateLambda([Claimable]()
+				{
+					if (FGitWorkspaceModel* Model = FGitWorkspaceModel::Get())
+					{
+						Model->ClaimLocks(Claimable);
+					}
+				}),
+				FCanExecuteAction::CreateLambda([]()
+				{
+					const FGitWorkspaceModel* Model = FGitWorkspaceModel::Get();
+					return Model && !Model->IsBusy();
+				})));
+		}
 	}
 
 	void RegisterMenus()

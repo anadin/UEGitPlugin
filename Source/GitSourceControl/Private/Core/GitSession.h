@@ -51,6 +51,8 @@ namespace GitCore
 
 		bool IsTracked(const FString& Path) const { return Tracked.IsValid() && Tracked->Contains(Path); }
 		const FFileAttributes* FindAttributes(const FString& Path) const { return Attributes.IsValid() ? Attributes->Find(Path) : nullptr; }
+		/** A lock the server says is ours that this worktree did not take: it was taken in another clone, worktree or computer. */
+		bool IsOursElsewhere(const FLockInfo& Lock) const { return Lock.bOurs && !LocksTakenHere.Contains(Lock.Id); }
 	};
 	using FSessionSnapshotRef = TSharedRef<const FSessionSnapshot, ESPMode::ThreadSafe>;
 
@@ -99,7 +101,11 @@ namespace GitCore
 		void RefreshBranches();
 		/** Makes sure attributes are known for Paths (used before answering lock questions). */
 		bool EnsureAttributes(const TArray<FString>& Paths);
-		void RecordLockTaken(const FLockInfo& Lock);
+		/**
+		 * Records that this worktree holds Lock, taken here or claimed from elsewhere. False when the
+		 * record could not be written: the lock then shows as held here only until locks are next checked.
+		 */
+		bool RecordLockTaken(const FLockInfo& Lock, FString* OutError = nullptr);
 		void RecordLockReleased(const FString& Path);
 		void SetMarkedForAdd(const TArray<FString>& Paths, bool bMarked);
 

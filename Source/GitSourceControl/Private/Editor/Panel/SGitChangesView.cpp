@@ -188,6 +188,7 @@ namespace
 			{
 				const FText Lock = Pinned->GetLockText(Entry.Path);
 				return SNew(SHorizontalBox)
+					.ToolTipText(Pinned->IsLockedElsewhere(Entry.Path) ? GitWorkspaceText::ClaimLockTooltip() : FText::GetEmpty())
 					+ SHorizontalBox::Slot()
 					.AutoWidth()
 					.VAlign(VAlign_Center)
@@ -631,7 +632,7 @@ FText SGitChangesView::GetLockText(const FString& Path) const
 	}
 	if (Lock->bOurs)
 	{
-		return Snapshot->LocksTakenHere.Contains(Lock->Id) ? LOCTEXT("LockedByYou", "You") : LOCTEXT("LockedByYouElsewhere", "You, in another clone");
+		return Snapshot->IsOursElsewhere(*Lock) ? LOCTEXT("LockedByYouElsewhere", "You, elsewhere") : LOCTEXT("LockedByYou", "You");
 	}
 	return Lock->LockedAt.GetTicks() > 0
 		? FText::Format(LOCTEXT("LockedByOwner", "{0} · {1}"), FText::FromString(Lock->Owner), GitWorkspaceText::Age(Lock->LockedAt))
@@ -937,6 +938,29 @@ void SGitChangesView::DiffSelection()
 	}
 }
 
+bool SGitChangesView::IsLockedElsewhere(const FString& Path) const
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	if (!Model.IsValid())
+	{
+		return false;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = Model->GetSnapshot();
+	const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Path);
+	return Lock && Snapshot->IsOursElsewhere(*Lock);
+}
+
+void SGitChangesView::ClaimSelection()
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	TArray<FString> Paths = SelectedPaths();
+	Paths.RemoveAll([this](const FString& Path) { return !IsLockedElsewhere(Path); });
+	if (Model.IsValid() && !Paths.IsEmpty())
+	{
+		Model->ClaimLocks(Paths);
+	}
+}
+
 void SGitChangesView::LockSelection(bool bLock, bool bForce)
 {
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
@@ -971,16 +995,20 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	const bool bAnyUnstaged = !SelectedPaths(false).IsEmpty();
 	const bool bAnyStaged = !SelectedPaths(true).IsEmpty();
 	bool bAnyMine = false;
+	bool bAnyElsewhere = false;
 	bool bAnyTheirs = false;
 	bool bAnyLockable = false;
 	for (const FItemPtr& Item : Files)
 	{
-		if (const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Item->Entry.Path))
+		const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Item->Entry.Path);
+		if (Lock)
 		{
 			(Lock->bOurs ? bAnyMine : bAnyTheirs) = true;
+			bAnyElsewhere |= Snapshot->IsOursElsewhere(*Lock);
 		}
+		// Only unlocked files can be locked; your locks from elsewhere are claimed instead.
 		const GitCore::FFileAttributes* Attributes = Snapshot->FindAttributes(Item->Entry.Path);
-		bAnyLockable |= Attributes && Attributes->bLockable && !Item->Entry.IsAdded();
+		bAnyLockable |= !Lock && Attributes && Attributes->bLockable && !Item->Entry.IsAdded();
 	}
 	const FItemPtr Single = SingleSelection();
 	const TArray<FItemPtr> Folders = SelectedFolders();
@@ -1054,6 +1082,11 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 		{
 			Menu.AddMenuEntry(LOCTEXT("LockMenu", "Lock (check out)"), LOCTEXT("LockMenuTooltip", "Take the lock so nobody else edits these assets."),
 				FSlateIcon(StyleName, "RevisionControl.Actions.CheckOut"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::LockSelection, true, false)));
+		}
+		if (bAnyElsewhere)
+		{
+			Menu.AddMenuEntry(LOCTEXT("ClaimMenu", "Claim lock"), GitWorkspaceText::ClaimLockTooltip(),
+				FSlateIcon(StyleName, "RevisionControl.Actions.CheckOut"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::ClaimSelection)));
 		}
 		if (bAnyMine)
 		{
@@ -1200,29 +1233,51 @@ TSharedRef<SWidget> SGitChangesView::MakeInspector()
 				.AutoHeight()
 				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
 				[
-					SNew(STextBlock)
-					.AutoWrapText(true)
-					.Text_Lambda([this, Selected]()
-					{
-						const FItemPtr Item = Selected();
-						const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
-						if (!Item.IsValid() || !Model.IsValid() || !Model->IsLockingEnabled())
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					.VAlign(VAlign_Center)
+					[
+						SNew(STextBlock)
+						.AutoWrapText(true)
+						.Text_Lambda([this, Selected]()
 						{
-							return FText::GetEmpty();
-						}
-						const GitCore::FSessionSnapshotRef Snapshot = Model->GetSnapshot();
-						if (const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Item->Entry.Path))
-						{
-							if (Lock->bOurs)
+							const FItemPtr Item = Selected();
+							const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+							if (!Item.IsValid() || !Model.IsValid() || !Model->IsLockingEnabled())
 							{
-								return Snapshot->LocksTakenHere.Contains(Lock->Id) ? LOCTEXT("YouHoldLock", "You hold the lock.")
-									: LOCTEXT("YouHoldLockElsewhere", "You hold the lock in another clone. Check out to use it here.");
+								return FText::GetEmpty();
 							}
-							return FText::Format(LOCTEXT("LockedBy", "Locked by {0}."), GetLockText(Item->Entry.Path));
-						}
-						const GitCore::FFileAttributes* Attributes = Model->GetSnapshot()->FindAttributes(Item->Entry.Path);
-						return Attributes && Attributes->bLockable ? LOCTEXT("NotLocked", "Not locked.") : LOCTEXT("NotLockable", "Not lockable.");
-					})
+							const GitCore::FSessionSnapshotRef Snapshot = Model->GetSnapshot();
+							if (const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Item->Entry.Path))
+							{
+								if (Lock->bOurs)
+								{
+									return Snapshot->IsOursElsewhere(*Lock) ? LOCTEXT("YouHoldLockElsewhere", "You took the lock elsewhere. Claim it to save and check in here.")
+										: LOCTEXT("YouHoldLock", "You hold the lock.");
+								}
+								return FText::Format(LOCTEXT("LockedBy", "Locked by {0}."), GetLockText(Item->Entry.Path));
+							}
+							const GitCore::FFileAttributes* Attributes = Model->GetSnapshot()->FindAttributes(Item->Entry.Path);
+							return Attributes && Attributes->bLockable ? LOCTEXT("NotLocked", "Not locked.") : LOCTEXT("NotLockable", "Not lockable.");
+						})
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("InspectorClaim", "Claim lock"))
+						.ToolTipText(GitWorkspaceText::ClaimLockTooltip())
+						.Visibility_Lambda([this, Selected]()
+						{
+							const FItemPtr Item = Selected();
+							return Item.IsValid() && IsLockedElsewhere(Item->Entry.Path) ? EVisibility::Visible : EVisibility::Collapsed;
+						})
+						.IsEnabled_Lambda([this]() { const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin(); return M.IsValid() && !M->IsBusy(); })
+						.OnClicked_Lambda([this]() { ClaimSelection(); return FReply::Handled(); })
+					]
 				]
 				+ SVerticalBox::Slot()
 				.AutoHeight()

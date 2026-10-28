@@ -18,6 +18,7 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "IContentBrowserSingleton.h"
 #include "ISourceControlModule.h"
@@ -605,6 +606,45 @@ void FGitWorkspaceModel::Unlock(const TArray<FString>& Paths, bool bForce)
 			return FGitActionResult::Failure(FText::Format(LOCTEXT("UnlockFailed", "Could not release the lock on {0}."), GitWorkspaceText::FileList(Failed)), Details);
 		}
 		return FGitActionResult::Success(FText::Format(LOCTEXT("Unlocked", "Released {0} {0}|plural(one=lock,other=locks)."), Released.Num()));
+	});
+}
+
+void FGitWorkspaceModel::ClaimLocks(const TArray<FString>& Paths)
+{
+	Run(LOCTEXT("Claiming", "Claiming locks…"), ELane::Mutation, [Paths](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		// The server already lists these locks as yours: this worktree only records that it uses them now.
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		TArray<FString> Claimed;
+		TArray<FString> Failed;
+		FString Details;
+		for (const FString& Path : Paths)
+		{
+			const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Path);
+			if (!Lock || !Snapshot->IsOursElsewhere(*Lock))
+			{
+				continue;
+			}
+			FString Error;
+			if (!Session.RecordLockTaken(*Lock, &Error))
+			{
+				Failed.Add(Path);
+				Details += Error + TEXT("\n");
+				continue;
+			}
+			// Git LFS leaves lockable files read-only until they are locked.
+			FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*Session.GetRepository().ToAbsolute(Path), false);
+			Claimed.Add(Path);
+		}
+		if (!Failed.IsEmpty())
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("ClaimFailed", "Could not claim the lock on {0}."), GitWorkspaceText::FileList(Failed)), Details);
+		}
+		if (Claimed.IsEmpty())
+		{
+			return FGitActionResult::Failure(LOCTEXT("NothingToClaim", "None of these locks is yours from elsewhere any more. Check locks to see who holds them."));
+		}
+		return FGitActionResult::Success(FText::Format(LOCTEXT("Claimed", "Claimed the lock on {0}. You can save and check in here."), GitWorkspaceText::FileList(Claimed)));
 	});
 }
 
