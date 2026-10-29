@@ -250,14 +250,14 @@ TSharedRef<SWidget> SGitPanel::MakeToolbar()
 					IconText(FAppStyle::GetBrush("Icons.Refresh"), TAttribute<FText>::CreateLambda([this]() { return IsCompact() ? FText::GetEmpty() : LOCTEXT("Fetch", "Fetch"); }))
 				]
 			]
-			// Sync
+			// Pull
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
 			.Padding(2.0f, 0.0f)
 			[
 				SNew(SButton)
 				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
-				.ToolTipText(LOCTEXT("SyncTooltip", "Get the new commits: Unreal saves your work, updates the files and reloads changed assets."))
+				.ToolTipText(LOCTEXT("PullTooltip", "Get the new commits: Unreal saves your work, updates the files and reloads changed assets."))
 				.IsEnabled_Lambda([Model, Idle]() { return Idle() && Model()->GetSnapshot()->Remote.Behind > 0; })
 				.OnClicked_Lambda([Model]() { if (const TSharedPtr<FGitWorkspaceModel> M = Model()) { M->Sync(); } return FReply::Handled(); })
 				[
@@ -269,7 +269,7 @@ TSharedRef<SWidget> SGitPanel::MakeToolbar()
 						{
 							return Behind > 0 ? FText::AsNumber(Behind) : FText::GetEmpty();
 						}
-						return Behind > 0 ? FText::Format(LOCTEXT("SyncCount", "Sync {0}"), Behind) : LOCTEXT("Sync", "Sync");
+						return Behind > 0 ? FText::Format(LOCTEXT("PullCount", "Pull {0}"), Behind) : LOCTEXT("Pull", "Pull");
 					}))
 				]
 			]

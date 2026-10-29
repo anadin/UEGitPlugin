@@ -133,7 +133,7 @@ bool FGitRemotePushTest::RunTest(const FString&)
 	Status = ReadStatus(*this, *Repository);
 	const GitCore::FOpResult Rejected = Repository->Push(Status, TEXT("origin"), nullptr);
 	TestFalse(TEXT("A push behind the server is rejected"), Rejected.bOk);
-	TestTrue(TEXT("The message says to sync first"), Rejected.Message.Contains(TEXT("Sync")));
+	TestTrue(TEXT("The message says to pull first"), Rejected.Message.Contains(TEXT("Pull")));
 	return true;
 }
 

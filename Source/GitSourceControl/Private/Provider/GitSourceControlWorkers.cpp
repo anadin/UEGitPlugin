@@ -123,7 +123,7 @@ namespace
 		}
 		if (Snapshot->Remote.IncomingPaths.Contains(Path))
 		{
-			Command.AddError(FText::Format(LOCTEXT("NewerOnServer", "A newer version of {0} is on the server. Sync first, then check it out."), FText::FromString(FPaths::GetCleanFilename(Path))));
+			Command.AddError(FText::Format(LOCTEXT("NewerOnServer", "A newer version of {0} is on the server. Pull first, then check it out."), FText::FromString(FPaths::GetCleanFilename(Path))));
 			return false;
 		}
 		FLockInfo Lock;
@@ -628,12 +628,12 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 	const FRemoteState& Remote = Snapshot->Remote;
 	if (Snapshot->Status.Branch.IsEmpty())
 	{
-		Command.AddError(LOCTEXT("SyncDetached", "Switch to a branch before syncing; HEAD is detached."));
+		Command.AddError(LOCTEXT("SyncDetached", "Switch to a branch before pulling; HEAD is detached."));
 		return false;
 	}
 	if (Remote.Upstream.IsEmpty())
 	{
-		Command.AddInfo(LOCTEXT("SyncUnpublished", "This branch has not been published yet, so there is nothing to sync."));
+		Command.AddInfo(LOCTEXT("SyncUnpublished", "This branch has not been published yet, so there is nothing to pull."));
 		return true;
 	}
 	if (Remote.Behind == 0)
@@ -643,7 +643,7 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 	}
 	if (Snapshot->Status.bOperationInProgress || Snapshot->Status.HasConflicts())
 	{
-		Command.AddError(LOCTEXT("SyncMidOperation", "Finish the merge or rebase in progress before syncing."));
+		Command.AddError(LOCTEXT("SyncMidOperation", "Finish the merge or rebase in progress before pulling."));
 		return false;
 	}
 	if (!Command.bWholeRepository)
@@ -660,7 +660,7 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		}
 		if (!Others.IsEmpty())
 		{
-			Command.AddError(FText::Format(LOCTEXT("SyncOtherFiles", "Other files also changed on the server ({0}). Use Sync in the status bar to update everything safely."), FText::FromString(FileList(Others))));
+			Command.AddError(FText::Format(LOCTEXT("SyncOtherFiles", "Other files also changed on the server ({0}). Use Pull in the status bar to update everything safely."), FText::FromString(FileList(Others))));
 			return false;
 		}
 	}
@@ -723,7 +723,7 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 			Command.AddInfo(FText::Format(LOCTEXT("SyncNeedsRestart", "Code, config or plugin files changed ({0}). Rebuild and restart the editor to use them."), FText::FromString(FileList(NeedRestart))));
 		}
 	}
-	Command.AddInfo(FText::Format(LOCTEXT("Synced", "Synced {0} {0}|plural(one=commit,other=commits) from {1}."), Remote.Behind, FText::FromString(Remote.Upstream)));
+	Command.AddInfo(FText::Format(LOCTEXT("Pulled", "Pulled {0} {0}|plural(one=commit,other=commits) from {1}."), Remote.Behind, FText::FromString(Remote.Upstream)));
 	Session.RequestLockRefresh(false);
 	Session.RequestStashesAndBranches();
 	return true;

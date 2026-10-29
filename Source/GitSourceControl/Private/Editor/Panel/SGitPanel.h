@@ -11,7 +11,7 @@ class SGitLocksView;
 class SGitStashesView;
 
 /**
- * The Git panel: one toolbar row (branch, sync state, Fetch / Sync / Push), an error banner
+ * The Git panel: one toolbar row (branch, sync state, Fetch / Pull / Push), an error banner
  * when the last action failed, and the Changes, History, Stashes and Locks tabs.
  */
 class SGitPanel : public SCompoundWidget

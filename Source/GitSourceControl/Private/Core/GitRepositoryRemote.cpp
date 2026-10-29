@@ -202,7 +202,7 @@ namespace GitCore
 			const FString Output = Result.StdoutText() + Result.ErrorText();
 			if (IsRejection(Output))
 			{
-				return FOpResult::Failure(TEXT("The server has newer commits. Sync, then push again."), Output);
+				return FOpResult::Failure(TEXT("The server has newer commits. Pull, then push again."), Output);
 			}
 			return FOpResult::Failure(DescribeFailure(Result, TEXT("Pushing")), Output);
 		}
@@ -245,7 +245,7 @@ namespace GitCore
 			Run(ECallKind::LocalMutate, {TEXT("rebase"), TEXT("--abort")});
 			return FOpResult::Failure(TEXT("Your commits conflict with the incoming changes. Nothing was changed; resolve the conflict in an external Git client."), Result.ErrorText());
 		}
-		return FOpResult::Failure(DescribeFailure(Result, TEXT("Syncing")), Result.ErrorText());
+		return FOpResult::Failure(DescribeFailure(Result, TEXT("Pulling")), Result.ErrorText());
 	}
 
 	bool FGitRepository::ChangedPaths(const FString& From, const FString& To, TSet<FString>& Out, FString& OutError) const

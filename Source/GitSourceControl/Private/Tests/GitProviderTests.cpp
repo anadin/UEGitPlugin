@@ -384,7 +384,7 @@ bool FGitProviderCheckOutAndSubmitTest::RunTest(const FString&)
 	const TSharedRef<FCheckIn, ESPMode::ThreadSafe> Rejected = ISourceControlOperation::Create<FCheckIn>();
 	Rejected->SetDescription(FText::FromString(TEXT("Map v3")));
 	TestEqual(TEXT("Submit reports the rejected push"), Run(Alice, Rejected, {Map}), ECommandResult::Failed);
-	TestTrue(TEXT("The commit is kept and Sync is suggested: ") + Messages(Rejected), Messages(Rejected).Contains(TEXT("Committed locally")) && Messages(Rejected).Contains(TEXT("Sync")));
+	TestTrue(TEXT("The commit is kept and Pull is suggested: ") + Messages(Rejected), Messages(Rejected).Contains(TEXT("Committed locally")) && Messages(Rejected).Contains(TEXT("Pull")));
 	TestEqual(TEXT("Alice's commit is local"), GitTest::Output(GitTest::Git(Team.Alice, {TEXT("log"), TEXT("-1"), TEXT("--format=%s")})), FString(TEXT("Map v3")));
 	TestTrue(TEXT("The map stays checked out"), GetState(Alice, Map)->IsCheckedOut());
 	return true;

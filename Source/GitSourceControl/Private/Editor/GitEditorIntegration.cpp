@@ -92,7 +92,7 @@ namespace
 		return Count;
 	}
 
-	/** Branch, Sync, Check in and Push, next to Unreal's own revision control status. */
+	/** Branch, Pull, Check in and Push, next to Unreal's own revision control status. */
 	class SGitStatusBar : public SCompoundWidget
 	{
 	public:
@@ -118,8 +118,8 @@ namespace
 				+ SHorizontalBox::Slot()
 				.AutoWidth()
 				[
-					MakeButton(TEXT("RevisionControl.StatusBar.NotAtLatestRevision"), TAttribute<FText>::CreateLambda([this]() { return FText::Format(LOCTEXT("SyncButton", "Sync {0}"), Behind); }),
-						TAttribute<FText>::CreateLambda([this]() { return FText::Format(LOCTEXT("SyncTooltip", "Get {0} new {0}|plural(one=commit,other=commits) from {1}. Unreal saves first and reloads the changed assets."), Behind, FText::FromString(Upstream)); }),
+					MakeButton(TEXT("RevisionControl.StatusBar.NotAtLatestRevision"), TAttribute<FText>::CreateLambda([this]() { return FText::Format(LOCTEXT("PullButton", "Pull {0}"), Behind); }),
+						TAttribute<FText>::CreateLambda([this]() { return FText::Format(LOCTEXT("PullTooltip", "Get {0} new {0}|plural(one=commit,other=commits) from {1}. Unreal saves first and reloads the changed assets."), Behind, FText::FromString(Upstream)); }),
 						[this]() { return Behind > 0; },
 						[this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->Sync(); } })
 				]

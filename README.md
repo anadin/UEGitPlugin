@@ -4,7 +4,7 @@ Git and Git LFS for Unreal Editor, working the way Unreal's revision control alr
 
 - **Check out** an asset and Git Workspace takes its Git LFS lock, so nobody else edits it at the same time.
 - **Check in** (Submit Content) commits the files you choose, pushes them and releases their locks.
-- **Sync** brings in your team's commits and reloads the assets that changed.
+- **Pull** brings in your team's commits and reloads the assets that changed.
 - **Revert** throws away your changes (keeping a backup) and gives the lock back.
 
 Artists never need to leave those flows. For everything else there is the **Git panel**: staging, commits, history, branches, stashes and locks.
@@ -47,15 +47,15 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 | Button | What it does |
 | --- | --- |
 | **main** (your branch) | Opens the Git panel. |
-| **Sync 3** | Gets 3 new commits. Unreal saves your work, updates the files and reloads the assets that changed. |
+| **Pull 3** | Gets 3 new commits. Unreal saves your work, updates the files and reloads the assets that changed. |
 | **Check in 2** | Opens Unreal's Submit Content dialog for your 2 changed assets. |
 | **Push 1** | Publishes a commit you made earlier (for example from the Git panel). |
 
 **Editing.** When you start editing a lockable asset, Unreal asks to check it out; Git Workspace takes the lock. If someone else holds it, the Content Browser shows who, and Check Out is refused. If you took the lock yourself in another clone, worktree or computer, the asset shows **Locked by you elsewhere**: right-click it and choose **Claim Lock** (Check Out does the same) to save and check it in from this copy; nothing is sent to the server, so stop editing it in the other copy. Saving never talks to the server: when you save an asset you have not checked out, Unreal's own dialog offers Check Out or Make Writable.
 
-**Checking in.** Check in commits exactly the files you leave ticked in the Submit dialog, using your description as the commit message, then pushes and releases their locks. Tick **Keep files checked out** to keep the locks. New assets are added when you check them in. If a teammate pushed first, your commit is kept and Git Workspace tells you to Sync and push again; your locks stay.
+**Checking in.** Check in commits exactly the files you leave ticked in the Submit dialog, using your description as the commit message, then pushes and releases their locks. Tick **Keep files checked out** to keep the locks. New assets are added when you check them in. If a teammate pushed first, your commit is kept and Git Workspace tells you to Pull and push again; your locks stay.
 
-**Syncing.** Sync fetches, then fast-forwards, or rebases your unpushed commits on top of the new ones. It stops before changing anything when you have local edits to files that also changed on the server, or when your unpushed commits would conflict. When C++ code, config or plugins changed, it tells you to rebuild and restart.
+**Pulling.** Pull fetches, then fast-forwards, or rebases your unpushed commits on top of the new ones. It stops before changing anything when you have local edits to files that also changed on the server, or when your unpushed commits would conflict. When C++ code, config or plugins changed, it tells you to rebuild and restart.
 
 **Reverting.** Revert restores the last committed version, keeps a copy of what it overwrote in `Saved/GitSourceControl/Backups` and releases the lock unless a commit you have not pushed still needs it.
 
@@ -65,7 +65,7 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 
 Open it with **Window > Git**, the branch button in the status bar, **Revision Control > Git Panel**, or **Show in Git Panel** on assets in the Content Browser.
 
-- **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Sync** and **Push**. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
+- **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Pull** and **Push**. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
 - **Changes**: two lists, **Changes** on top and **Staged** below (plus **Conflicts** above them when there are any), each with its own colored title bar. Drag the Staged title bar up or down to share the height between them; the split is remembered. A title bar's button stages or unstages the files selected in its list, or every file it lists when none is selected. Rows show asset and actor names and who holds each lock, and the details show the selected file; a text file's changes show below its details. Stage what you want to commit, describe it, and choose **Commit**. To push as well, hold Alt (Option on macOS) over the button: it becomes **Commit and push**. Right-click for Compare, History, Show in Content Browser, Show in Finder (Explorer on Windows), Lock, Claim lock, Release lock and Discard changes.
 - **History**: commits on your branch (unpushed ones are marked), searchable by summary, author or commit id; select one to see its files, and a text file to see how the commit changed it.
 - **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes. Search them by name.
@@ -110,11 +110,11 @@ On macOS, use Cmd instead of Ctrl.
 
 - **"… is locked by …"**: someone else holds the lock. Ask them to check in or release it; the Git panel's Locks tab can force-release it if they cannot.
 - **"Locked by you elsewhere"**: you took the lock in another copy of the project (a clone, a worktree or another computer). **Claim lock** (Content Browser, or the Git panel's Changes and Locks tabs) or Check Out takes it over for this copy without contacting the server. The other copy may still treat the lock as its own, so finish or drop the work there.
-- **"The server has newer commits"**: your commit was kept locally. Sync, then Push.
-- **"Nothing was changed: you have local changes …"** during Sync or a branch switch: check in, stash or revert those files first.
+- **"The server has newer commits"**: your commit was kept locally. Pull, then Push.
+- **"Nothing was changed: you have local changes …"** during Pull or a branch switch: check in, stash or revert those files first.
 - **Fetch or push fails with an authentication error**: make sure `git fetch` works in a terminal for this repository without prompting. Background checks never prompt; they back off and retry.
 - **"Another git process seems to be running"** or a stale `index.lock`: close other Git tools working on this repository. If none are running, delete `.git/index.lock`.
-- **Offline**: editing and saving keep working. Lock owners shown are the last known ones, with their age; Check Out and Sync fail with a clear message until the server is back.
+- **Offline**: editing and saving keep working. Lock owners shown are the last known ones, with their age; Check Out and Pull fail with a clear message until the server is back.
 - **Git LFS not installed**: install Git LFS and run `git lfs install`. The revision control status tooltip shows the Git and Git LFS versions in use.
 
 Detailed messages are in **Window > Message Log > Revision Control** (or via **Show log** in notifications).

@@ -122,7 +122,7 @@ void SGitStashesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 					.Visibility_Lambda([this]() { return Stashes.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
 					.Text_Lambda([this]()
 					{
-						return AllStashes.IsEmpty() ? LOCTEXT("NoStashes", "No stashes. Stash your changes to switch tasks, sync, or try something without committing.")
+						return AllStashes.IsEmpty() ? LOCTEXT("NoStashes", "No stashes. Stash your changes to switch tasks, pull, or try something without committing.")
 							: LOCTEXT("NoMatchingStashes", "No stash matches the search.");
 					})
 					.ColorAndOpacity(FSlateColor::UseSubduedForeground())

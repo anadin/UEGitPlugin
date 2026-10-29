@@ -240,7 +240,7 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	}
 	if (!IsCurrent())
 	{
-		return FText::Format(LOCTEXT("NotCurrentTooltip", "A newer version is on {0}. Sync before editing."), FText::FromString(Upstream.IsEmpty() ? TEXT("the server") : Upstream));
+		return FText::Format(LOCTEXT("NotCurrentTooltip", "A newer version is on {0}. Pull before editing."), FText::FromString(Upstream.IsEmpty() ? TEXT("the server") : Upstream));
 	}
 	if (LockState == EGitLockState::LockedByOther)
 	{
