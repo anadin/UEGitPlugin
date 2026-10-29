@@ -88,6 +88,16 @@ namespace
 		}
 	}
 
+	/** The key that turns Commit into Commit and push while held over it. */
+	FText PushModifierName()
+	{
+#if PLATFORM_MAC
+		return LOCTEXT("OptionKey", "Option");
+#else
+		return LOCTEXT("AltKey", "Alt");
+#endif
+	}
+
 	/**
 	 * A list's title bar. Below another list it is also the divider between them: dragging it moves
 	 * height from one list to the other.
@@ -1662,6 +1672,7 @@ TSharedRef<SWidget> SGitChangesView::MakeCommitBar()
 				.MaxDesiredHeight(140.0f)
 				[
 					SAssignNew(MessageBox, SMultiLineEditableTextBox)
+					.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.Message"))
 					.HintText(LOCTEXT("MessageHint", "Commit message (the first line is the summary)"))
 					.AutoWrapText(true)
 					.Text_Lambda([this]() { return FText::FromString(CommitMessage); })
@@ -1709,38 +1720,32 @@ TSharedRef<SWidget> SGitChangesView::MakeCommitBar()
 						return CommitMessage.TrimStartAndEnd().IsEmpty() ? LOCTEXT("CommitNeedsMessage", "Describe the change to commit it.") : FText::GetEmpty();
 					})
 				]
-				// The buttons fill the rest of their line and sit at its right edge.
+				// The button fills the rest of its line and sits at its right edge. Pushing as well takes
+				// Option (Alt) held over it, so it is never one stray click away.
 				+ SWrapBox::Slot()
 				.FillEmptySpace(true)
 				.HAlign(HAlign_Right)
 				.VAlign(VAlign_Center)
 				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					[
-						SNew(SButton)
-						.Text(LOCTEXT("CommitAndPush", "Commit and push"))
-						.ToolTipText(LOCTEXT("CommitAndPushTooltip", "Commit the staged files, then push every outgoing commit. (Ctrl+Shift+Enter)"))
-						.IsEnabled(this, &SGitChangesView::CanCommit)
-						.OnClicked_Lambda([this]() { Commit(true); return FReply::Handled(); })
-					]
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.Padding(4.0f, 0.0f, 0.0f, 0.0f)
-					[
-						SNew(SButton)
-						.ButtonStyle(FAppStyle::Get(), "PrimaryButton")
-						.Text_Lambda([this]()
-						{
-							const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
-							const int32 Count = Model.IsValid() ? Model->GetSnapshot()->Status.StagedCount() : 0;
-							return FText::Format(LOCTEXT("CommitCount", "Commit {0}"), Count);
-						})
-						.ToolTipText(LOCTEXT("CommitTooltip", "Commit the staged files. Nothing is pushed. (Ctrl+Enter)"))
-						.IsEnabled(this, &SGitChangesView::CanCommit)
-						.OnClicked_Lambda([this]() { Commit(false); return FReply::Handled(); })
-					]
+					SAssignNew(CommitButton, SButton)
+					.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.Commit"))
+					.ButtonStyle(FAppStyle::Get(), "PrimaryButton")
+					.Text_Lambda([this]()
+					{
+						const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+						const int32 Count = Model.IsValid() ? Model->GetSnapshot()->Status.StagedCount() : 0;
+						return CommitPushes()
+							? FText::Format(LOCTEXT("CommitAndPushCount", "Commit {0} and push"), Count)
+							: FText::Format(LOCTEXT("CommitCount", "Commit {0}"), Count);
+					})
+					.ToolTipText_Lambda([this]()
+					{
+						return CommitPushes()
+							? LOCTEXT("CommitAndPushTooltip", "Commit the staged files, then push every outgoing commit. (Ctrl+Shift+Enter)")
+							: FText::Format(LOCTEXT("CommitTooltip", "Commit the staged files. Nothing is pushed. (Ctrl+Enter)\nHold {0} to commit and push."), PushModifierName());
+					})
+					.IsEnabled(this, &SGitChangesView::CanCommit)
+					.OnClicked_Lambda([this]() { Commit(CommitPushes()); return FReply::Handled(); })
 				]
 			]
 		];
@@ -1755,6 +1760,12 @@ bool SGitChangesView::CanCommit() const
 	}
 	const GitCore::FSessionSnapshotRef Snapshot = Model->GetSnapshot();
 	return Snapshot->Status.StagedCount() > 0 && !Snapshot->Status.HasConflicts();
+}
+
+bool SGitChangesView::CommitPushes() const
+{
+	// What the button says is what a click does: both ask the platform for the keys held right now.
+	return CommitButton.IsValid() && CommitButton->IsHovered() && FSlateApplication::Get().GetModifierKeys().IsAltDown() && CanCommit();
 }
 
 void SGitChangesView::Commit(bool bPush)

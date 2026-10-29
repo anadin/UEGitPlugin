@@ -8,6 +8,7 @@
 #include "Widgets/Views/STreeView.h"
 
 class FGitWorkspaceModel;
+class SButton;
 class SGitDiffView;
 class SHeaderRow;
 class SMultiLineEditableTextBox;
@@ -150,12 +151,15 @@ private:
 	void ShowSelection(bool bContentBrowser);
 	void Commit(bool bPush);
 	bool CanCommit() const;
+	/** Option (Alt) is held over the Commit button while it can commit: it then reads, and does, Commit and push. */
+	bool CommitPushes() const;
 
 	TWeakPtr<FGitWorkspaceModel> WeakModel;
 	FDelegateHandle ChangedHandle;
 	TArray<FPane> Panes;
 	TSharedPtr<SSearchBox> SearchBox;
 	TSharedPtr<SMultiLineEditableTextBox> MessageBox;
+	TSharedPtr<SButton> CommitButton;
 	TSharedPtr<SGitDiffView> DiffView;
 	/** The file, side and repository state of the diff shown. */
 	FString DiffKey;

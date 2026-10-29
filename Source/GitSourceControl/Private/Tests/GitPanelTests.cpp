@@ -21,8 +21,11 @@
 #include "Types/ISlateMetaData.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SSearchBox.h"
 #include "Widgets/SWindow.h"
+#include "Widgets/Text/STextBlock.h"
 
 namespace
 {
@@ -91,6 +94,63 @@ namespace
 		}
 		return nullptr;
 	}
+
+	/** The first text shown below Root. */
+	FString FirstText(const TSharedRef<SWidget>& Root)
+	{
+		if (Root->GetType() == TEXT("STextBlock"))
+		{
+			return StaticCastSharedRef<STextBlock>(Root)->GetText().ToString();
+		}
+		FChildren* Children = Root->GetAllChildren();
+		for (int32 Index = 0; Children && Index < Children->Num(); ++Index)
+		{
+			if (const FString Text = FirstText(Children->GetChildAt(Index)); !Text.IsEmpty())
+			{
+				return Text;
+			}
+		}
+		return FString();
+	}
+
+	/** What a button says, its bound label brought up to date as painting would. */
+	FString ButtonLabel(const TSharedRef<SWidget>& Button)
+	{
+		Button->SlatePrepass(1.0f);
+		return FirstText(Button);
+	}
+
+	/** Slate asks the platform which keys are held, so while this lives a stand-in platform says Option (Alt) is. */
+	class FScopedOptionHeld
+	{
+	public:
+		FScopedOptionHeld()
+			: Real(FSlateApplication::Get().GetPlatformApplication())
+		{
+			FSlateApplication::Get().OverridePlatformApplication(MakeShared<FOptionHeld>(Real->Cursor));
+		}
+
+		~FScopedOptionHeld()
+		{
+			FSlateApplication::Get().OverridePlatformApplication(Real);
+		}
+
+	private:
+		struct FOptionHeld : GenericApplication
+		{
+			explicit FOptionHeld(const TSharedPtr<ICursor>& InCursor)
+				: GenericApplication(InCursor)
+			{
+			}
+
+			virtual FModifierKeysState GetModifierKeys() const override
+			{
+				return FModifierKeysState(false, false, false, false, true, false, false, false, false);
+			}
+		};
+
+		TSharedPtr<GenericApplication> Real;
+	};
 
 	/** One of the Changes tab's lists: "GitPanel.Changes.Unstaged", ".Staged" or ".Conflicts". */
 	TSharedPtr<STreeView<SGitChangesView::FItemPtr>> ChangesList(const TSharedRef<SWidget>& Panel, FName Tag)
@@ -174,11 +234,40 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	TestTrue(TEXT("The push finishes"), Panel.WaitIdle());
 	TestEqual(TEXT("The server has the commit"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
 
+	// The commit bar has one button: it commits, and pushes as well only while Option (Alt) is held over it.
+	const TSharedPtr<SMultiLineEditableTextBox> MessageBox = StaticCastSharedPtr<SMultiLineEditableTextBox>(FindTagged(Widget, TEXT("GitPanel.Changes.Message")));
+	const TSharedPtr<SButton> CommitButton = StaticCastSharedPtr<SButton>(FindTagged(Widget, TEXT("GitPanel.Changes.Commit")));
+	if (!TestTrue(TEXT("The commit bar is tagged"), MessageBox.IsValid() && CommitButton.IsValid()))
+	{
+		return false;
+	}
 	Panel.Model->Stage({TEXT("Content/Hero.uasset")});
 	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; });
-	Panel.Model->Commit(TEXT("Hero"), true);
+	MessageBox->SetText(FText::FromString(TEXT("Hero")));
+	{
+		const FScopedOptionHeld Option;
+		TestEqual(TEXT("Option elsewhere leaves Commit alone"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1")));
+	}
+	CommitButton->OnMouseEnter(FGeometry(), FPointerEvent());
+	TestEqual(TEXT("Commit counts the staged files"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1")));
+	CommitButton->SimulateClick();
+	TestTrue(TEXT("The commit finishes"), Panel.WaitIdle());
+	TestEqual(TEXT("Commit commits"), PanelSubject(Repo), FString(TEXT("Hero")));
+	TestNotEqual(TEXT("Commit pushes nothing"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
+
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a again\n"));
+	Panel.Model->Stage({TEXT("a.txt")});
+	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; });
+	MessageBox->SetText(FText::FromString(TEXT("Again")));
+	{
+		const FScopedOptionHeld Option;
+		TestEqual(TEXT("Option over Commit makes it Commit and push"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1 and push")));
+		CommitButton->SimulateClick();
+	}
 	TestTrue(TEXT("Commit and push finishes"), Panel.WaitIdle());
+	TestEqual(TEXT("Commit and push commits"), PanelSubject(Repo), FString(TEXT("Again")));
 	TestEqual(TEXT("Commit and push reaches the server"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
+	CommitButton->OnMouseLeave(FPointerEvent());
 
 	// The commit must contain what the user reviewed: staging behind the panel's back is refused.
 	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a reviewed\n"));
@@ -743,6 +832,26 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		Settings->ChangesListShare = State->ChangesShareWas;
 		Settings->StagedListShare = State->StagedShareWas;
 		Settings->SaveConfig();
+		// A message lets the staged readme be committed.
+		if (const TSharedPtr<SWidget> Message = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.Message")))
+		{
+			StaticCastSharedPtr<SMultiLineEditableTextBox>(Message)->SetText(FText::FromString(TEXT("Update the readme")));
+		}
+	}, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([this, State]()
+	{
+		// The pointer over Commit, then Option (Alt) held there as well.
+		const TSharedPtr<SWidget> Button = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.Commit"));
+		if (TestTrue(TEXT("The Commit button is found"), Button.IsValid()))
+		{
+			Button->OnMouseEnter(Button->GetCachedGeometry(), FPointerEvent());
+			State->Capture(TEXT("commit-hover"));
+			{
+				const FScopedOptionHeld Option;
+				State->Capture(TEXT("commit-and-push"));
+			}
+			Button->OnMouseLeave(FPointerEvent());
+		}
 		State->Window->RequestDestroyWindow();
 	}, 1.0f));
 	return true;
