@@ -13,7 +13,7 @@ class SHeaderRow;
 class SMultiLineEditableTextBox;
 class SSearchBox;
 
-/** A group (Conflicts, Staged, Changes), a folder in it, or one side of a changed file. */
+/** A list's group (Conflicts, Changes, Staged), a folder in it, or one side of a changed file. */
 struct FGitChangeItem
 {
 	enum class EGroup : uint8
@@ -41,7 +41,10 @@ struct FGitChangeItem
 	bool IsStagedSide() const { return Group == EGroup::Staged; }
 };
 
-/** Changes tab: changed files grouped by staged state and folder, an inspector and the commit box. */
+/**
+ * Changes tab: changed files in separate lists for Changes and Staged (and Conflicts when there are
+ * any), whose title bars are dividers that resize them, then an inspector and the commit box.
+ */
 class SGitChangesView : public SCompoundWidget
 {
 public:
@@ -89,11 +92,45 @@ private:
 	/** What Compare does for the selected asset, which has no text diff. */
 	FText GetAssetDiffHint() const;
 	TSharedPtr<SWidget> OnContextMenu();
+	/** One list of the Changes tab: its group (the files and their counts) and its tree. */
+	struct FPane
+	{
+		FItemPtr Group;
+		TSharedPtr<SWidget> Widget;
+		TSharedPtr<STreeView<FItemPtr>> Tree;
+		TSharedPtr<SHeaderRow> HeaderRow;
+	};
+	/** A title bar being dragged: the lists on either side, and their heights and shares when it was pressed. */
+	struct FDividerDrag
+	{
+		FGitChangeItem::EGroup Above = FGitChangeItem::EGroup::Unstaged;
+		FGitChangeItem::EGroup Below = FGitChangeItem::EGroup::Staged;
+		float AboveHeight = 0.0f;
+		float BelowHeight = 0.0f;
+		float Shares = 0.0f;
+	};
+	/** The lists on top of each other: Conflicts (only while there are any), Changes, Staged. */
+	TSharedRef<SWidget> MakeLists();
+	TSharedRef<SWidget> MakePane(FPane& Pane);
+	/** The list's title bar, which tells the lists apart and holds its Stage or Unstage button. */
+	TSharedRef<SWidget> MakePaneHeader(const FItemPtr& Group);
 	TSharedRef<SWidget> MakeInspector();
 	TSharedRef<SWidget> MakeCommitBar();
+	const FPane& GetPane(FGitChangeItem::EGroup Group) const;
+	/** The list shown above Group's, whose boundary its title bar moves; null for the top list. */
+	const FPane* PaneAbove(FGitChangeItem::EGroup Group) const;
+	/** A list's part of the height, relative to the others'. */
+	float& ShareOf(FGitChangeItem::EGroup Group);
+	void BeginDividerDrag(FGitChangeItem::EGroup Below);
+	void DragDivider(float Offset);
+	void EndDividerDrag();
 
+	/** Selected rows in every list; selecting in one list clears the others. */
+	TArray<FItemPtr> SelectedItems() const;
 	/** Selected files, and the files in selected folders. */
 	TArray<FItemPtr> SelectedFiles() const;
+	/** The same for one list. */
+	TArray<FItemPtr> SelectedFilesIn(FGitChangeItem::EGroup Group) const;
 	TArray<FString> SelectedPaths(bool bStagedSide) const;
 	TArray<FString> SelectedPaths() const;
 	/** The single selected file; null when a folder or several items are selected. */
@@ -101,6 +138,8 @@ private:
 	TArray<FItemPtr> SelectedFolders() const;
 	void StageSelection();
 	void UnstageSelection();
+	/** A list's header button: stages or unstages its selected files, or every file it lists when none is selected. */
+	void StageFromHeader(FGitChangeItem::EGroup Group);
 	void DiscardSelection();
 	void DiffSelection();
 	void LockSelection(bool bLock, bool bForce);
@@ -114,8 +153,7 @@ private:
 
 	TWeakPtr<FGitWorkspaceModel> WeakModel;
 	FDelegateHandle ChangedHandle;
-	TSharedPtr<STreeView<FItemPtr>> Tree;
-	TSharedPtr<SHeaderRow> HeaderRow;
+	TArray<FPane> Panes;
 	TSharedPtr<SSearchBox> SearchBox;
 	TSharedPtr<SMultiLineEditableTextBox> MessageBox;
 	TSharedPtr<SGitDiffView> DiffView;
@@ -123,8 +161,6 @@ private:
 	FString DiffKey;
 	/** The selection is a text file, so the inspector shows its diff. */
 	bool bDiffShown = false;
-	TArray<FItemPtr> Groups;
-	TSet<FGitChangeItem::EGroup> CollapsedGroups;
 	/** Folders the user closed, by group and path. */
 	TSet<FString> CollapsedFolders;
 	FGitFileDisplays Displays;
@@ -132,6 +168,11 @@ private:
 	bool bBuiltFolders = true;
 	/** Set while a rebuild restores expansion, so only the user's own changes are remembered. */
 	bool bRestoringExpansion = false;
+	/** Set while one list clears the others' selection. */
+	bool bSyncingSelection = false;
+	/** Conflicts' part of the height while there are any (Changes and Staged keep theirs in the user settings). */
+	float ConflictsShare = 0.25f;
+	TOptional<FDividerDrag> DividerDrag;
 	FString Filter;
 	bool bContentOnly = false;
 	bool bCompact = false;

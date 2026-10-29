@@ -52,4 +52,11 @@ public:
 	/** Set once the "prompt for check out" suggestion has been shown. */
 	UPROPERTY(config)
 	bool bOfferedCheckoutPrompt = false;
+
+	/** How the Changes tab shares its height between the Changes and Staged lists (set by dragging the divider). */
+	UPROPERTY(config)
+	float ChangesListShare = 0.6f;
+
+	UPROPERTY(config)
+	float StagedListShare = 0.4f;
 };

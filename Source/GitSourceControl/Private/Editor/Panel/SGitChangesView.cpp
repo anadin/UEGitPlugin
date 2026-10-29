@@ -2,6 +2,7 @@
 #include "SGitChangesView.h"
 
 #include "Editor/GitWorkspaceModel.h"
+#include "Provider/GitSourceControlUserSettings.h"
 #include "SGitDialogs.h"
 #include "SGitDiffView.h"
 
@@ -86,6 +87,81 @@ namespace
 			ForEachItem(Item->Children, Visit);
 		}
 	}
+
+	/**
+	 * A list's title bar. Below another list it is also the divider between them: dragging it moves
+	 * height from one list to the other.
+	 */
+	class SGitPaneHeader : public SCompoundWidget
+	{
+	public:
+		DECLARE_DELEGATE_OneParam(FOnDividerMoved, float /* Offset from where the bar was pressed, in Slate units */);
+
+		SLATE_BEGIN_ARGS(SGitPaneHeader) {}
+			SLATE_DEFAULT_SLOT(FArguments, Content)
+			SLATE_ATTRIBUTE(bool, IsDivider)
+			SLATE_EVENT(FSimpleDelegate, DividerPressed)
+			SLATE_EVENT(FOnDividerMoved, DividerMoved)
+			SLATE_EVENT(FSimpleDelegate, DividerReleased)
+		SLATE_END_ARGS()
+
+		void Construct(const FArguments& InArgs)
+		{
+			IsDivider = InArgs._IsDivider;
+			DividerPressed = InArgs._DividerPressed;
+			DividerMoved = InArgs._DividerMoved;
+			DividerReleased = InArgs._DividerReleased;
+			ChildSlot
+			[
+				InArgs._Content.Widget
+			];
+		}
+
+		virtual FReply OnMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& Event) override
+		{
+			if (Event.GetEffectingButton() != EKeys::LeftMouseButton || !IsDivider.Get())
+			{
+				return FReply::Unhandled();
+			}
+			PressedAt = Event.GetScreenSpacePosition().Y;
+			Scale = FMath::Max(Geometry.GetAccumulatedLayoutTransform().GetScale(), UE_SMALL_NUMBER);
+			DividerPressed.ExecuteIfBound();
+			return FReply::Handled().CaptureMouse(SharedThis(this));
+		}
+
+		virtual FReply OnMouseMove(const FGeometry& Geometry, const FPointerEvent& Event) override
+		{
+			if (!HasMouseCapture())
+			{
+				return FReply::Unhandled();
+			}
+			DividerMoved.ExecuteIfBound((Event.GetScreenSpacePosition().Y - PressedAt) / Scale);
+			return FReply::Handled();
+		}
+
+		virtual FReply OnMouseButtonUp(const FGeometry& Geometry, const FPointerEvent& Event) override
+		{
+			return HasMouseCapture() ? FReply::Handled().ReleaseMouseCapture() : FReply::Unhandled();
+		}
+
+		virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override
+		{
+			DividerReleased.ExecuteIfBound();
+		}
+
+		virtual FCursorReply OnCursorQuery(const FGeometry& Geometry, const FPointerEvent& Event) const override
+		{
+			return IsDivider.Get() ? FCursorReply::Cursor(EMouseCursor::ResizeUpDown) : FCursorReply::Unhandled();
+		}
+
+	private:
+		TAttribute<bool> IsDivider;
+		FSimpleDelegate DividerPressed;
+		FOnDividerMoved DividerMoved;
+		FSimpleDelegate DividerReleased;
+		float PressedAt = 0.0f;
+		float Scale = 1.0f;
+	};
 
 	/** One side of a changed file, or a folder of them. */
 	class SGitChangeRow : public SMultiColumnTableRow<SGitChangesView::FItemPtr>
@@ -246,24 +322,6 @@ namespace
 		SGitChangesView::FItemPtr Item;
 		TWeakPtr<SGitChangesView> View;
 	};
-
-	/** A group's header row; Alt+click opens or closes the group with all its folders. */
-	class SGitGroupRow : public STableRow<SGitChangesView::FItemPtr>
-	{
-	public:
-		SLATE_BEGIN_ARGS(SGitGroupRow) {}
-		SLATE_END_ARGS()
-
-		void Construct(const FArguments& InArgs, const TSharedRef<STableViewBase>& Owner)
-		{
-			STableRow<SGitChangesView::FItemPtr>::Construct(STableRow<SGitChangesView::FItemPtr>::FArguments().ShowSelection(false), Owner);
-		}
-
-		virtual FReply OnPreviewMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& Event) override
-		{
-			return GitFileTree::ToggleOnAltClick(*this, Event);
-		}
-	};
 }
 
 void SGitChangesView::Construct(const FArguments& InArgs, const TSharedRef<FGitWorkspaceModel>& InModel)
@@ -321,7 +379,7 @@ void SGitChangesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 				]
 			]
 		]
-		// List and inspector
+		// Lists and inspector
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
 		[
@@ -330,34 +388,7 @@ void SGitChangesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 			+ SSplitter::Slot()
 			.Value(0.68f)
 			[
-				SAssignNew(Tree, STreeView<FItemPtr>)
-				.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.List"))
-				.TreeItemsSource(&Groups)
-				.SelectionMode(ESelectionMode::Multi)
-				.OnGenerateRow(this, &SGitChangesView::OnGenerateRow)
-				.OnGetChildren(this, &SGitChangesView::OnGetChildren)
-				.OnExpansionChanged(this, &SGitChangesView::OnExpansionChanged)
-				.OnSetExpansionRecursive(this, &SGitChangesView::OnSetExpansionRecursive)
-				.OnSelectionChanged(this, &SGitChangesView::OnSelectionChanged)
-				.OnMouseButtonDoubleClick(this, &SGitChangesView::OnDoubleClick)
-				.OnContextMenuOpening(this, &SGitChangesView::OnContextMenu)
-				.OnIsSelectableOrNavigable_Lambda([](FItemPtr Item) { return Item.IsValid() && !Item->bGroup; })
-				.HeaderRow
-				(
-					SAssignNew(HeaderRow, SHeaderRow)
-					+ SHeaderRow::Column(NameColumn)
-					.DefaultLabel(LOCTEXT("NameColumn", "Name"))
-					.FillWidth(0.55f)
-					+ SHeaderRow::Column(ChangeColumn)
-					.DefaultLabel(LOCTEXT("ChangeColumn", "Change"))
-					.FillWidth(0.18f)
-					+ SHeaderRow::Column(LockColumn)
-					.DefaultLabel(LOCTEXT("LockColumn", "Lock"))
-					.FillWidth(0.27f)
-					+ SHeaderRow::Column(ActionColumn)
-					.DefaultLabel(FText::GetEmpty())
-					.FixedWidth(28.0f)
-				)
+				MakeLists()
 			]
 			+ SSplitter::Slot()
 			.Value(0.32f)
@@ -401,12 +432,15 @@ void SGitChangesView::Tick(const FGeometry& AllottedGeometry, const double InCur
 {
 	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
 	const bool bNowCompact = AllottedGeometry.GetLocalSize().X < 560.0f;
-	if (bNowCompact != bCompact && HeaderRow.IsValid())
+	if (bNowCompact != bCompact)
 	{
 		bCompact = bNowCompact;
-		HeaderRow->SetShowGeneratedColumn(ChangeColumn, !bCompact);
-		HeaderRow->SetShowGeneratedColumn(LockColumn, !bCompact);
-		Tree->RebuildList();
+		for (const FPane& Pane : Panes)
+		{
+			Pane.HeaderRow->SetShowGeneratedColumn(ChangeColumn, !bCompact);
+			Pane.HeaderRow->SetShowGeneratedColumn(LockColumn, !bCompact);
+			Pane.Tree->RebuildList();
+		}
 	}
 	// The folders preference is shared with the other tabs.
 	if (GitFileTree::ShowFolders() != bBuiltFolders)
@@ -436,7 +470,7 @@ FString SGitChangesView::ExpansionKey(const FGitChangeItem& Item) const
 void SGitChangesView::Rebuild()
 {
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
-	if (!Model.IsValid() || !Tree.IsValid())
+	if (!Model.IsValid() || Panes.IsEmpty())
 	{
 		return;
 	}
@@ -455,20 +489,17 @@ void SGitChangesView::Rebuild()
 	bBuiltFolders = bFolders;
 
 	TSet<FString> Selected;
-	for (const FItemPtr& Item : Tree->GetSelectedItems())
+	for (const FItemPtr& Item : SelectedItems())
 	{
 		Selected.Add(ExpansionKey(*Item));
 	}
-	auto MakeGroup = [](FGitChangeItem::EGroup Group)
+	const FItemPtr Conflicts = GetPane(FGitChangeItem::EGroup::Conflicts).Group;
+	const FItemPtr Staged = GetPane(FGitChangeItem::EGroup::Staged).Group;
+	const FItemPtr Unstaged = GetPane(FGitChangeItem::EGroup::Unstaged).Group;
+	for (const FItemPtr& Group : {Conflicts, Staged, Unstaged})
 	{
-		const FItemPtr Item = MakeShared<FGitChangeItem>();
-		Item->bGroup = true;
-		Item->Group = Group;
-		return Item;
-	};
-	const FItemPtr Conflicts = MakeGroup(FGitChangeItem::EGroup::Conflicts);
-	const FItemPtr Staged = MakeGroup(FGitChangeItem::EGroup::Staged);
-	const FItemPtr Unstaged = MakeGroup(FGitChangeItem::EGroup::Unstaged);
+		Group->Total = 0;
+	}
 	TArray<FItemPtr> ConflictFiles;
 	TArray<FItemPtr> StagedFiles;
 	TArray<FItemPtr> UnstagedFiles;
@@ -533,60 +564,58 @@ void SGitChangesView::Rebuild()
 	Arrange(Staged, StagedFiles);
 	Arrange(Unstaged, UnstagedFiles);
 
-	Groups.Reset();
-	if (Conflicts->Total > 0)
-	{
-		Groups.Add(Conflicts);
-	}
-	Groups.Add(Staged);
-	Groups.Add(Unstaged);
-
-	// "Show in Git panel" opens the folders on the way to each path.
+	// "Show in Git panel" selects each path once, in the first list that has it, opening the folders on the way.
 	TArray<FItemPtr> Reselect;
 	for (const FString& Path : PendingSelection)
 	{
-		for (const FItemPtr& Group : Groups)
+		for (const FPane& Pane : Panes)
 		{
 			TArray<FItemPtr> Chain;
-			if (GitFileTree::FindPath<FGitChangeItem>(Group->Children, [&Path](const FGitChangeItem& Item) { return Item.Path == Path; }, Chain))
+			if (GitFileTree::FindPath<FGitChangeItem>(Pane.Group->Children, [&Path](const FGitChangeItem& Item) { return Item.Path == Path; }, Chain))
 			{
-				CollapsedGroups.Remove(Group->Group);
 				for (const FItemPtr& Folder : Chain)
 				{
 					CollapsedFolders.Remove(ExpansionKey(*Folder));
 				}
 				Reselect.Add(Chain.Last());
+				break;
 			}
 		}
 	}
 	const bool bSearching = !Filter.IsEmpty();
 	bRestoringExpansion = true;
-	for (const FItemPtr& Group : Groups)
+	for (const FPane& Pane : Panes)
 	{
-		Tree->SetItemExpansion(Group, bSearching || !CollapsedGroups.Contains(Group->Group));
-		GitFileTree::RestoreExpansion(*Tree, Group->Children, CollapsedFolders, bSearching, FString::Printf(TEXT("%d|"), static_cast<int32>(Group->Group)));
+		GitFileTree::RestoreExpansion(*Pane.Tree, Pane.Group->Children, CollapsedFolders, bSearching, FString::Printf(TEXT("%d|"), static_cast<int32>(Pane.Group->Group)));
 	}
 	bRestoringExpansion = false;
 
 	// Files shown on request replace the selection; otherwise the selection survives the rebuild.
 	if (Reselect.IsEmpty())
 	{
-		ForEachItem(Groups, [this, &Selected, &Reselect](const FItemPtr& Item)
+		for (const FPane& Pane : Panes)
 		{
-			if (!Item->bGroup && Selected.Contains(ExpansionKey(*Item)))
+			ForEachItem(Pane.Group->Children, [this, &Selected, &Reselect](const FItemPtr& Item)
 			{
-				Reselect.AddUnique(Item);
-			}
-		});
+				if (Selected.Contains(ExpansionKey(*Item)))
+				{
+					Reselect.AddUnique(Item);
+				}
+			});
+		}
 	}
-	Tree->ClearSelection();
-	Tree->RequestTreeRefresh();
-	if (!Reselect.IsEmpty())
+	for (const FPane& Pane : Panes)
 	{
-		Tree->SetItemSelection(Reselect, true);
-		if (!PendingSelection.IsEmpty())
+		Pane.Tree->ClearSelection();
+		Pane.Tree->RequestTreeRefresh();
+		const TArray<FItemPtr> InPane = Reselect.FilterByPredicate([&Pane](const FItemPtr& Item) { return Item->Group == Pane.Group->Group; });
+		if (!InPane.IsEmpty())
 		{
-			Tree->RequestScrollIntoView(Reselect[0]);
+			Pane.Tree->SetItemSelection(InPane, true);
+			if (!PendingSelection.IsEmpty())
+			{
+				Pane.Tree->RequestScrollIntoView(InPane[0]);
+			}
 		}
 	}
 	PendingSelection.Reset();
@@ -641,61 +670,9 @@ FText SGitChangesView::GetLockText(const FString& Path) const
 
 TSharedRef<ITableRow> SGitChangesView::OnGenerateRow(FItemPtr Item, const TSharedRef<STableViewBase>& Owner)
 {
-	if (!Item->bGroup)
-	{
-		return SNew(SGitChangeRow, Owner)
-			.Item(Item)
-			.View(SharedThis(this));
-	}
-	const bool bStagedGroup = Item->Group == FGitChangeItem::EGroup::Staged;
-	const TSharedRef<SGitGroupRow> Row = SNew(SGitGroupRow, Owner);
-	// The whole row, replacing the expander STableRow adds in trees: this one indents like the file rows.
-	Row->SetRowContent(
-		SNew(SBox)
-		.Padding(FMargin(0.0f, 4.0f))
-		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			[
-				SNew(SExpanderArrow, Row)
-				.IndentAmount(12.0f)
-			]
-			+ SHorizontalBox::Slot()
-			.FillWidth(1.0f)
-			.VAlign(VAlign_Center)
-			[
-				SNew(STextBlock)
-				.Text(GroupLabel(*Item))
-				.Font(FAppStyle::GetFontStyle("NormalFontBold"))
-			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(4.0f, 0.0f)
-			[
-				SNew(STextBlock)
-				.Text(bStagedGroup ? LOCTEXT("StagedEmpty", "Stage files to commit them.") : LOCTEXT("UnstagedEmpty", "No changes."))
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				.Visibility(Item->Total == 0 && Item->Group != FGitChangeItem::EGroup::Conflicts ? EVisibility::Visible : EVisibility::Collapsed)
-			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
-				.Visibility(Item->Children.IsEmpty() || Item->Group == FGitChangeItem::EGroup::Conflicts ? EVisibility::Collapsed : EVisibility::Visible)
-				.Text(bStagedGroup ? LOCTEXT("UnstageAll", "Unstage all") : LOCTEXT("StageAll", "Stage all"))
-				.ToolTipText(bStagedGroup ? LOCTEXT("UnstageAllTooltip", "Move every listed file back to Changes.") : LOCTEXT("StageAllTooltip", "Stage every listed file for the next commit."))
-				.OnClicked_Lambda([this, Item]()
-				{
-					ToggleStaged(Item);
-					return FReply::Handled();
-				})
-			]
-		]);
-	return Row;
+	return SNew(SGitChangeRow, Owner)
+		.Item(Item)
+		.View(SharedThis(this));
 }
 
 void SGitChangesView::OnGetChildren(FItemPtr Item, TArray<FItemPtr>& OutChildren) const
@@ -708,44 +685,42 @@ void SGitChangesView::OnGetChildren(FItemPtr Item, TArray<FItemPtr>& OutChildren
 
 void SGitChangesView::OnExpansionChanged(FItemPtr Item, bool bExpanded)
 {
-	if (!Item.IsValid() || bRestoringExpansion)
+	if (!Item.IsValid() || !Item->bFolder || bRestoringExpansion)
 	{
 		return;
 	}
-	if (Item->bGroup)
+	if (bExpanded)
 	{
-		if (bExpanded)
-		{
-			CollapsedGroups.Remove(Item->Group);
-		}
-		else
-		{
-			CollapsedGroups.Add(Item->Group);
-		}
+		CollapsedFolders.Remove(ExpansionKey(*Item));
 	}
-	else if (Item->bFolder)
+	else
 	{
-		if (bExpanded)
-		{
-			CollapsedFolders.Remove(ExpansionKey(*Item));
-		}
-		else
-		{
-			CollapsedFolders.Add(ExpansionKey(*Item));
-		}
+		CollapsedFolders.Add(ExpansionKey(*Item));
 	}
 }
 
 void SGitChangesView::OnSetExpansionRecursive(FItemPtr Item, bool bExpand)
 {
-	if (Tree.IsValid())
+	if (Item.IsValid())
 	{
-		GitFileTree::SetExpansionRecursive(*Tree, Item, bExpand);
+		GitFileTree::SetExpansionRecursive(*GetPane(Item->Group).Tree, Item, bExpand);
 	}
 }
 
 void SGitChangesView::OnSelectionChanged(FItemPtr Item, ESelectInfo::Type SelectInfo)
 {
+	// Picking in one list clears the others, so Space, Delete and the menu act on what the user just picked.
+	if (Item.IsValid() && SelectInfo != ESelectInfo::Direct && !bSyncingSelection)
+	{
+		TGuardValue<bool> Syncing(bSyncingSelection, true);
+		for (const FPane& Pane : Panes)
+		{
+			if (Pane.Group->Group != Item->Group)
+			{
+				Pane.Tree->ClearSelection();
+			}
+		}
+	}
 	UpdateDiff();
 }
 
@@ -820,6 +795,7 @@ void SGitChangesView::OnDoubleClick(FItemPtr Item)
 	}
 	if (!Item->IsFile())
 	{
+		const TSharedPtr<STreeView<FItemPtr>>& Tree = GetPane(Item->Group).Tree;
 		Tree->SetItemExpansion(Item, !Tree->IsItemExpanded(Item));
 		return;
 	}
@@ -835,18 +811,29 @@ void SGitChangesView::OnDoubleClick(FItemPtr Item)
 	}
 }
 
+TArray<SGitChangesView::FItemPtr> SGitChangesView::SelectedItems() const
+{
+	TArray<FItemPtr> Items;
+	for (const FPane& Pane : Panes)
+	{
+		Items.Append(Pane.Tree->GetSelectedItems());
+	}
+	return Items;
+}
+
 TArray<SGitChangesView::FItemPtr> SGitChangesView::SelectedFiles() const
 {
-	if (!Tree.IsValid())
-	{
-		return TArray<FItemPtr>();
-	}
-	return GitFileTree::SelectedFiles(Tree->GetSelectedItems().FilterByPredicate([](const FItemPtr& Item) { return Item.IsValid() && !Item->bGroup; }));
+	return GitFileTree::SelectedFiles(SelectedItems());
+}
+
+TArray<SGitChangesView::FItemPtr> SGitChangesView::SelectedFilesIn(FGitChangeItem::EGroup Group) const
+{
+	return GitFileTree::SelectedFiles(GetPane(Group).Tree->GetSelectedItems());
 }
 
 TArray<SGitChangesView::FItemPtr> SGitChangesView::SelectedFolders() const
 {
-	return Tree.IsValid() ? Tree->GetSelectedItems().FilterByPredicate([](const FItemPtr& Item) { return Item.IsValid() && Item->bFolder; }) : TArray<FItemPtr>();
+	return SelectedItems().FilterByPredicate([](const FItemPtr& Item) { return Item.IsValid() && Item->bFolder; });
 }
 
 TArray<FString> SGitChangesView::SelectedPaths(bool bStagedSide) const
@@ -874,7 +861,7 @@ TArray<FString> SGitChangesView::SelectedPaths() const
 
 SGitChangesView::FItemPtr SGitChangesView::SingleSelection() const
 {
-	const TArray<FItemPtr> Picked = Tree.IsValid() ? Tree->GetSelectedItems() : TArray<FItemPtr>();
+	const TArray<FItemPtr> Picked = SelectedItems();
 	return Picked.Num() == 1 && Picked[0].IsValid() && Picked[0]->IsFile() ? Picked[0] : nullptr;
 }
 
@@ -909,6 +896,33 @@ void SGitChangesView::UnstageSelection()
 	if (const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin())
 	{
 		Model->Unstage(SelectedPaths(true));
+	}
+}
+
+void SGitChangesView::StageFromHeader(FGitChangeItem::EGroup Group)
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	const FPane& Pane = GetPane(Group);
+	TArray<FString> Paths;
+	for (const FItemPtr& File : SelectedFilesIn(Group))
+	{
+		Paths.AddUnique(File->Entry.Path);
+	}
+	if (!Model.IsValid())
+	{
+		return;
+	}
+	if (Paths.IsEmpty())
+	{
+		ToggleStaged(Pane.Group);
+	}
+	else if (Group == FGitChangeItem::EGroup::Staged)
+	{
+		Model->Unstage(Paths);
+	}
+	else
+	{
+		Model->Stage(Paths);
 	}
 }
 
@@ -1084,12 +1098,9 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	}
 	// Selected folders stand for themselves here, not for the files in them.
 	TArray<FString> RowPaths;
-	for (const FItemPtr& Item : Tree->GetSelectedItems())
+	for (const FItemPtr& Item : SelectedItems())
 	{
-		if (!Item->bGroup)
-		{
-			RowPaths.AddUnique(Item->Path);
-		}
+		RowPaths.AddUnique(Item->Path);
 	}
 	GitFileTree::AddShowEntries(Menu, Model.ToSharedRef(), RowPaths);
 	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
@@ -1154,7 +1165,7 @@ FReply SGitChangesView::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& 
 	}
 	if (Key == EKeys::Enter)
 	{
-		const TArray<FItemPtr> Picked = Tree->GetSelectedItems();
+		const TArray<FItemPtr> Picked = SelectedItems();
 		if (Picked.Num() == 1)
 		{
 			// A file opens; a folder opens or closes.
@@ -1168,6 +1179,259 @@ FReply SGitChangesView::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& 
 		return FReply::Handled();
 	}
 	return SCompoundWidget::OnKeyDown(MyGeometry, InKeyEvent);
+}
+
+const SGitChangesView::FPane& SGitChangesView::GetPane(FGitChangeItem::EGroup Group) const
+{
+	const FPane* Found = Panes.FindByPredicate([Group](const FPane& Pane) { return Pane.Group->Group == Group; });
+	check(Found);
+	return *Found;
+}
+
+TSharedRef<SWidget> SGitChangesView::MakeLists()
+{
+	for (const FGitChangeItem::EGroup Group : {FGitChangeItem::EGroup::Conflicts, FGitChangeItem::EGroup::Unstaged, FGitChangeItem::EGroup::Staged})
+	{
+		FPane& Pane = Panes.AddDefaulted_GetRef();
+		Pane.Group = MakeShared<FGitChangeItem>();
+		Pane.Group->bGroup = true;
+		Pane.Group->Group = Group;
+	}
+	// Each list takes its share of the height; collapsed Conflicts take none.
+	const TSharedRef<SVerticalBox> Lists = SNew(SVerticalBox);
+	for (FPane& Pane : Panes)
+	{
+		const FGitChangeItem::EGroup Group = Pane.Group->Group;
+		Lists->AddSlot()
+			.FillHeight(TAttribute<float>::CreateLambda([this, Group]() { return ShareOf(Group); }))
+			[
+				MakePane(Pane)
+			];
+	}
+	return Lists;
+}
+
+const SGitChangesView::FPane* SGitChangesView::PaneAbove(FGitChangeItem::EGroup Group) const
+{
+	const FPane* Above = nullptr;
+	for (const FPane& Pane : Panes)
+	{
+		if (Pane.Group->Group == Group)
+		{
+			return Above;
+		}
+		if (Pane.Widget.IsValid() && Pane.Widget->GetVisibility() != EVisibility::Collapsed)
+		{
+			Above = &Pane;
+		}
+	}
+	return nullptr;
+}
+
+float& SGitChangesView::ShareOf(FGitChangeItem::EGroup Group)
+{
+	UGitSourceControlUserSettings* Settings = GetMutableDefault<UGitSourceControlUserSettings>();
+	switch (Group)
+	{
+	case FGitChangeItem::EGroup::Conflicts:
+		return ConflictsShare;
+	case FGitChangeItem::EGroup::Staged:
+		return Settings->StagedListShare;
+	default:
+		return Settings->ChangesListShare;
+	}
+}
+
+void SGitChangesView::BeginDividerDrag(FGitChangeItem::EGroup Below)
+{
+	const FPane* Above = PaneAbove(Below);
+	if (!Above)
+	{
+		return;
+	}
+	FDividerDrag Drag;
+	Drag.Above = Above->Group->Group;
+	Drag.Below = Below;
+	Drag.AboveHeight = Above->Widget->GetCachedGeometry().GetLocalSize().Y;
+	Drag.BelowHeight = GetPane(Below).Widget->GetCachedGeometry().GetLocalSize().Y;
+	Drag.Shares = ShareOf(Drag.Above) + ShareOf(Drag.Below);
+	DividerDrag = Drag;
+}
+
+void SGitChangesView::DragDivider(float Offset)
+{
+	if (!DividerDrag.IsSet())
+	{
+		return;
+	}
+	const FDividerDrag& Drag = DividerDrag.GetValue();
+	const float Total = Drag.AboveHeight + Drag.BelowHeight;
+	if (Total <= 0.0f || Drag.Shares <= 0.0f)
+	{
+		return;
+	}
+	// The two lists trade height; neither gets smaller than its title bar and a row.
+	const float MinHeight = FMath::Min(60.0f, Total * 0.5f);
+	const float AboveHeight = FMath::Clamp(Drag.AboveHeight + Offset, MinHeight, Total - MinHeight);
+	ShareOf(Drag.Above) = Drag.Shares * AboveHeight / Total;
+	ShareOf(Drag.Below) = Drag.Shares - ShareOf(Drag.Above);
+}
+
+void SGitChangesView::EndDividerDrag()
+{
+	if (DividerDrag.IsSet())
+	{
+		DividerDrag.Reset();
+		GetMutableDefault<UGitSourceControlUserSettings>()->SaveConfig();
+	}
+}
+
+TSharedRef<SWidget> SGitChangesView::MakePane(FPane& Pane)
+{
+	const FItemPtr Group = Pane.Group;
+	const bool bConflicts = Group->Group == FGitChangeItem::EGroup::Conflicts;
+	const bool bStaged = Group->Group == FGitChangeItem::EGroup::Staged;
+	const FName Tag = bConflicts ? TEXT("GitPanel.Changes.Conflicts") : bStaged ? TEXT("GitPanel.Changes.Staged") : TEXT("GitPanel.Changes.Unstaged");
+	return SAssignNew(Pane.Widget, SVerticalBox)
+		// Conflicts only take room while there are any.
+		.Visibility_Lambda([Group, bConflicts]() { return !bConflicts || Group->Total > 0 ? EVisibility::Visible : EVisibility::Collapsed; })
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		[
+			MakePaneHeader(Group)
+		]
+		+ SVerticalBox::Slot()
+		.FillHeight(1.0f)
+		[
+			SNew(SOverlay)
+			+ SOverlay::Slot()
+			[
+				SAssignNew(Pane.Tree, STreeView<FItemPtr>)
+				.AddMetaData<FTagMetaData>(Tag)
+				.TreeItemsSource(&Group->Children)
+				.SelectionMode(ESelectionMode::Multi)
+				.OnGenerateRow(this, &SGitChangesView::OnGenerateRow)
+				.OnGetChildren(this, &SGitChangesView::OnGetChildren)
+				.OnExpansionChanged(this, &SGitChangesView::OnExpansionChanged)
+				.OnSetExpansionRecursive(this, &SGitChangesView::OnSetExpansionRecursive)
+				.OnSelectionChanged(this, &SGitChangesView::OnSelectionChanged)
+				.OnMouseButtonDoubleClick(this, &SGitChangesView::OnDoubleClick)
+				.OnContextMenuOpening(this, &SGitChangesView::OnContextMenu)
+				.HeaderRow
+				(
+					// The list's own title bar names it; the columns speak for themselves.
+					SAssignNew(Pane.HeaderRow, SHeaderRow)
+					.Visibility(EVisibility::Collapsed)
+					+ SHeaderRow::Column(NameColumn)
+					.FillWidth(0.55f)
+					+ SHeaderRow::Column(ChangeColumn)
+					.FillWidth(0.18f)
+					+ SHeaderRow::Column(LockColumn)
+					.FillWidth(0.27f)
+					+ SHeaderRow::Column(ActionColumn)
+					.FixedWidth(28.0f)
+				)
+			]
+			+ SOverlay::Slot()
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Center)
+			.Padding(16.0f)
+			[
+				SNew(STextBlock)
+				.Visibility_Lambda([Group]() { return Group->FileCount == 0 ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+				.Text_Lambda([Group, bStaged]()
+				{
+					if (Group->Total > 0)
+					{
+						return LOCTEXT("PaneFiltered", "No files here match the filter.");
+					}
+					return bStaged ? LOCTEXT("StagedEmpty", "Nothing staged. Stage changes to include them in the next commit.") : LOCTEXT("UnstagedEmpty", "No changes.");
+				})
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Justification(ETextJustify::Center)
+				.AutoWrapText(true)
+			]
+		];
+}
+
+TSharedRef<SWidget> SGitChangesView::MakePaneHeader(const FItemPtr& Group)
+{
+	const FGitChangeItem::EGroup Kind = Group->Group;
+	const bool bConflicts = Kind == FGitChangeItem::EGroup::Conflicts;
+	const bool bStaged = Kind == FGitChangeItem::EGroup::Staged;
+	// A color and an icon per list tell them apart at a glance.
+	const FSlateColor Accent = bConflicts ? FStyleColors::Error : bStaged ? FStyleColors::AccentGreen : FStyleColors::AccentOrange;
+	const FText Tooltip = bConflicts ? LOCTEXT("ConflictsTooltip", "Files with merge conflicts. Resolve them before committing.")
+		: bStaged ? LOCTEXT("StagedTooltip", "What the next commit contains. Drag this bar up or down to give the lists more or less room.")
+		: LOCTEXT("ChangesTooltip", "Changes that are not staged yet. Stage them to include them in the next commit.");
+	return SNew(SGitPaneHeader)
+		.AddMetaData<FTagMetaData>(bConflicts ? TEXT("GitPanel.Changes.ConflictsBar") : bStaged ? TEXT("GitPanel.Changes.StagedBar") : TEXT("GitPanel.Changes.UnstagedBar"))
+		.IsDivider_Lambda([this, Kind]() { return PaneAbove(Kind) != nullptr; })
+		.DividerPressed(FSimpleDelegate::CreateSP(this, &SGitChangesView::BeginDividerDrag, Kind))
+		.DividerMoved(SGitPaneHeader::FOnDividerMoved::CreateSP(this, &SGitChangesView::DragDivider))
+		.DividerReleased(FSimpleDelegate::CreateSP(this, &SGitChangesView::EndDividerDrag))
+		.ToolTipText(Tooltip)
+		[
+			SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("Brushes.Header"))
+			.Padding(0.0f)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				[
+					SNew(SBox)
+					.WidthOverride(3.0f)
+					[
+						SNew(SImage)
+						.Image(FAppStyle::GetBrush("WhiteBrush"))
+						.ColorAndOpacity(Accent)
+					]
+				]
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(8.0f, 0.0f, 6.0f, 0.0f)
+				[
+					SNew(SImage)
+					.Image(FAppStyle::GetBrush(bConflicts ? "Icons.Warning" : bStaged ? "Icons.Check" : "Icons.Edit"))
+					.ColorAndOpacity(Accent)
+				]
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
+				.VAlign(VAlign_Center)
+				.Padding(0.0f, 7.0f)
+				[
+					SNew(STextBlock)
+					.Font(FAppStyle::GetFontStyle("NormalFontBold"))
+					.Text_Lambda([Group]() { return GroupLabel(*Group); })
+				]
+				// Acts on the list's selection, or on everything it lists when nothing is selected.
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(4.0f, 0.0f, 6.0f, 0.0f)
+				[
+					SNew(SButton)
+					.Visibility(bConflicts ? EVisibility::Collapsed : EVisibility::Visible)
+					.ContentPadding(FMargin(8.0f, 0.0f))
+					.Text_Lambda([this, Kind, bStaged]()
+					{
+						const int32 Count = SelectedFilesIn(Kind).Num();
+						if (Count == 0)
+						{
+							return bStaged ? LOCTEXT("UnstageAll", "Unstage all") : LOCTEXT("StageAll", "Stage all");
+						}
+						return FText::Format(bStaged ? LOCTEXT("UnstageSelected", "Unstage {0}") : LOCTEXT("StageSelected", "Stage {0}"), Count);
+					})
+					.ToolTipText(bStaged ? LOCTEXT("UnstageButtonTooltip", "Move the selected files back to Changes; with none selected, every file listed here. (Space)")
+						: LOCTEXT("StageButtonTooltip", "Stage the selected files; with none selected, every file listed here. (Space)"))
+					.IsEnabled_Lambda([Group]() { return Group->FileCount > 0; })
+					.OnClicked_Lambda([this, Kind]() { StageFromHeader(Kind); return FReply::Handled(); })
+					.Cursor(EMouseCursor::Default)
+				]
+			]
+		];
 }
 
 TSharedRef<SWidget> SGitChangesView::MakeInspector()

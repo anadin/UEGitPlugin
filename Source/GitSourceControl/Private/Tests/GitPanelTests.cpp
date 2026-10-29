@@ -92,6 +92,12 @@ namespace
 		return nullptr;
 	}
 
+	/** One of the Changes tab's lists: "GitPanel.Changes.Unstaged", ".Staged" or ".Conflicts". */
+	TSharedPtr<STreeView<SGitChangesView::FItemPtr>> ChangesList(const TSharedRef<SWidget>& Panel, FName Tag)
+	{
+		return StaticCastSharedPtr<STreeView<SGitChangesView::FItemPtr>>(FindTagged(Panel, Tag));
+	}
+
 	/** Selects the first item of a tagged list in the panel. */
 	template<typename ItemType>
 	void SelectFirst(const TSharedRef<SWidget>& Panel, FName Tag)
@@ -134,19 +140,27 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	// Show in Git Panel replaces the selection instead of adding to it.
 	Widget->ShowPaths({TEXT("a.txt")});
 	Widget->ShowPaths({TEXT("Content/Hero.uasset")});
-	if (const TSharedPtr<SWidget> Found = FindTagged(Widget, TEXT("GitPanel.Changes.List")))
+	const TSharedPtr<STreeView<SGitChangesView::FItemPtr>> ChangesTree = ChangesList(Widget, TEXT("GitPanel.Changes.Unstaged"));
+	const TSharedPtr<STreeView<SGitChangesView::FItemPtr>> StagedTree = ChangesList(Widget, TEXT("GitPanel.Changes.Staged"));
+	if (!TestTrue(TEXT("The Changes and Staged lists are tagged"), ChangesTree.IsValid() && StagedTree.IsValid()))
 	{
-		const TArray<SGitChangesView::FItemPtr> Selected = StaticCastSharedPtr<STreeView<SGitChangesView::FItemPtr>>(Found)->GetSelectedItems();
-		TestTrue(TEXT("Only the file shown last is selected"), Selected.Num() == 1 && Selected[0]->Path == TEXT("Content/Hero.uasset"));
+		return false;
 	}
-	else
-	{
-		AddError(TEXT("The Changes list is not tagged."));
-	}
+	const TArray<SGitChangesView::FItemPtr> Shown = ChangesTree->GetSelectedItems();
+	TestTrue(TEXT("Only the file shown last is selected"), Shown.Num() == 1 && Shown[0]->Path == TEXT("Content/Hero.uasset"));
 
 	Panel.Model->Stage({TEXT("a.txt")});
 	TestTrue(TEXT("Staging shows up"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
 	TestEqual(TEXT("Only a.txt is staged"), PanelStaged(Repo), FString(TEXT("a.txt")));
+
+	// The lists share one selection: picking in Staged clears Changes, so Space and the menus act on the new pick.
+	Widget->ShowPaths({TEXT("Content/Hero.uasset")});
+	if (TestEqual(TEXT("a.txt moved to the Staged list"), StagedTree->GetRootItems().Num(), 1))
+	{
+		StagedTree->SetSelection(StagedTree->GetRootItems()[0], ESelectInfo::OnMouseClick);
+		TestEqual(TEXT("Picking a staged file clears the Changes selection"), ChangesTree->GetSelectedItems().Num(), 0);
+		TestEqual(TEXT("And selects the staged file"), StagedTree->GetSelectedItems().Num(), 1);
+	}
 
 	bool bCommitted = false;
 	Panel.Model->Commit(TEXT("Panel commit"), false, [&bCommitted](bool bDone) { bCommitted = bDone; });
@@ -561,6 +575,8 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		TSharedPtr<SWindow> Window;
 		TSharedPtr<SGitPanel> Widget;
 		bool bWrapWas = false;
+		float ChangesShareWas = GetDefault<UGitSourceControlUserSettings>()->ChangesListShare;
+		float StagedShareWas = GetDefault<UGitSourceControlUserSettings>()->StagedListShare;
 		FString Folder = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Automation/GitWorkspace/Screenshots"));
 
 		explicit FState(FAutomationTestBase& Test)
@@ -698,7 +714,37 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		State->Capture(TEXT("locks-elsewhere"));
 		State->Widget->ShowPaths({TEXT("Content/Hero.uasset")});
 	}, 1.0f));
-	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-claim")); State->Window->RequestDestroyWindow(); }, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([this, State]()
+	{
+		State->Capture(TEXT("changes-claim"));
+		// Drag the Staged list's title bar up through Slate, as a mouse would: the lists trade height.
+		const TSharedPtr<SWidget> Bar = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.StagedBar"));
+		if (!TestTrue(TEXT("The Staged title bar is found"), Bar.IsValid()))
+		{
+			return;
+		}
+		const FGeometry& Geometry = Bar->GetCachedGeometry();
+		const FVector2D Start = Geometry.LocalToAbsolute(FVector2D(40.0f, Geometry.GetLocalSize().Y * 0.5f));
+		const FVector2D End = Start - FVector2D(0.0f, 120.0f * Geometry.GetAccumulatedLayoutTransform().GetScale());
+		const TSet<FKey> Pressed = {EKeys::LeftMouseButton};
+		FSlateApplication& App = FSlateApplication::Get();
+		App.ProcessMouseButtonDownEvent(nullptr, FPointerEvent(0, Start, Start, Pressed, EKeys::LeftMouseButton, 0.0f, FModifierKeysState()));
+		App.ProcessMouseMoveEvent(FPointerEvent(0, End, Start, Pressed, FKey(), 0.0f, FModifierKeysState()));
+		App.ProcessMouseButtonUpEvent(FPointerEvent(0, End, End, TSet<FKey>(), EKeys::LeftMouseButton, 0.0f, FModifierKeysState()));
+		const UGitSourceControlUserSettings* Settings = GetDefault<UGitSourceControlUserSettings>();
+		TestTrue(TEXT("Dragging the Staged bar up gives Staged more room"),
+			Settings->StagedListShare > State->StagedShareWas && Settings->ChangesListShare < State->ChangesShareWas);
+	}, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("changes-resized"));
+		// Leave the user's own split as it was.
+		UGitSourceControlUserSettings* Settings = GetMutableDefault<UGitSourceControlUserSettings>();
+		Settings->ChangesListShare = State->ChangesShareWas;
+		Settings->StagedListShare = State->StagedShareWas;
+		Settings->SaveConfig();
+		State->Window->RequestDestroyWindow();
+	}, 1.0f));
 	return true;
 }
 
