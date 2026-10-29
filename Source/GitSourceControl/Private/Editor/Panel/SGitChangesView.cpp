@@ -938,6 +938,44 @@ void SGitChangesView::DiffSelection()
 	}
 }
 
+bool SGitChangesView::CanShowSelection(bool bContentBrowser) const
+{
+	const FItemPtr Item = SingleSelection();
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	if (!Item.IsValid() || !Model.IsValid())
+	{
+		return false;
+	}
+	// Asked every frame: work it out once per file and repository state.
+	const uint64 Generation = Model->GetSnapshot()->Generation;
+	if (Item->Entry.Path != ShowPath || Generation != ShowGeneration)
+	{
+		ShowPath = Item->Entry.Path;
+		ShowGeneration = Generation;
+		bShowInContentBrowser = Model->CanBrowseTo({ShowPath});
+		bShowOnDisk = Model->CanReveal({ShowPath});
+	}
+	return bContentBrowser ? bShowInContentBrowser : bShowOnDisk;
+}
+
+void SGitChangesView::ShowSelection(bool bContentBrowser)
+{
+	const FItemPtr Item = SingleSelection();
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	if (!Item.IsValid() || !Model.IsValid())
+	{
+		return;
+	}
+	if (bContentBrowser)
+	{
+		Model->BrowseTo({Item->Entry.Path});
+	}
+	else
+	{
+		Model->Reveal({Item->Entry.Path});
+	}
+}
+
 bool SGitChangesView::IsLockedElsewhere(const FString& Path) const
 {
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
@@ -1044,23 +1082,18 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.OpenInExternalEditor"),
 			FUIAction(FExecuteAction::CreateLambda([Weak = WeakModel, Path]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->OpenFile(Path); } })));
 	}
-	Menu.AddMenuEntry(LOCTEXT("BrowseMenu", "Show in Content Browser"), LOCTEXT("BrowseMenuTooltip", "Select these assets in the Content Browser (other files open in the file browser)."),
-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),
-		FUIAction(FExecuteAction::CreateLambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->BrowseTo(SelectedPaths()); } })));
-	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
-		FUIAction(FExecuteAction::CreateLambda([this]()
+	// Selected folders stand for themselves here, not for the files in them.
+	TArray<FString> RowPaths;
+	for (const FItemPtr& Item : Tree->GetSelectedItems())
+	{
+		if (!Item->bGroup)
 		{
-			// Selected folders copy their own path, files theirs.
-			TArray<FString> Paths;
-			for (const FItemPtr& Item : Tree->GetSelectedItems())
-			{
-				if (!Item->bGroup)
-				{
-					Paths.AddUnique(Item->Path);
-				}
-			}
-			FPlatformApplicationMisc::ClipboardCopy(*FString::Join(Paths, LINE_TERMINATOR));
-		})));
+			RowPaths.AddUnique(Item->Path);
+		}
+	}
+	GitFileTree::AddShowEntries(Menu, Model.ToSharedRef(), RowPaths);
+	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
+		FUIAction(FExecuteAction::CreateLambda([RowPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(RowPaths, LINE_TERMINATOR)); })));
 	Menu.EndSection();
 
 	if (!Folders.IsEmpty())
@@ -1140,7 +1173,7 @@ FReply SGitChangesView::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& 
 TSharedRef<SWidget> SGitChangesView::MakeInspector()
 {
 	auto Selected = [this]() { return SingleSelection(); };
-	auto Button = [](const FText& Label, const FText& Tooltip, TFunction<void()> Action, TFunction<bool()> IsEnabled = nullptr) -> TSharedRef<SWidget>
+	auto Button = [](const FText& Label, const TAttribute<FText>& Tooltip, TFunction<void()> Action, TFunction<bool()> IsEnabled = nullptr) -> TSharedRef<SWidget>
 	{
 		return SNew(SButton)
 			.Text(Label)
@@ -1298,8 +1331,20 @@ TSharedRef<SWidget> SGitChangesView::MakeInspector()
 					]
 					+ SWrapBox::Slot()
 					[
-						Button(LOCTEXT("InspectorBrowse", "Browse"), LOCTEXT("InspectorBrowseTooltip", "Show in the Content Browser."),
-							[this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->BrowseTo(SelectedPaths()); } })
+						Button(LOCTEXT("InspectorBrowse", "Browse"),
+							TAttribute<FText>::CreateLambda([this]()
+							{
+								return CanShowSelection(true) ? LOCTEXT("InspectorBrowseTooltip", "Show in the Content Browser.")
+									: LOCTEXT("InspectorBrowseNone", "Only assets in a content folder show in the Content Browser.");
+							}),
+							[this]() { ShowSelection(true); },
+							[this]() { return CanShowSelection(true); })
+					]
+					+ SWrapBox::Slot()
+					[
+						Button(FGitWorkspaceModel::RevealLabel(), FText::Format(LOCTEXT("InspectorRevealTooltip", "Show the file in {0}."), FPlatformMisc::GetFileManagerName()),
+							[this]() { ShowSelection(false); },
+							[this]() { return CanShowSelection(false); })
 					]
 					+ SWrapBox::Slot()
 					[

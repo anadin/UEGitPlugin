@@ -9,6 +9,7 @@
 
 #include "AssetDefinition.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "AssetToolsModule.h"
 #include "Async/Async.h"
 #include "ContentBrowserModule.h"
@@ -24,6 +25,7 @@
 #include "ISourceControlModule.h"
 #include "Logging/MessageLog.h"
 #include "Misc/FileHelper.h"
+#include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopedSlowTask.h"
@@ -56,6 +58,147 @@ namespace
 	bool IsExternalPackage(const FString& Path)
 	{
 		return Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/"));
+	}
+
+	/**
+	 * The same place outside World Partition's external folders: "Content/__ExternalActors__/Maps/Main"
+	 * becomes "Content/Maps/Main". Empty for other paths.
+	 */
+	FString OutsideExternalFolder(const FString& Path)
+	{
+		for (const TCHAR* Folder : {TEXT("/__ExternalActors__"), TEXT("/__ExternalObjects__")})
+		{
+			const int32 Length = FCString::Strlen(Folder);
+			const int32 Start = Path.Find(FString(Folder) + TEXT("/"));
+			if (Start != INDEX_NONE)
+			{
+				return Path.Left(Start + 1) + Path.Mid(Start + Length + 1);
+			}
+			if (Path.EndsWith(Folder))
+			{
+				return Path.LeftChop(Length);
+			}
+		}
+		return FString();
+	}
+
+	/**
+	 * The package name of a file under a mounted content folder. TryConvertFilenameToLongPackageName is
+	 * not enough: it hands back an unmounted macOS or Linux path as if it were a package name.
+	 */
+	bool MountedPackageName(const FString& AbsoluteFile, FString& OutPackageName)
+	{
+		FPackageName::EFlexNameType Type = FPackageName::EFlexNameType::Invalid;
+		return FPackageName::TryConvertToMountedPath(AbsoluteFile, nullptr, &OutPackageName, nullptr, nullptr, nullptr, &Type) &&
+			Type == FPackageName::EFlexNameType::LocalPath;
+	}
+
+	/** Adds the assets (not redirectors) the Asset Registry knows for a package file under a mounted content folder. */
+	bool FindAssets(const FString& AbsoluteFile, TArray<FAssetData>& OutAssets)
+	{
+		FString PackageName;
+		if (!MountedPackageName(AbsoluteFile, PackageName))
+		{
+			return false;
+		}
+		TArray<FAssetData> Found;
+		IAssetRegistry::GetChecked().GetAssetsByPackageName(FName(*PackageName), Found, true);
+		bool bFound = false;
+		for (const FAssetData& Asset : Found)
+		{
+			if (!Asset.IsRedirector())
+			{
+				OutAssets.AddUnique(Asset);
+				bFound = true;
+			}
+		}
+		return bFound;
+	}
+
+	/** Adds the Content Browser folder ("/Game/Props") of a folder on disk under a mounted content folder. */
+	void AddContentFolder(const FString& AbsoluteFolder, TArray<FString>& OutFolders)
+	{
+		FString PackageName;
+		if (IFileManager::Get().DirectoryExists(*AbsoluteFolder) && MountedPackageName(AbsoluteFolder / TEXT("Folder.uasset"), PackageName))
+		{
+			OutFolders.AddUnique(FPackageName::GetLongPackagePath(PackageName));
+		}
+	}
+
+	/** What Show in Content Browser selects for repository files and folders. */
+	void FindContentBrowserTargets(const GitCore::FGitRepository& Repository, const TArray<FString>& RelativePaths, TArray<FAssetData>& OutAssets, TArray<FString>& OutFolders)
+	{
+		for (const FString& Path : RelativePaths)
+		{
+			const FString Absolute = Repository.ToAbsolute(Path);
+			// The Content Browser hides World Partition's external folders: their actors show as their level.
+			const FString Outside = OutsideExternalFolder(Path);
+			if (IFileManager::Get().DirectoryExists(*Absolute))
+			{
+				if (Outside.IsEmpty())
+				{
+					AddContentFolder(Absolute, OutFolders);
+				}
+				else if (!FindAssets(Repository.ToAbsolute(Outside + TEXT(".umap")), OutAssets))
+				{
+					// Not a level's folder (or its level is gone): the matching content folder, else the one it would be in.
+					const FString Folder = Repository.ToAbsolute(Outside);
+					AddContentFolder(IFileManager::Get().DirectoryExists(*Folder) ? Folder : FPaths::GetPath(Folder), OutFolders);
+				}
+				continue;
+			}
+			if (!IsPackagePath(Path))
+			{
+				continue;
+			}
+			if (!Outside.IsEmpty())
+			{
+				const FString Level = Repository.ToAbsolute(OutsideExternalFolder(GitWorkspaceText::TreeFolder(Path)));
+				if (!FindAssets(Level + TEXT(".umap"), OutAssets))
+				{
+					AddContentFolder(FPaths::GetPath(Level), OutFolders);
+				}
+				continue;
+			}
+			// An asset that is gone shows the folder it was in.
+			if (!FindAssets(Absolute, OutAssets))
+			{
+				AddContentFolder(FPaths::GetPath(Absolute), OutFolders);
+			}
+		}
+	}
+
+	/**
+	 * What Show in Finder / Explorer opens: each folder once, with the first file asked for selected
+	 * in it. A path that is gone shows the nearest folder that still exists.
+	 */
+	TArray<FString> FindRevealTargets(const GitCore::FGitRepository& Repository, const TArray<FString>& RelativePaths)
+	{
+		TArray<FString> Targets;
+		TSet<FString> Folders;
+		for (const FString& Path : RelativePaths)
+		{
+			FString Relative = Path;
+			FString Target = Repository.ToAbsolute(Relative);
+			bool bFolder = IFileManager::Get().DirectoryExists(*Target);
+			if (!bFolder && !IFileManager::Get().FileExists(*Target))
+			{
+				do
+				{
+					Relative = FPaths::GetPath(Relative);
+					Target = Repository.ToAbsolute(Relative);
+				}
+				while (!Relative.IsEmpty() && !IFileManager::Get().DirectoryExists(*Target));
+				bFolder = true;
+			}
+			bool bShown = false;
+			Folders.Add(bFolder ? Target : FPaths::GetPath(Target), &bShown);
+			if (!bShown)
+			{
+				Targets.Add(Target);
+			}
+		}
+		return Targets;
 	}
 
 	/** Lock check, LFS upload and push of every outgoing commit. Runs on the mutation lane. */
@@ -1031,25 +1174,61 @@ void FGitWorkspaceModel::OpenFile(const FString& RelativePath)
 	}
 }
 
-void FGitWorkspaceModel::BrowseTo(const TArray<FString>& RelativePaths)
+void FGitWorkspaceModel::GetBrowseTargets(const TArray<FString>& RelativePaths, TArray<FAssetData>& OutAssets, TArray<FString>& OutFolders) const
+{
+	if (const GitCore::FGitSessionPtr Session = GetSession())
+	{
+		FindContentBrowserTargets(Session->GetRepository(), RelativePaths, OutAssets, OutFolders);
+	}
+}
+
+bool FGitWorkspaceModel::CanBrowseTo(const TArray<FString>& RelativePaths) const
 {
 	TArray<FAssetData> Assets;
-	for (const FString& Path : RelativePaths)
+	TArray<FString> Folders;
+	GetBrowseTargets(RelativePaths, Assets, Folders);
+	return !Assets.IsEmpty() || !Folders.IsEmpty();
+}
+
+void FGitWorkspaceModel::BrowseTo(const TArray<FString>& RelativePaths)
+{
+	FContentBrowserSelection Selection;
+	GetBrowseTargets(RelativePaths, Selection.SelectedAssets, Selection.SelectedFolders);
+	if (Selection.Num() > 0)
 	{
-		TArray<FAssetData> Found;
-		if (IsPackagePath(Path) && !IsExternalPackage(Path) && USourceControlHelpers::GetAssetData(ToAbsolute(Path), Found))
-		{
-			Assets.Append(Found.FilterByPredicate([](const FAssetData& Asset) { return !Asset.IsRedirector(); }));
-		}
+		FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get().SyncBrowserTo(Selection);
 	}
-	if (!Assets.IsEmpty())
+}
+
+TArray<FString> FGitWorkspaceModel::GetRevealTargets(const TArray<FString>& RelativePaths) const
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	return Session.IsValid() ? FindRevealTargets(Session->GetRepository(), RelativePaths) : TArray<FString>();
+}
+
+bool FGitWorkspaceModel::CanReveal(const TArray<FString>& RelativePaths) const
+{
+	return !GetRevealTargets(RelativePaths).IsEmpty();
+}
+
+void FGitWorkspaceModel::Reveal(const TArray<FString>& RelativePaths)
+{
+	const TArray<FString> Targets = GetRevealTargets(RelativePaths);
+	// Like the Content Browser's own Show in Explorer: many windows only when the user agrees.
+	if (Targets.Num() > 10 && FMessageDialog::Open(EAppMsgType::YesNo,
+		FText::Format(LOCTEXT("RevealMany", "Open {0} {1} windows?"), Targets.Num(), FPlatformMisc::GetFileManagerName())) != EAppReturnType::Yes)
 	{
-		FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get().SyncBrowserToAssets(Assets);
+		return;
 	}
-	else if (RelativePaths.Num() == 1)
+	for (const FString& Target : Targets)
 	{
-		FPlatformProcess::ExploreFolder(*ToAbsolute(RelativePaths[0]));
+		FPlatformProcess::ExploreFolder(*IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*Target));
 	}
+}
+
+FText FGitWorkspaceModel::RevealLabel()
+{
+	return FText::Format(LOCTEXT("RevealLabel", "Show in {0}"), FPlatformMisc::GetFileManagerName());
 }
 
 void FGitWorkspaceModel::ShowDiff(const FString& RelativePath, bool bStaged)

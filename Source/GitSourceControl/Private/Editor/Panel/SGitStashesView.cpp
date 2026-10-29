@@ -460,11 +460,6 @@ TSharedPtr<SWidget> SGitStashesView::OnFileMenu()
 	{
 		return nullptr;
 	}
-	TArray<FString> FilePaths;
-	for (const FPathItemPtr& File : GitFileTree::SelectedFiles(Picked))
-	{
-		FilePaths.Add(File->Path);
-	}
 	TArray<FString> ItemPaths;
 	TArray<FPathItemPtr> Folders;
 	for (const FPathItemPtr& Item : Picked)
@@ -476,8 +471,10 @@ TSharedPtr<SWidget> SGitStashesView::OnFileMenu()
 		}
 	}
 	FMenuBuilder Menu(true, nullptr);
-	Menu.AddMenuEntry(LOCTEXT("BrowseMenu", "Show in Content Browser"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),
-		FUIAction(FExecuteAction::CreateLambda([this, FilePaths]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->BrowseTo(FilePaths); } })));
+	if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin())
+	{
+		GitFileTree::AddShowEntries(Menu, M.ToSharedRef(), ItemPaths);
+	}
 	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
 		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
 	if (!Folders.IsEmpty())

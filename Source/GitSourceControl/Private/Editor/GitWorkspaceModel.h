@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AssetRegistry/AssetData.h"
 #include "Core/GitSession.h"
 
 class FGitSourceControlProvider;
@@ -98,7 +99,21 @@ public:
 
 	FString ToAbsolute(const FString& RelativePath) const;
 	void OpenFile(const FString& RelativePath);
+	/** What Show in Content Browser selects for these repository files and folders: assets, and Content Browser folders. */
+	void GetBrowseTargets(const TArray<FString>& RelativePaths, TArray<FAssetData>& OutAssets, TArray<FString>& OutFolders) const;
+	bool CanBrowseTo(const TArray<FString>& RelativePaths) const;
+	/**
+	 * Selects in the Content Browser: assets and folders under a mounted content folder, a World
+	 * Partition actor's level, and the folder of an asset that no longer exists. Other files are left out.
+	 */
 	void BrowseTo(const TArray<FString>& RelativePaths);
+	/** What Show in Finder / Explorer opens: absolute files (shown selected) and folders, one per folder. */
+	TArray<FString> GetRevealTargets(const TArray<FString>& RelativePaths) const;
+	bool CanReveal(const TArray<FString>& RelativePaths) const;
+	/** Shows files and folders in Finder / Explorer, one window per folder; a file that is gone shows the folder it was in. */
+	void Reveal(const TArray<FString>& RelativePaths);
+	/** "Show in Finder", "Show in Explorer" or the platform's file manager. */
+	static FText RevealLabel();
 	/** Asset diff against the last commit, or a text diff (staged or unstaged side). */
 	void ShowDiff(const FString& RelativePath, bool bStaged);
 	void ShowHistory(const FString& RelativePath);

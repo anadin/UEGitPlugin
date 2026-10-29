@@ -66,12 +66,14 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 Open it with **Window > Git**, the branch button in the status bar, **Revision Control > Git Panel**, or **Show in Git Panel** on assets in the Content Browser.
 
 - **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Sync** and **Push**. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
-- **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file; a text file's changes show below its details. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Lock, Claim lock, Release lock and Discard changes.
+- **Changes**: your changes grouped into **Staged** and **Changes** (plus **Conflicts** when there are any), with asset and actor names, who holds each lock, and details for the selected file; a text file's changes show below its details. Stage what you want to commit, describe it, and choose **Commit** or **Commit and push**. Right-click for Compare, History, Show in Content Browser, Show in Finder (Explorer on Windows), Lock, Claim lock, Release lock and Discard changes.
 - **History**: commits on your branch (unpushed ones are marked), searchable by summary, author or commit id; select one to see its files, and a text file to see how the commit changed it.
 - **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes. Search them by name.
 - **Locks**: every lock on the server, yours first, searchable by file or owner. Release your own locks, or someone else's when they cannot. Locks you took in another clone, worktree or computer show as **You, elsewhere**; select them and **Claim** to use them in this copy.
 
 Every file list shows files in their folders. Folders that only hold one folder share a row (`Source/Demo`), and World Partition actors sit under their level, without the hash folders. Selecting a folder selects its files: Stage, Discard, Lock and Release act on all of them. Alt+click a folder (Option+click on macOS), or Shift+click its arrow, to open or close everything in it. The folder button next to each search box switches every list between folders and one list of paths.
+
+Every list's right-click menu (and the details in Changes) can show a file where it lives. **Show in Content Browser** appears for assets and folders inside a content folder: a World Partition actor shows its level, and a deleted asset the folder it was in. **Show in Finder** (**Show in Explorer** on Windows) works for any file or folder, inside or outside content folders, and opens one window per folder; a deleted file shows the nearest folder that still exists.
 
 Each tab has a search box (Ctrl+F); matches are highlighted and their folders open. The files of a commit or stash have their own filter.
 

@@ -13,6 +13,7 @@
 - Diffs can wrap long lines (Wrap lines, above each diff and in its right-click menu, saved in Editor Preferences); the changed part of a line stays highlighted across the wrap. A count of added and removed lines sits beside the switch.
 - **Claim lock** takes over a lock you took in another clone, worktree or computer, so this copy can save and check in the file. It is in the Content Browser's asset menu, the Git panel's Changes tab (right-click, or the button next to the lock in the details) and its Locks tab, which also counts such locks. Nothing is sent to the server. These locks now read "Locked by you elsewhere" / "You, elsewhere", and Lock in the Changes tab only appears for unlocked files.
 - Git panel: Show in Git Panel selects only the files asked for; it used to add them to whatever was already selected.
+- Git panel: Show in Content Browser only appears for assets and folders inside a content folder (a World Partition actor shows its level, a deleted asset its folder); it no longer opens Finder or Explorer for other files. **Show in Finder** / **Show in Explorer** is a separate entry for any file or folder, in every list's right-click menu and as a button in the Changes details.
 
 ## 4.0.0-alpha
 

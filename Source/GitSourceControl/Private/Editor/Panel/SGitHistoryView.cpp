@@ -735,11 +735,6 @@ TSharedPtr<SWidget> SGitHistoryView::OnFileMenu()
 	{
 		return nullptr;
 	}
-	TArray<FString> FilePaths;
-	for (const FFileItemPtr& File : GitFileTree::SelectedFiles(Picked))
-	{
-		FilePaths.Add(File->Path);
-	}
 	TArray<FString> ItemPaths;
 	TArray<FFileItemPtr> Folders;
 	for (const FFileItemPtr& Item : Picked)
@@ -757,8 +752,10 @@ TSharedPtr<SWidget> SGitHistoryView::OnFileMenu()
 			FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Actions.Diff"),
 			FUIAction(FExecuteAction::CreateLambda([this, Change = Picked[0]->Change]() { CompareChange(Change); })));
 	}
-	Menu.AddMenuEntry(LOCTEXT("BrowseChange", "Show in Content Browser"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),
-		FUIAction(FExecuteAction::CreateLambda([this, FilePaths]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->BrowseTo(FilePaths); } })));
+	if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin())
+	{
+		GitFileTree::AddShowEntries(Menu, M.ToSharedRef(), ItemPaths);
+	}
 	Menu.AddMenuEntry(LOCTEXT("CopyChangePath", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
 		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
 	if (!Folders.IsEmpty())

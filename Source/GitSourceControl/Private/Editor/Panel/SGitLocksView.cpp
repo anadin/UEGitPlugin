@@ -467,11 +467,6 @@ TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 	}
 	const bool bAnyMine = Selected.ContainsByPredicate([](const TSharedPtr<GitCore::FLockInfo>& Lock) { return Lock->bOurs; });
 	const bool bAnyTheirs = Selected.ContainsByPredicate([](const TSharedPtr<GitCore::FLockInfo>& Lock) { return !Lock->bOurs; });
-	TArray<FString> Paths;
-	for (const TSharedPtr<GitCore::FLockInfo>& Lock : Selected)
-	{
-		Paths.Add(Lock->Path);
-	}
 	TArray<FString> ItemPaths;
 	TArray<FItemPtr> Folders;
 	for (const FItemPtr& Item : Tree->GetSelectedItems())
@@ -499,8 +494,10 @@ TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 		Menu.AddMenuEntry(LOCTEXT("ForceReleaseMenu", "Release someone else's lock…"), LOCTEXT("ForceReleaseMenuTooltip", "Only when its owner cannot release it."),
 			FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Unlocked"), FUIAction(FExecuteAction::CreateSP(this, &SGitLocksView::Release, true)));
 	}
-	Menu.AddMenuEntry(LOCTEXT("BrowseMenu", "Show in Content Browser"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),
-		FUIAction(FExecuteAction::CreateLambda([this, Paths]() { if (const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin()) { Model->BrowseTo(Paths); } })));
+	if (const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin())
+	{
+		GitFileTree::AddShowEntries(Menu, Model.ToSharedRef(), ItemPaths);
+	}
 	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
 		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
 	if (!Folders.IsEmpty())

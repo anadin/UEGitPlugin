@@ -9,6 +9,7 @@
 #include "Widgets/Views/STreeView.h"
 
 class FGitWorkspaceModel;
+class FMenuBuilder;
 
 /**
  * Folder trees for the Git panel's file lists. An item type works with these helpers when it has
@@ -25,6 +26,11 @@ namespace GitFileTree
 
 	/** Alt+click on a folder row (its arrow too) opens or closes everything below it, as Shift+click on the arrow does. */
 	FReply ToggleOnAltClick(ITableRow& Row, const FPointerEvent& Event);
+	/**
+	 * Show in Content Browser and Show in Finder / Explorer for the selected rows' own paths (folders
+	 * as folders), each only when it has something to show.
+	 */
+	void AddShowEntries(FMenuBuilder& Menu, const TSharedRef<FGitWorkspaceModel>& Model, const TArray<FString>& Paths);
 
 	/**
 	 * The name cell of a row: the expander, an icon (a folder's opens with it), the name and a

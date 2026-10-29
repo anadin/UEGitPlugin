@@ -4,6 +4,7 @@
 #include "Editor/GitWorkspaceModel.h"
 #include "Provider/GitSourceControlUserSettings.h"
 
+#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SCheckBox.h"
@@ -51,6 +52,25 @@ FReply GitFileTree::ToggleOnAltClick(ITableRow& Row, const FPointerEvent& Event)
 		return FReply::Handled();
 	}
 	return FReply::Unhandled();
+}
+
+void GitFileTree::AddShowEntries(FMenuBuilder& Menu, const TSharedRef<FGitWorkspaceModel>& Model, const TArray<FString>& Paths)
+{
+	const TWeakPtr<FGitWorkspaceModel> Weak = Model;
+	if (Model->CanBrowseTo(Paths))
+	{
+		Menu.AddMenuEntry(LOCTEXT("BrowseMenu", "Show in Content Browser"),
+			LOCTEXT("BrowseMenuTooltip", "Select these assets or folders in the Content Browser. A World Partition actor shows its level."),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.BrowseContent"),
+			FUIAction(FExecuteAction::CreateLambda([Weak, Paths]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->BrowseTo(Paths); } })));
+	}
+	if (Model->CanReveal(Paths))
+	{
+		Menu.AddMenuEntry(FGitWorkspaceModel::RevealLabel(),
+			FText::Format(LOCTEXT("RevealMenuTooltip", "Show these files or folders in {0}."), FPlatformMisc::GetFileManagerName()),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "ContentBrowser.ShowInExplorer"),
+			FUIAction(FExecuteAction::CreateLambda([Weak, Paths]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->Reveal(Paths); } })));
+	}
 }
 
 TSharedRef<SWidget> GitFileTree::MakeNameCell(const TSharedRef<ITableRow>& Row, bool bFolder, const FText& Name, const FText& Note, const FSlateBrush* Icon,

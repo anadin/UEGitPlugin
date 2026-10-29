@@ -11,12 +11,16 @@
 #include "Editor/Panel/SGitPanel.h"
 #include "Editor/Panel/SGitStashesView.h"
 
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Curves/CurveFloat.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/PlatformFileManager.h"
 #include "ImageCore.h"
 #include "ImageUtils.h"
 #include "Misc/App.h"
 #include "Types/ISlateMetaData.h"
+#include "UObject/Package.h"
+#include "UObject/SavePackage.h"
 #include "Widgets/Input/SSearchBox.h"
 #include "Widgets/SWindow.h"
 
@@ -460,6 +464,83 @@ bool FGitPanelFileDiffsTest::RunTest(const FString&)
 	TestTrue(TEXT("A file Git does not track yet shows its content"), Has(Untracked, FGitDiffLine::EKind::Added, TEXT("hello")));
 	const TArray<TSharedPtr<FGitDiffLine>> Committed = Load([&Panel, &Base](auto Done) { Panel.Model->LoadCommitDiff(Base, TEXT("a.txt"), MoveTemp(Done)); });
 	TestTrue(TEXT("A commit shows how it changed the file"), Has(Committed, FGitDiffLine::EKind::Added, TEXT("one")) && Has(Committed, FGitDiffLine::EKind::Added, TEXT("two")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelShowInTest, "GitWorkspace.Panel.ShowIn", PanelTestFlags)
+bool FGitPanelShowInTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Repo = Fixture.InitRepo();
+	GitTest::WriteFile(Repo, TEXT("Config/DefaultGame.ini"), TEXT("[Game]\n"));
+	GitTest::WriteFile(Repo, TEXT("Source/Demo/Demo.cpp"), TEXT("// demo\n"));
+	GitTest::WriteFile(Repo, TEXT("Docs/Loose.uasset"), TEXT("outside every content folder\n"));
+	IFileManager::Get().MakeDirectory(*(Repo / TEXT("Content/Maps")), true);
+	IFileManager::Get().MakeDirectory(*(Repo / TEXT("Content/__ExternalActors__/Maps/Main")), true);
+	GitTest::CommitAll(Repo, TEXT("base"));
+
+	// The fixture's Content folder, mounted the way a plugin's is, with one real asset in it.
+	const FString MountRoot = TEXT("/GitShowInTest/");
+	const FString ContentDir = Repo / TEXT("Content/");
+	FPackageName::RegisterMountPoint(MountRoot, ContentDir);
+	UCurveFloat* Barrel = nullptr;
+	ON_SCOPE_EXIT
+	{
+		if (Barrel)
+		{
+			Barrel->ClearFlags(RF_Public | RF_Standalone);
+		}
+		FPackageName::UnRegisterMountPoint(MountRoot, ContentDir);
+	};
+	UPackage* Package = CreatePackage(TEXT("/GitShowInTest/Props/Barrel"));
+	Barrel = NewObject<UCurveFloat>(Package, TEXT("Barrel"), RF_Public | RF_Standalone);
+	const FString BarrelFile = Repo / TEXT("Content/Props/Barrel.uasset");
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	if (!TestTrue(TEXT("The test asset saves"), UPackage::SavePackage(Package, Barrel, *BarrelFile, SaveArgs)))
+	{
+		return false;
+	}
+	IAssetRegistry::GetChecked().ScanFilesSynchronous({BarrelFile}, true);
+
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	auto Browse = [&Panel](const TArray<FString>& Paths)
+	{
+		TArray<FAssetData> Assets;
+		TArray<FString> Folders;
+		Panel.Model->GetBrowseTargets(Paths, Assets, Folders);
+		TArray<FString> Shown;
+		for (const FAssetData& Asset : Assets)
+		{
+			Shown.Add(Asset.PackageName.ToString());
+		}
+		for (const FString& Folder : Folders)
+		{
+			Shown.Add(Folder + TEXT("/"));
+		}
+		return FString::Join(Shown, TEXT(", "));
+	};
+	TestEqual(TEXT("An asset in a content folder is selected"), Browse({TEXT("Content/Props/Barrel.uasset")}), FString(TEXT("/GitShowInTest/Props/Barrel")));
+	TestEqual(TEXT("A content folder shows itself"), Browse({TEXT("Content/Props")}), FString(TEXT("/GitShowInTest/Props/")));
+	TestEqual(TEXT("A deleted asset shows its folder"), Browse({TEXT("Content/Props/Gone.uasset")}), FString(TEXT("/GitShowInTest/Props/")));
+	TestEqual(TEXT("A World Partition actor without its level shows the level's folder"),
+		Browse({TEXT("Content/__ExternalActors__/Maps/Main/A/7Q/Actor.uasset")}), FString(TEXT("/GitShowInTest/Maps/")));
+	TestEqual(TEXT("A level's actor folder without the level shows the folder the level would be in"),
+		Browse({TEXT("Content/__ExternalActors__/Maps/Main")}), FString(TEXT("/GitShowInTest/Maps/")));
+	TestEqual(TEXT("Files and folders outside content folders are left out"),
+		Browse({TEXT("Config/DefaultGame.ini"), TEXT("Source/Demo"), TEXT("Source/Demo/Demo.cpp"), TEXT("Docs/Loose.uasset")}), FString());
+	TestFalse(TEXT("So Show in Content Browser is not offered for them"), Panel.Model->CanBrowseTo({TEXT("Config/DefaultGame.ini"), TEXT("Docs/Loose.uasset")}));
+	TestTrue(TEXT("It is offered when one of them is an asset"), Panel.Model->CanBrowseTo({TEXT("Config/DefaultGame.ini"), TEXT("Content/Props/Barrel.uasset")}));
+
+	auto Reveal = [&Panel](const TArray<FString>& Paths) { return FString::Join(Panel.Model->GetRevealTargets(Paths), TEXT(", ")); };
+	auto Absolute = [&Panel](const FString& Path) { return Panel.Model->ToAbsolute(Path); };
+	TestEqual(TEXT("Files show selected in their folders"), Reveal({TEXT("Config/DefaultGame.ini"), TEXT("Content/Props/Barrel.uasset")}),
+		Absolute(TEXT("Config/DefaultGame.ini")) + TEXT(", ") + Absolute(TEXT("Content/Props/Barrel.uasset")));
+	TestEqual(TEXT("Each folder opens once"), Reveal({TEXT("Content/Props/Barrel.uasset"), TEXT("Content/Props/Gone.uasset")}), Absolute(TEXT("Content/Props/Barrel.uasset")));
+	TestEqual(TEXT("A folder shows itself"), Reveal({TEXT("Source/Demo")}), Absolute(TEXT("Source/Demo")));
+	TestEqual(TEXT("A file that is gone shows the nearest folder that exists"), Reveal({TEXT("Old/Deep/Gone.txt")}), Absolute(FString()));
+	TestTrue(TEXT("Show in Finder / Explorer is offered outside content folders too"), Panel.Model->CanReveal({TEXT("Docs/Loose.uasset")}));
 	return true;
 }
 

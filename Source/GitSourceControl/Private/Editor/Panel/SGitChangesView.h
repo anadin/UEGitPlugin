@@ -106,6 +106,9 @@ private:
 	void LockSelection(bool bLock, bool bForce);
 	/** Takes over the selected files' locks you took in another clone, worktree or computer. */
 	void ClaimSelection();
+	/** The selected file shows in the Content Browser (bContentBrowser) or in Finder / Explorer. */
+	bool CanShowSelection(bool bContentBrowser) const;
+	void ShowSelection(bool bContentBrowser);
 	void Commit(bool bPush);
 	bool CanCommit() const;
 
@@ -134,4 +137,9 @@ private:
 	bool bCompact = false;
 	FString CommitMessage;
 	TArray<FString> PendingSelection;
+	/** Where the selected file can be shown, for the file and repository state it was worked out for. */
+	mutable FString ShowPath;
+	mutable uint64 ShowGeneration = MAX_uint64;
+	mutable bool bShowInContentBrowser = false;
+	mutable bool bShowOnDisk = false;
 };
