@@ -1692,13 +1692,15 @@ TSharedRef<SWidget> SGitChangesView::MakeCommitBar()
 			.AutoHeight()
 			.Padding(0.0f, 6.0f, 0.0f, 0.0f)
 			[
-				SNew(SWrapBox)
-				.UseAllottedSize(true)
-				.InnerSlotPadding(FVector2D(6.0f, 4.0f))
-				+ SWrapBox::Slot()
+				// The hint takes the width the button leaves, so it wraps to the panel. A wrap box would size it
+				// by its own wrapped width, keeping a longer hint as narrow as the shorter one before it.
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
 				.VAlign(VAlign_Center)
 				[
 					SNew(STextBlock)
+					.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.CommitHint"))
 					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 					.AutoWrapText(true)
 					.Text_Lambda([this]()
@@ -1720,12 +1722,11 @@ TSharedRef<SWidget> SGitChangesView::MakeCommitBar()
 						return CommitMessage.TrimStartAndEnd().IsEmpty() ? LOCTEXT("CommitNeedsMessage", "Describe the change to commit it.") : FText::GetEmpty();
 					})
 				]
-				// The button fills the rest of its line and sits at its right edge. Pushing as well takes
-				// Option (Alt) held over it, so it is never one stray click away.
-				+ SWrapBox::Slot()
-				.FillEmptySpace(true)
-				.HAlign(HAlign_Right)
+				// Pushing as well takes Option (Alt) held over the button, so it is never one stray click away.
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
 				.VAlign(VAlign_Center)
+				.Padding(6.0f, 0.0f, 0.0f, 0.0f)
 				[
 					SAssignNew(CommitButton, SButton)
 					.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.Commit"))

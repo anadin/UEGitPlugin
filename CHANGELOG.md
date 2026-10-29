@@ -17,6 +17,7 @@
 - Git panel: Changes and Staged are separate lists, Staged below Changes (Conflicts above them when there are any), told apart by colored title bars with icons. The Staged title bar is a divider: drag it to share the height between the lists, and the split is remembered. Each title bar has a Stage or Unstage button for the files selected in its list, or for everything it lists when none is selected; selecting in one list clears the other.
 - Git panel: one **Commit** button instead of Commit and Commit and push. Hold Alt (Option on macOS) over it to make it **Commit and push**, so pushing is never one stray click away. Ctrl+Shift+Enter still commits and pushes.
 - Sync is now **Pull**, the Git term, in the Git panel's toolbar, the status bar and the messages that point to it. Unreal's own menu entries keep their names.
+- Git panel: the hint below the commit message wraps to the panel's width; it could stay as narrow as a shorter hint shown before it.
 
 ## 4.0.0-alpha
 

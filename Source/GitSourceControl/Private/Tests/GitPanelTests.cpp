@@ -120,33 +120,40 @@ namespace
 		return FirstText(Button);
 	}
 
-	/** Slate asks the platform which keys are held, so while this lives a stand-in platform says Option (Alt) is. */
-	class FScopedOptionHeld
+	/**
+	 * Slate asks the platform which keys are held and which window is under the real pointer. While this
+	 * lives, a stand-in answers: Option (Alt) held when asked for, and no window, so simulated pointer
+	 * events find their window by position wherever the real pointer is.
+	 */
+	class FScopedStandInPlatform
 	{
 	public:
-		FScopedOptionHeld()
+		explicit FScopedStandInPlatform(bool bOptionHeld = false)
 			: Real(FSlateApplication::Get().GetPlatformApplication())
 		{
-			FSlateApplication::Get().OverridePlatformApplication(MakeShared<FOptionHeld>(Real->Cursor));
+			FSlateApplication::Get().OverridePlatformApplication(MakeShared<FStandIn>(Real->Cursor, bOptionHeld));
 		}
 
-		~FScopedOptionHeld()
+		~FScopedStandInPlatform()
 		{
 			FSlateApplication::Get().OverridePlatformApplication(Real);
 		}
 
 	private:
-		struct FOptionHeld : GenericApplication
+		struct FStandIn : GenericApplication
 		{
-			explicit FOptionHeld(const TSharedPtr<ICursor>& InCursor)
+			FStandIn(const TSharedPtr<ICursor>& InCursor, bool bInOptionHeld)
 				: GenericApplication(InCursor)
+				, bOptionHeld(bInOptionHeld)
 			{
 			}
 
 			virtual FModifierKeysState GetModifierKeys() const override
 			{
-				return FModifierKeysState(false, false, false, false, true, false, false, false, false);
+				return FModifierKeysState(false, false, false, false, bOptionHeld, false, false, false, false);
 			}
+
+			bool bOptionHeld;
 		};
 
 		TSharedPtr<GenericApplication> Real;
@@ -245,7 +252,7 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; });
 	MessageBox->SetText(FText::FromString(TEXT("Hero")));
 	{
-		const FScopedOptionHeld Option;
+		const FScopedStandInPlatform OptionHeld(true);
 		TestEqual(TEXT("Option elsewhere leaves Commit alone"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1")));
 	}
 	CommitButton->OnMouseEnter(FGeometry(), FPointerEvent());
@@ -260,7 +267,7 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; });
 	MessageBox->SetText(FText::FromString(TEXT("Again")));
 	{
-		const FScopedOptionHeld Option;
+		const FScopedStandInPlatform OptionHeld(true);
 		TestEqual(TEXT("Option over Commit makes it Commit and push"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1 and push")));
 		CommitButton->SimulateClick();
 	}
@@ -666,6 +673,7 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		bool bWrapWas = false;
 		float ChangesShareWas = GetDefault<UGitSourceControlUserSettings>()->ChangesListShare;
 		float StagedShareWas = GetDefault<UGitSourceControlUserSettings>()->StagedListShare;
+		float HintLineHeight = 0.0f;
 		FString Folder = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Automation/GitWorkspace/Screenshots"));
 
 		explicit FState(FAutomationTestBase& Test)
@@ -816,10 +824,14 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 		const FVector2D Start = Geometry.LocalToAbsolute(FVector2D(40.0f, Geometry.GetLocalSize().Y * 0.5f));
 		const FVector2D End = Start - FVector2D(0.0f, 120.0f * Geometry.GetAccumulatedLayoutTransform().GetScale());
 		const TSet<FKey> Pressed = {EKeys::LeftMouseButton};
-		FSlateApplication& App = FSlateApplication::Get();
-		App.ProcessMouseButtonDownEvent(nullptr, FPointerEvent(0, Start, Start, Pressed, EKeys::LeftMouseButton, 0.0f, FModifierKeysState()));
-		App.ProcessMouseMoveEvent(FPointerEvent(0, End, Start, Pressed, FKey(), 0.0f, FModifierKeysState()));
-		App.ProcessMouseButtonUpEvent(FPointerEvent(0, End, End, TSet<FKey>(), EKeys::LeftMouseButton, 0.0f, FModifierKeysState()));
+		{
+			// Otherwise Slate looks only in the window under the real pointer, which may be another one.
+			const FScopedStandInPlatform Platform;
+			FSlateApplication& App = FSlateApplication::Get();
+			App.ProcessMouseButtonDownEvent(nullptr, FPointerEvent(0, Start, Start, Pressed, EKeys::LeftMouseButton, 0.0f, FModifierKeysState()));
+			App.ProcessMouseMoveEvent(FPointerEvent(0, End, Start, Pressed, FKey(), 0.0f, FModifierKeysState()));
+			App.ProcessMouseButtonUpEvent(FPointerEvent(0, End, End, TSet<FKey>(), EKeys::LeftMouseButton, 0.0f, FModifierKeysState()));
+		}
 		const UGitSourceControlUserSettings* Settings = GetDefault<UGitSourceControlUserSettings>();
 		TestTrue(TEXT("Dragging the Staged bar up gives Staged more room"),
 			Settings->StagedListShare > State->StagedShareWas && Settings->ChangesListShare < State->ChangesShareWas);
@@ -847,10 +859,35 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 			Button->OnMouseEnter(Button->GetCachedGeometry(), FPointerEvent());
 			State->Capture(TEXT("commit-hover"));
 			{
-				const FScopedOptionHeld Option;
+				const FScopedStandInPlatform OptionHeld(true);
 				State->Capture(TEXT("commit-and-push"));
 			}
 			Button->OnMouseLeave(FPointerEvent());
+		}
+		// Without a message, the hint below the box asks for one.
+		if (const TSharedPtr<SWidget> Message = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.Message")))
+		{
+			StaticCastSharedPtr<SMultiLineEditableTextBox>(Message)->SetText(FText::GetEmpty());
+		}
+	}, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		// With nothing staged, a longer hint replaces that one-line hint.
+		if (const TSharedPtr<SWidget> Hint = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.CommitHint")))
+		{
+			State->HintLineHeight = Hint->GetDesiredSize().Y;
+		}
+		State->Panel->Model->Unstage({TEXT("readme.txt")});
+		State->Panel->WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 0; });
+	}, 1.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([this, State]()
+	{
+		State->Capture(TEXT("commit-hint"));
+		// It wraps to the panel's width, not to the width of the hint it replaced.
+		const TSharedPtr<SWidget> Hint = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.CommitHint"));
+		if (TestTrue(TEXT("The commit hint is found"), Hint.IsValid() && State->HintLineHeight > 0.0f))
+		{
+			TestEqual(TEXT("The longer hint still takes one line of a wide panel"), Hint->GetDesiredSize().Y, State->HintLineHeight, 0.5f);
 		}
 		State->Window->RequestDestroyWindow();
 	}, 1.0f));
