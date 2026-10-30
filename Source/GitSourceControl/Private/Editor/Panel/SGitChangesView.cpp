@@ -1301,7 +1301,7 @@ TSharedRef<SWidget> SGitChangesView::MakePane(FPane& Pane)
 	const FItemPtr Group = Pane.Group;
 	const bool bConflicts = Group->Group == FGitChangeItem::EGroup::Conflicts;
 	const bool bStaged = Group->Group == FGitChangeItem::EGroup::Staged;
-	const FName Tag = bConflicts ? TEXT("GitPanel.Changes.Conflicts") : bStaged ? TEXT("GitPanel.Changes.Staged") : TEXT("GitPanel.Changes.Unstaged");
+	const FName ListTag = bConflicts ? TEXT("GitPanel.Changes.Conflicts") : bStaged ? TEXT("GitPanel.Changes.Staged") : TEXT("GitPanel.Changes.Unstaged");
 	return SAssignNew(Pane.Widget, SVerticalBox)
 		// Conflicts only take room while there are any.
 		.Visibility_Lambda([Group, bConflicts]() { return !bConflicts || Group->Total > 0 ? EVisibility::Visible : EVisibility::Collapsed; })
@@ -1317,7 +1317,7 @@ TSharedRef<SWidget> SGitChangesView::MakePane(FPane& Pane)
 			+ SOverlay::Slot()
 			[
 				SAssignNew(Pane.Tree, STreeView<FItemPtr>)
-				.AddMetaData<FTagMetaData>(Tag)
+				.AddMetaData<FTagMetaData>(ListTag)
 				.TreeItemsSource(&Group->Children)
 				.SelectionMode(ESelectionMode::Multi)
 				.OnGenerateRow(this, &SGitChangesView::OnGenerateRow)

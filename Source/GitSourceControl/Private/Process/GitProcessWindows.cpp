@@ -8,6 +8,14 @@
 
 #include "Windows/AllowWindowsPlatformTypes.h"
 #include <windows.h>
+namespace GitCore
+{
+	namespace
+	{
+		// Built from TRUE and FALSE, which Unreal only defines between these two headers.
+		constexpr DWORD_PTR HandleListAttribute = PROC_THREAD_ATTRIBUTE_HANDLE_LIST;
+	}
+}
 #include "Windows/HideWindowsPlatformTypes.h"
 
 // Windows maps API names to macros (GetUserName is GetUserNameW). In a unity build they would
@@ -140,7 +148,7 @@ namespace GitCore
 		}
 		// Only the three pipe ends are inherited, never the editor's other handles.
 		HANDLE Inherited[3] = {StdinChild.Value, StdoutChild.Value, StderrChild.Value};
-		if (!::UpdateProcThreadAttribute(AttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, Inherited, sizeof(Inherited), nullptr, nullptr))
+		if (!::UpdateProcThreadAttribute(AttributeList, 0, HandleListAttribute, Inherited, sizeof(Inherited), nullptr, nullptr))
 		{
 			::DeleteProcThreadAttributeList(AttributeList);
 			Result.Diagnostic = FString::Printf(TEXT("Could not restrict inherited handles (error %u)."), ::GetLastError());
