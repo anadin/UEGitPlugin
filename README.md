@@ -137,6 +137,8 @@ UnrealEditor-Cmd YourProject.uproject -unattended -nullrhi -ExecCmds="Automation
 
 `GitWorkspace.Panel.Screenshots` only runs in an editor that renders; it saves images of the Git panel to `Saved/Automation/GitWorkspace/Screenshots`. `GitWorkspace.Editor.NativeFlows` drives Unreal's own check out, check in, revert and sync helpers; it only runs in a disposable project with its own repository and lock server (the development project's `Scripts/dev.sh e2e`, or `Scripts\dev.cmd e2e` on Windows, prepares one).
 
+Visual Studio rejects a parameter or local variable named like a data member its class inherits, such as `Tag` in a Slate widget; clang accepts it. On a Mac, the development project's `Scripts/dev.sh check` builds the editor and lists such names before a Windows build stops on them.
+
 To build a plugin package for your platform (Windows, macOS or Linux), see [Packaging](Docs/Packaging.md).
 
 ## Credits and licence
