@@ -33,6 +33,14 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Submit")
 	bool bPushOnSubmit = true;
 
+	/** Pull replays your unpushed commits on top of the pulled ones. Off: it joins both with a merge commit. Also set by the Git panel's Pull dialog. */
+	UPROPERTY(config, EditAnywhere, Category = "Pull", meta = (DisplayName = "Rebase instead of merge"))
+	bool bPullRebase = true;
+
+	/** Pull sets local changes that are in the way aside and puts them back afterwards. Off: it stops instead. Also set by the Git panel's Pull dialog. */
+	UPROPERTY(config, EditAnywhere, Category = "Pull", meta = (DisplayName = "Stash and reapply local changes"))
+	bool bPullStash = true;
+
 	/** How many revert backups to keep in Saved/GitSourceControl/Backups. */
 	UPROPERTY(config, EditAnywhere, Category = "Backups", meta = (ClampMin = "1", ClampMax = "200"))
 	int32 BackupsToKeep = 20;

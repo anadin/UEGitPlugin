@@ -55,7 +55,7 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 
 **Checking in.** Check in commits exactly the files you leave ticked in the Submit dialog, using your description as the commit message, then pushes and releases their locks. Tick **Keep files checked out** to keep the locks. New assets are added when you check them in. If a teammate pushed first, your commit is kept and Git Workspace tells you to Pull and push again; your locks stay. If your branch is not on the server yet, Check in asks before publishing it; say no and nothing is checked in.
 
-**Pulling.** Pull fetches, then fast-forwards, or rebases your unpushed commits on top of the new ones. It stops before changing anything when you have local edits to files that also changed on the server, or when your unpushed commits would conflict. When C++ code, config or plugins changed, it tells you to rebuild and restart.
+**Pulling.** Pull fetches, then fast-forwards, or rebases your unpushed commits on top of the new ones (or merges them, if you choose that in the Git panel's Pull dialog). Your local edits stay: one to a file that also changed on the server is combined with the server's version. Pull stops before changing anything when the two cannot be combined (an asset, or the same lines), when your unpushed commits would conflict, or when a rebase would rewrite commits that are already on the server. When C++ code, config or plugins changed, it tells you to rebuild and restart.
 
 **Reverting.** Revert restores the last committed version, keeps a copy of what it overwrote in `Saved/GitSourceControl/Backups` and releases the lock unless a commit you have not pushed still needs it.
 
@@ -65,7 +65,7 @@ The status bar shows what needs doing, next to Unreal's own revision control sta
 
 Open it with **Window > Git**, the branch button in the status bar, **Revision Control > Git Panel**, or **Show in Git Panel** on assets in the Content Browser.
 
-- **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Pull** and **Push**. Push sends your commits to a branch with your branch's name, never to an upstream with another name (such as `origin/main` for a feature branch made from it). A push that would create a branch on the server, or change the branch yours follows, asks first; **Publish** is its own confirmation. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
+- **Toolbar**: switch, create or publish branches; see how far ahead or behind you are and when the server was last checked; **Fetch**, **Pull** and **Push**. Pull opens a dialog: choose the remote and branch to pull (your branch's upstream unless you pick another), whether to rebase your unpushed commits or merge, and whether to stash and reapply local changes that are in the way. The status bar's Pull uses the same two choices without asking. Push sends your commits to a branch with your branch's name, never to an upstream with another name (such as `origin/main` for a feature branch made from it). A push that would create a branch on the server, or change the branch yours follows, asks first; **Publish** is its own confirmation. Running Git commands show here with a Cancel button, and failures show in a banner with a link to the log.
 - **Changes**: two lists, **Changes** on top and **Staged** below (plus **Conflicts** above them when there are any), each with its own colored title bar. Drag the Staged title bar up or down to share the height between them; the split is remembered. A title bar's button stages or unstages the files selected in its list, or every file it lists when none is selected. Rows show asset and actor names and who holds each lock, and the details show the selected file; a text file's changes show below its details. Stage what you want to commit, describe it, and choose **Commit**. To push as well, hold Alt (Option on macOS) over the button: it becomes **Commit and push**. Right-click for Compare, History, Show in Content Browser, Show in Finder (Explorer on Windows), Lock, Claim lock, Release lock and Discard changes.
 - **History**: commits on your branch (unpushed ones are marked), searchable by summary, author or commit id; select one to see its files, and a text file to see how the commit changed it.
 - **Stashes**: put your changes aside (optionally with new files), then restore, apply or delete stashes. Search them by name.
@@ -104,14 +104,14 @@ On macOS, use Cmd instead of Ctrl.
 - **Use Git LFS locks**: turn Check Out locking on or off for this project.
 - **Lock server remote**: the remote whose LFS server holds locks; empty uses the branch's upstream remote (usually `origin`).
 
-**Editor Preferences > Revision Control > Git Workspace** (per user): how often status, locks and the server are checked (background fetching can be turned off), whether Check in pushes, how many revert backups to keep, whether the Git panel shows folders, and whether diffs wrap long lines.
+**Editor Preferences > Revision Control > Git Workspace** (per user): how often status, locks and the server are checked (background fetching can be turned off), whether Check in pushes, how Pull treats your unpushed commits and local changes, how many revert backups to keep, whether the Git panel shows folders, and whether diffs wrap long lines.
 
 ## Troubleshooting
 
 - **"… is locked by …"**: someone else holds the lock. Ask them to check in or release it; the Git panel's Locks tab can force-release it if they cannot.
 - **"Locked by you elsewhere"**: you took the lock in another copy of the project (a clone, a worktree or another computer). **Claim lock** (Content Browser, or the Git panel's Changes and Locks tabs) or Check Out takes it over for this copy without contacting the server. The other copy may still treat the lock as its own, so finish or drop the work there.
 - **"The server has newer commits"**: your commit was kept locally. Pull, then Push.
-- **"Nothing was changed: you have local changes …"** during Pull or a branch switch: check in, stash or revert those files first.
+- **"Nothing was changed: you have local changes …"** during Pull or a branch switch: check in, stash or revert those files first. Pull combines your edit with the server's when it can; it cannot for assets, or when both changed the same lines.
 - **Fetch or push fails with an authentication error**: make sure `git fetch` works in a terminal for this repository without prompting. Background checks never prompt; they back off and retry.
 - **"Another git process seems to be running"** or a stale `index.lock`: close other Git tools working on this repository. If none are running, delete `.git/index.lock`.
 - **Offline**: editing and saving keep working. Lock owners shown are the last known ones, with their age; Check Out and Pull fail with a clear message until the server is back.

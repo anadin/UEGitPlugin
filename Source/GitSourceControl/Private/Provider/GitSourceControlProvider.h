@@ -78,6 +78,8 @@ public:
 	bool IsLockingEnabled() const;
 	/** Attaches file history read by an UpdateStatus operation. */
 	void SetHistory(const FString& AbsoluteFile, const TArray<GitCore::FFileRevision>& Revisions);
+	/** Until reset, Sync and its preview pull as these say instead of the user's settings (the Git panel's Pull dialog). */
+	void SetPullOptions(const TOptional<GitCore::FPullOptions>& Options) { PullOverride = Options; }
 
 	/** Fired on the game thread after the repository state changed (status bar, panel). */
 	DECLARE_MULTICAST_DELEGATE(FOnRepositoryChanged);
@@ -107,6 +109,7 @@ private:
 	uint64 CachedGeneration = 0;
 	TSet<FString> RenameSources;
 
+	TOptional<GitCore::FPullOptions> PullOverride;
 	TArray<FGitSourceControlCommandRef> PendingCommands;
 	FSourceControlStateChanged OnSourceControlStateChanged;
 	FOnRepositoryChanged RepositoryChanged;

@@ -468,7 +468,7 @@ namespace GitCore
 		return bVerified;
 	}
 
-	bool FGitSession::Fetch(ECallKind Kind, const FCancelTokenPtr& Cancel, FString* OutError)
+	bool FGitSession::Fetch(ECallKind Kind, const FCancelTokenPtr& Cancel, FString* OutError, const FString& FromRemote)
 	{
 		FString Remote;
 		{
@@ -479,7 +479,7 @@ namespace GitCore
 		{
 			Remote = Repository->DefaultRemote();
 		}
-		const FOpResult Result = Repository->Fetch(Remote, Kind, Cancel);
+		const FOpResult Result = Repository->Fetch(FromRemote.IsEmpty() ? Remote : FromRemote, Kind, Cancel);
 		if (!Result.bOk && Cancel.IsValid() && Cancel->IsCancelled())
 		{
 			// Sync, Submit or shutdown took over; they refresh the remote state themselves.
@@ -559,10 +559,15 @@ namespace GitCore
 	void FGitSession::RefreshBranches()
 	{
 		TArray<FBranchInfo> Branches;
+		TArray<FString> Remotes;
 		FString Error;
-		if (Repository->ReadBranches(Branches, Error))
+		if (Repository->ReadBranches(Branches, Error) && Repository->ReadRemotes(Remotes))
 		{
-			Publish(EChange::Branches, [&Branches](FSessionSnapshot& State) { State.Branches = MoveTemp(Branches); });
+			Publish(EChange::Branches, [&Branches, &Remotes](FSessionSnapshot& State)
+			{
+				State.Branches = MoveTemp(Branches);
+				State.Remotes = MoveTemp(Remotes);
+			});
 		}
 	}
 

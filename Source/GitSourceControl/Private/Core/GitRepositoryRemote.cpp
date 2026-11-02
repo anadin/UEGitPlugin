@@ -251,28 +251,70 @@ namespace GitCore
 		return false;
 	}
 
-	FOpResult FGitRepository::Integrate(const FString& Upstream, bool bRebase, const FCancelTokenPtr& Cancel) const
+	bool FGitRepository::PredictReapplyConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const
+	{
+		bOutConflicts = false;
+		// stash create records the changes as a commit on top of HEAD without touching the working tree.
+		const FProcessResult Stash = Run(ECallKind::LocalScan, {TEXT("stash"), TEXT("create")});
+		if (!Stash.Succeeded())
+		{
+			OutError = DescribeFailure(Stash, TEXT("Reading your local changes"));
+			return false;
+		}
+		const FString Changes = Stash.StdoutText().TrimStartAndEnd();
+		if (Changes.IsEmpty())
+		{
+			return true;
+		}
+		// Its merge with Upstream is HEAD's merge with Upstream plus the local changes put back on top.
+		const FProcessResult Result = Run(ECallKind::LocalScan, {TEXT("merge-tree"), TEXT("--write-tree"), TEXT("--no-messages"), Upstream, Changes});
+		if (Result.Exited() && (Result.ExitCode == 0 || Result.ExitCode == 1))
+		{
+			bOutConflicts = Result.ExitCode == 1;
+			return true;
+		}
+		OutError = DescribeFailure(Result, TEXT("Checking your local changes against the incoming ones"));
+		return false;
+	}
+
+	bool FGitRepository::CountUnpublishedCommits(int32& OutCount, FString& OutError) const
+	{
+		const FProcessResult Result = Run(ECallKind::LocalScan, {TEXT("rev-list"), TEXT("--count"), TEXT("HEAD"), TEXT("--not"), TEXT("--remotes")});
+		if (!Result.Succeeded())
+		{
+			OutError = DescribeFailure(Result, TEXT("Counting unpushed commits"));
+			return false;
+		}
+		OutCount = FCString::Atoi(*Result.StdoutText());
+		return true;
+	}
+
+	FOpResult FGitRepository::Integrate(const FString& Upstream, EIntegrate Mode, const FCancelTokenPtr& Cancel) const
 	{
 		FGitCall Call;
 		Call.Kind = ECallKind::Integrate;
 		Call.Cancel = Cancel;
-		if (bRebase)
+		switch (Mode)
 		{
+		case EIntegrate::Rebase:
 			Call.Args = {TEXT("-c"), TEXT("core.editor=true"), TEXT("rebase"), TEXT("--autostash"), Upstream};
-		}
-		else
-		{
+			break;
+		case EIntegrate::Merge:
+			Call.Args = {TEXT("merge"), TEXT("--no-edit"), TEXT("--no-stat"), Upstream};
+			break;
+		default:
 			Call.Args = {TEXT("merge"), TEXT("--ff-only"), TEXT("--no-edit"), TEXT("--no-stat"), Upstream};
+			break;
 		}
 		const FProcessResult Result = Run(Call);
 		if (Result.Succeeded())
 		{
 			return FOpResult::Success();
 		}
-		if (bRebase && IsOperationInProgress())
+		if (Mode != EIntegrate::FastForward && IsOperationInProgress())
 		{
-			// Never leave a half-finished rebase behind: restore the original commits and edits.
-			Run(ECallKind::LocalMutate, {TEXT("rebase"), TEXT("--abort")});
+			// Never leave a half-finished rebase or merge behind: restore the original commits and edits.
+			Run(ECallKind::LocalMutate, {Mode == EIntegrate::Rebase ? TEXT("rebase") : TEXT("merge"), TEXT("--abort")});
 			return FOpResult::Failure(TEXT("Your commits conflict with the incoming changes. Nothing was changed; resolve the conflict in an external Git client."), Result.ErrorText());
 		}
 		return FOpResult::Failure(DescribeFailure(Result, TEXT("Pulling")), Result.ErrorText());

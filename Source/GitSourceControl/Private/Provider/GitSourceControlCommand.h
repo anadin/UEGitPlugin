@@ -21,6 +21,8 @@ struct FGitCommandSettings
 	bool bPushOnSubmit = true;
 	/** The user agreed to a push that creates a branch on the server or changes the branch this one follows. */
 	bool bPushAgreed = false;
+	/** Where Sync pulls from and how. */
+	GitCore::FPullOptions Pull;
 	int32 BackupsToKeep = 20;
 	int32 BackupDays = 14;
 	FString BackupDirectory;

@@ -208,6 +208,74 @@ namespace
 		return Path.StartsWith(TEXT("Source/")) || Path.StartsWith(TEXT("Config/")) || Path.StartsWith(TEXT("Plugins/")) ||
 			Path.EndsWith(TEXT(".uproject")) || Path.EndsWith(TEXT(".uplugin")) || Path.EndsWith(TEXT(".Build.cs")) || Path.EndsWith(TEXT(".Target.cs"));
 	}
+
+	/** What a pull would bring in: from the upstream, or from the remote branch the Git panel's Pull dialog chose. */
+	bool ReadPullSource(FGitSourceControlCommand& Command, FRemoteState& Out, FString& OutError)
+	{
+		const FPullOptions& Pull = Command.Settings.Pull;
+		const FSessionSnapshotRef Snapshot = Command.Session->GetSnapshot();
+		if (Pull.Branch.IsEmpty())
+		{
+			Out = Snapshot->Remote;
+			return true;
+		}
+		// Compared like an upstream, through the remote-tracking branch the fetch just updated.
+		FStatusSnapshot Status = Snapshot->Status;
+		Status.Upstream = Pull.Remote + TEXT("/") + Pull.Branch;
+		const bool bRead = Command.Session->GetRepository().ReadRemoteState(Status, Pull.Remote, Out, OutError);
+		Out.Remote = Pull.Remote;
+		return bRead;
+	}
+
+	/** How a pull goes, decided before anything changes. */
+	struct FPullPlan
+	{
+		EIntegrate Mode = EIntegrate::FastForward;
+		/** Local changes to files that also changed on the server. */
+		TArray<FString> Overlap;
+		/** New local files where the server adds files of the same name. */
+		TArray<FString> NewInTheWay;
+		/** The tracked files a stash would set aside. */
+		TArray<FString> Stashed;
+		/** Local changes overlap the incoming ones, or a rebase needs them out of the way. */
+		bool bStash = false;
+	};
+
+	FPullPlan PlanPull(const FSessionSnapshot& Snapshot, const FRemoteState& Source, const FPullOptions& Pull)
+	{
+		FPullPlan Plan;
+		Plan.Mode = Source.Ahead == 0 ? EIntegrate::FastForward : Pull.bRebase ? EIntegrate::Rebase : EIntegrate::Merge;
+		for (const FStatusEntry& Entry : Snapshot.Status.Entries)
+		{
+			const bool bIncoming = Source.IncomingPaths.Contains(Entry.Path) || (!Entry.OriginalPath.IsEmpty() && Source.IncomingPaths.Contains(Entry.OriginalPath));
+			if (Entry.bUntracked)
+			{
+				if (bIncoming)
+				{
+					Plan.NewInTheWay.Add(Entry.Path);
+				}
+				continue;
+			}
+			if (bIncoming)
+			{
+				Plan.Overlap.Add(Entry.Path);
+			}
+			Plan.Stashed.Add(Entry.Path);
+			if (!Entry.OriginalPath.IsEmpty())
+			{
+				Plan.Stashed.AddUnique(Entry.OriginalPath);
+			}
+		}
+		// A merge or a fast-forward keeps local changes it does not touch; a rebase needs a clean working tree.
+		Plan.bStash = !Plan.Stashed.IsEmpty() && (!Plan.Overlap.IsEmpty() || Plan.Mode == EIntegrate::Rebase);
+		return Plan;
+	}
+
+	/** Puts back the changes a pull set aside, staged as they were when that still applies. */
+	bool ReapplyStash(const FGitRepository& Repository)
+	{
+		return Repository.StashApply(TEXT("stash@{0}"), true, true).bOk || Repository.StashApply(TEXT("stash@{0}"), false, true).bOk;
+	}
 }
 
 bool FGitConnectWorker::Execute(FGitSourceControlCommand& Command)
@@ -596,18 +664,28 @@ bool FGitSyncPreviewWorker::Execute(FGitSourceControlCommand& Command)
 		return false;
 	}
 	FGitSession& Session = *Command.Session;
+	const FPullOptions& Pull = Command.Settings.Pull;
 	Session.CancelBackgroundWork();
 	FString Error;
-	if (!Session.Fetch(ECallKind::UserNetwork, Command.Cancel, &Error))
+	FRemoteState Source;
+	if (!Session.Fetch(ECallKind::UserNetwork, Command.Cancel, &Error, Pull.Remote) || !Session.RefreshStatus(nullptr, &Error) || !ReadPullSource(Command, Source, Error))
 	{
 		// An empty preview keeps the editor from reloading every package; Sync reports the problem.
 		Command.AddInfo(Error);
 		return true;
 	}
-	Session.RefreshStatus();
-	for (const FString& Path : Session.GetSnapshot()->Remote.IncomingPaths)
+	for (const FString& Path : Source.IncomingPaths)
 	{
 		AffectedFiles.Add(Session.GetRepository().ToAbsolute(Path));
+	}
+	// Files whose changes are set aside during the pull change on disk too: the editor unloads and reloads them as well.
+	const FPullPlan Plan = PlanPull(*Session.GetSnapshot(), Source, Pull);
+	if (Source.Behind > 0 && Plan.bStash && Pull.bStash)
+	{
+		for (const FString& Path : Plan.Stashed)
+		{
+			AffectedFiles.AddUnique(Session.GetRepository().ToAbsolute(Path));
+		}
 	}
 	return true;
 }
@@ -627,9 +705,10 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		Command.AddError(LOCTEXT("SyncRevisionUnsupported", "Syncing to a specific revision is not supported. Use the Git panel to switch branches."));
 		return false;
 	}
+	const FPullOptions& Pull = Command.Settings.Pull;
 	Session.CancelBackgroundWork();
 	FString Error;
-	if (!Session.Fetch(ECallKind::UserNetwork, Command.Cancel, &Error))
+	if (!Session.Fetch(ECallKind::UserNetwork, Command.Cancel, &Error, Pull.Remote))
 	{
 		Command.AddError(Error);
 		return false;
@@ -639,18 +718,23 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		return false;
 	}
 	const FSessionSnapshotRef Snapshot = Session.GetSnapshot();
-	const FRemoteState& Remote = Snapshot->Remote;
 	if (Snapshot->Status.Branch.IsEmpty())
 	{
 		Command.AddError(LOCTEXT("SyncDetached", "Switch to a branch before pulling; HEAD is detached."));
 		return false;
 	}
-	if (Remote.Upstream.IsEmpty())
+	FRemoteState Source;
+	if (!ReadPullSource(Command, Source, Error))
+	{
+		Command.AddError(Error);
+		return false;
+	}
+	if (Source.Upstream.IsEmpty())
 	{
 		Command.AddInfo(LOCTEXT("SyncUnpublished", "This branch has not been published yet, so there is nothing to pull."));
 		return true;
 	}
-	if (Remote.Behind == 0)
+	if (Source.Behind == 0)
 	{
 		Command.AddInfo(LOCTEXT("SyncUpToDate", "Already up to date."));
 		return true;
@@ -665,7 +749,7 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		// Git updates the whole working tree; only allow a file-level sync when it changes nothing else.
 		const TSet<FString> Requested(Command.RelativeFiles);
 		TArray<FString> Others;
-		for (const FString& Path : Remote.IncomingPaths)
+		for (const FString& Path : Source.IncomingPaths)
 		{
 			if (!Requested.Contains(Path))
 			{
@@ -678,24 +762,42 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 			return false;
 		}
 	}
-	TArray<FString> Overlap;
-	for (const FStatusEntry& Entry : Snapshot->Status.Entries)
+
+	const FPullPlan Plan = PlanPull(*Snapshot, Source, Pull);
+	if (!Plan.NewInTheWay.IsEmpty())
 	{
-		if (Remote.IncomingPaths.Contains(Entry.Path) || (!Entry.OriginalPath.IsEmpty() && Remote.IncomingPaths.Contains(Entry.OriginalPath)))
-		{
-			Overlap.Add(Entry.Path);
-		}
-	}
-	if (!Overlap.IsEmpty())
-	{
-		Command.AddError(FText::Format(LOCTEXT("SyncOverlap", "Nothing was changed: you have local changes to files that also changed on the server ({0}). Submit, stash or revert them first."), FText::FromString(FileList(Overlap))));
+		Command.AddError(FText::Format(LOCTEXT("SyncNewInTheWay", "Nothing was changed: new files of yours have the same names as files coming from the server ({0}). Move or delete them first."),
+			FText::FromString(FileList(Plan.NewInTheWay))));
 		return false;
 	}
-	const bool bRebase = Remote.Ahead > 0;
-	if (bRebase)
+	if (Plan.bStash && !Pull.bStash)
+	{
+		Command.AddError(Plan.Overlap.IsEmpty()
+			? LOCTEXT("SyncNeedsStash", "Nothing was changed: rebasing needs your local changes out of the way. Submit, stash or revert them first, or pull with Stash and reapply local changes.")
+			: FText::Format(LOCTEXT("SyncOverlap", "Nothing was changed: you have local changes to files that also changed on the server ({0}). Submit, stash or revert them first, or pull with Stash and reapply local changes."),
+				FText::FromString(FileList(Plan.Overlap))));
+		return false;
+	}
+	if (Plan.Mode == EIntegrate::Rebase)
+	{
+		// A rebase rewrites the commits it replays, so never ones the server already has.
+		int32 Unpublished = 0;
+		if (!Repository.CountUnpublishedCommits(Unpublished, Error))
+		{
+			Command.AddError(Error);
+			return false;
+		}
+		if (Unpublished < Source.Ahead)
+		{
+			Command.AddError(FText::Format(LOCTEXT("SyncRewritesPublished", "Nothing was changed: rebasing onto {0} would rewrite commits that are already on the server. Pull from the Git panel with Rebase instead of merge unticked to merge them instead."),
+				FText::FromString(Source.Upstream)));
+			return false;
+		}
+	}
+	if (Plan.Mode != EIntegrate::FastForward)
 	{
 		bool bConflicts = false;
-		if (!Repository.PredictConflicts(Remote.Upstream, bConflicts, Error))
+		if (!Repository.PredictConflicts(Source.Upstream, bConflicts, Error))
 		{
 			Command.AddError(Error);
 			return false;
@@ -706,21 +808,57 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 			return false;
 		}
 	}
-	const FOpResult Downloaded = Repository.FetchLfsObjects(Remote.Remote.IsEmpty() ? Repository.DefaultRemote() : Remote.Remote, Remote.Upstream, Command.Cancel);
+	if (!Plan.Overlap.IsEmpty())
+	{
+		// Local changes to incoming files are put back on top of them: only when the two combine without a conflict.
+		bool bConflicts = false;
+		if (!Repository.PredictReapplyConflicts(Source.Upstream, bConflicts, Error))
+		{
+			Command.AddError(Error);
+			return false;
+		}
+		if (bConflicts)
+		{
+			Command.AddError(FText::Format(LOCTEXT("SyncOverlapConflict", "Nothing was changed: you have local changes to files that also changed on the server, and the two cannot be combined ({0}). Submit, stash or revert yours first."),
+				FText::FromString(FileList(Plan.Overlap))));
+			return false;
+		}
+	}
+	const FOpResult Downloaded = Repository.FetchLfsObjects(Source.Remote.IsEmpty() ? Repository.DefaultRemote() : Source.Remote, Source.Upstream, Command.Cancel);
 	if (!Downloaded.bOk)
 	{
 		Command.AddError(Downloaded.Message);
 		return false;
 	}
+
 	const FString OldHead = Snapshot->Status.Head;
-	const FOpResult Integrated = Repository.Integrate(Remote.Upstream, bRebase, Command.Cancel);
-	Session.RefreshStatus();
+	// Set-aside changes come back after the pull; if they cannot, they wait in the Git panel's Stashes tab under this name.
+	const FString StashName = TEXT("Local changes set aside by Pull");
+	if (Plan.bStash)
+	{
+		const FOpResult Stashed = Repository.StashPush({}, StashName, false);
+		if (!Stashed.bOk)
+		{
+			Command.AddError(FText::Format(LOCTEXT("SyncStashFailed", "Nothing was changed: your local changes could not be set aside. {0}"), FText::FromString(Stashed.Message)));
+			Command.AddError(Stashed.Details);
+			Session.RefreshStatus();
+			return false;
+		}
+	}
+	const FOpResult Integrated = Repository.Integrate(Source.Upstream, Plan.Mode, Command.Cancel);
 	if (!Integrated.bOk)
 	{
+		if (Plan.bStash)
+		{
+			ReapplyStash(Repository);
+		}
+		Session.RefreshStatus();
 		Command.AddError(Integrated.Message);
 		Command.AddError(Integrated.Details);
 		return false;
 	}
+	const bool bRestored = !Plan.bStash || ReapplyStash(Repository);
+	Session.RefreshStatus();
 	TSet<FString> Changed;
 	if (!OldHead.IsEmpty() && Repository.ChangedPaths(OldHead, TEXT("HEAD"), Changed, Error))
 	{
@@ -737,10 +875,17 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 			Command.AddInfo(FText::Format(LOCTEXT("SyncNeedsRestart", "Code, config or plugin files changed ({0}). Rebuild and restart the editor to use them."), FText::FromString(FileList(NeedRestart))));
 		}
 	}
-	Command.AddInfo(FText::Format(LOCTEXT("Pulled", "Pulled {0} {0}|plural(one=commit,other=commits) from {1}."), Remote.Behind, FText::FromString(Remote.Upstream)));
+	if (!bRestored)
+	{
+		Command.AddError(FText::Format(LOCTEXT("SyncNotRestored", "Pulled, but your local changes could not be put back. They are kept as the stash \"{0}\" in the Git panel's Stashes tab."),
+			FText::FromString(StashName)));
+	}
+	Command.AddInfo(FText::Format(Plan.Mode == EIntegrate::Merge
+		? LOCTEXT("Merged", "Merged {0} {0}|plural(one=commit,other=commits) from {1}.")
+		: LOCTEXT("Pulled", "Pulled {0} {0}|plural(one=commit,other=commits) from {1}."), Source.Behind, FText::FromString(Source.Upstream)));
 	Session.RequestLockRefresh(false);
 	Session.RequestStashesAndBranches();
-	return true;
+	return bRestored;
 }
 
 bool FGitMarkForAddWorker::Execute(FGitSourceControlCommand& Command)

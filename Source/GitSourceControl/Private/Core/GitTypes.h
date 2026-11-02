@@ -107,6 +107,18 @@ namespace GitCore
 		bool NeedsAgreement() const { return !Remote.IsEmpty() && (!bExists || !PreviousUpstream.IsEmpty()); }
 	};
 
+	/** How a pull brings in commits: from where, and what happens to local commits and changes. */
+	struct FPullOptions
+	{
+		/** The remote branch to pull, such as origin and main; empty: the branch's upstream. */
+		FString Remote;
+		FString Branch;
+		/** Local commits are replayed on top of the pulled ones; off: both are joined by a merge commit. */
+		bool bRebase = true;
+		/** Local changes in the way are set aside and put back afterwards; off: the pull stops instead. */
+		bool bStash = true;
+	};
+
 	struct FRemoteState
 	{
 		FString Remote;

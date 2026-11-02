@@ -48,6 +48,8 @@ namespace GitCore
 		TSet<FString> MarkedForAdd;
 		TArray<FStashEntry> Stashes;
 		TArray<FBranchInfo> Branches;
+		/** Remote names, read with the branches. */
+		TArray<FString> Remotes;
 
 		bool IsTracked(const FString& Path) const { return Tracked.IsValid() && Tracked->Contains(Path); }
 		const FFileAttributes* FindAttributes(const FString& Path) const { return Attributes.IsValid() ? Attributes->Find(Path) : nullptr; }
@@ -95,7 +97,8 @@ namespace GitCore
 		/** Re-reads status; OnlyPaths limits the work to some files when possible. */
 		bool RefreshStatus(const TArray<FString>* OnlyPaths = nullptr, FString* OutError = nullptr);
 		bool RefreshLocks(ECallKind Kind, FString* OutError = nullptr);
-		bool Fetch(ECallKind Kind, const FCancelTokenPtr& Cancel, FString* OutError = nullptr);
+		/** Fetches FromRemote, or the branch's default remote when it is empty. */
+		bool Fetch(ECallKind Kind, const FCancelTokenPtr& Cancel, FString* OutError = nullptr, const FString& FromRemote = FString());
 		void RefreshRemote();
 		void RefreshStashes();
 		void RefreshBranches();

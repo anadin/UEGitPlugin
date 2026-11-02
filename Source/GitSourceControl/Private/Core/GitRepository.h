@@ -27,6 +27,17 @@ namespace GitCore
 		Blob
 	};
 
+	/** How Integrate brings in pulled commits. */
+	enum class EIntegrate : uint8
+	{
+		/** No local commits: move to the pulled commit. */
+		FastForward,
+		/** Replay local commits on top of the pulled ones. */
+		Rebase,
+		/** Join both histories with a merge commit. */
+		Merge
+	};
+
 	struct FGitCall
 	{
 		ECallKind Kind = ECallKind::LocalScan;
@@ -146,8 +157,12 @@ namespace GitCore
 		FOpResult Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel) const;
 		/** True when merging Upstream into HEAD would conflict. */
 		bool PredictConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const;
-		/** Fast-forwards to Upstream, or rebases local commits onto it when bRebase. Aborts cleanly on failure. */
-		FOpResult Integrate(const FString& Upstream, bool bRebase, const FCancelTokenPtr& Cancel) const;
+		/** True when the uncommitted changes, set aside and put back after integrating Upstream, would conflict. */
+		bool PredictReapplyConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const;
+		/** Commits on HEAD that no remote-tracking branch has: the only ones a rebase may rewrite. */
+		bool CountUnpublishedCommits(int32& OutCount, FString& OutError) const;
+		/** Brings Upstream's commits into HEAD as Mode says. Aborts cleanly on failure. */
+		FOpResult Integrate(const FString& Upstream, EIntegrate Mode, const FCancelTokenPtr& Cancel) const;
 		bool ChangedPaths(const FString& From, const FString& To, TSet<FString>& Out, FString& OutError) const;
 		/** Downloads the LFS objects Ref needs, before HEAD moves, so a failed download changes nothing. */
 		FOpResult FetchLfsObjects(const FString& Remote, const FString& Ref, const FCancelTokenPtr& Cancel) const;

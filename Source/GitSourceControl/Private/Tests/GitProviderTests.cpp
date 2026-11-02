@@ -535,6 +535,158 @@ bool FGitProviderSyncTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitProviderPullStashTest, "GitWorkspace.Provider.PullStash", ProviderTestFlags)
+bool FGitProviderPullStashTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Alice = Fixture.InitRepo(TEXT("alice"), TEXT("Alice"));
+	// Lines far enough apart that each edit's diff context leaves the other's alone.
+	auto Ini = [](const TCHAR* Name, const TCHAR* Mode) { return FString::Printf(TEXT("[Game]\nName=%s\nA=1\nB=2\nC=3\nD=4\nE=5\nF=6\nG=7\nMode=%s\n"), Name, Mode); };
+	GitTest::WriteFile(Alice, TEXT(".gitignore"), TEXT("Saved/\n"));
+	GitTest::WriteFile(Alice, TEXT("Config/DefaultGame.ini"), Ini(TEXT("Demo"), TEXT("Easy")));
+	GitTest::WriteFile(Alice, TEXT("Source/Game.cpp"), TEXT("v1\n"));
+	GitTest::WriteFile(Alice, TEXT("Docs/Readme.txt"), TEXT("readme\n"));
+	GitTest::CommitAll(Alice, TEXT("base"));
+	GitTest::Git(Alice, {TEXT("remote"), TEXT("add"), TEXT("origin"), Origin});
+	GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("-u"), TEXT("origin"), TEXT("main")});
+	const FString Bob = Fixture.Clone(Origin, TEXT("bob"), TEXT("Bob"));
+	auto AlicePushes = [&Alice](const FString& Path, const FString& Content, const FString& Message)
+	{
+		GitTest::WriteFile(Alice, Path, Content);
+		GitTest::CommitAll(Alice, Message);
+		GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+	};
+	AddExpectedErrorPlain(TEXT("or pull with Stash and reapply local changes"), EAutomationExpectedErrorFlags::Contains, 1);
+	AddExpectedErrorPlain(TEXT("the two cannot be combined"), EAutomationExpectedErrorFlags::Contains, 1);
+	AddExpectedErrorPlain(TEXT("new files of yours have the same names"), EAutomationExpectedErrorFlags::Contains, 1);
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	GitTest::FTestProvider Provider(Bob);
+	const FString Everything = Bob / TEXT("Source");
+	const FString IniFile = TEXT("Config/DefaultGame.ini");
+
+	// Both edited the config, on different lines: Bob's staged edit comes back on top of Alice's, still staged.
+	AlicePushes(IniFile, Ini(TEXT("Demo"), TEXT("Hard")), TEXT("Harder"));
+	GitTest::WriteFile(Bob, IniFile, Ini(TEXT("Bob's Demo"), TEXT("Easy")));
+	GitTest::Git(Bob, {TEXT("add"), IniFile});
+	const FSourceControlOperationRef Combine = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Pull combines a local edit with the server's: ") + Messages(Combine), Run(Provider, Combine, {Everything}), ECommandResult::Succeeded);
+	TestEqual(TEXT("Both edits are in the file"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Hard")));
+	TestEqual(TEXT("Alice's commit arrived"), Head(Bob), Head(Origin, TEXT("main")));
+	TestEqual(TEXT("Bob's edit is still staged, not committed"), GitTest::Output(GitTest::Git(Bob, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")})), IniFile);
+	TestTrue(TEXT("No stash is left behind"), GitTest::Output(GitTest::Git(Bob, {TEXT("stash"), TEXT("list")})).IsEmpty());
+
+	// Without Stash and reapply, a local edit to an incoming file stops the pull.
+	AlicePushes(IniFile, Ini(TEXT("Demo"), TEXT("Insane")), TEXT("Insane"));
+	const FString HeadBefore = Head(Bob);
+	GitCore::FPullOptions NoStash;
+	NoStash.bStash = false;
+	Provider->SetPullOptions(NoStash);
+	const FSourceControlOperationRef Refused = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Pull without stashing refuses"), Run(Provider, Refused, {Everything}), ECommandResult::Failed);
+	Provider->SetPullOptions({});
+	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	TestEqual(TEXT("The local edit is untouched"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Hard")));
+
+	// Edits to the same line cannot be combined: nothing changes.
+	GitTest::WriteFile(Bob, IniFile, Ini(TEXT("Bob's Demo"), TEXT("Bob's")));
+	const FSourceControlOperationRef Conflict = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Pull refuses edits it cannot combine"), Run(Provider, Conflict, {Everything}), ECommandResult::Failed);
+	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	TestEqual(TEXT("The conflicting edit is untouched"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Bob's")));
+
+	// A rebase needs a clean working tree: unrelated edits are set aside, and the editor is told to reload them.
+	GitTest::Git(Bob, {TEXT("reset"), TEXT("-q"), TEXT("--hard")});
+	GitTest::WriteFile(Bob, TEXT("Source/Game.cpp"), TEXT("v2 from bob\n"));
+	GitTest::Git(Bob, {TEXT("commit"), TEXT("-q"), TEXT("-am"), TEXT("Bob's code")});
+	GitTest::WriteFile(Bob, TEXT("Docs/Readme.txt"), TEXT("bob's readme\n"));
+	const TSharedRef<FSyncPreview, ESPMode::ThreadSafe> Preview = ISourceControlOperation::Create<FSyncPreview>();
+	TestEqual(TEXT("The preview succeeds"), Run(Provider, Preview, {Everything}), ECommandResult::Succeeded);
+	TestTrue(TEXT("The preview lists the incoming file"), Preview->GetAffectedFiles().Contains(Bob / IniFile));
+	TestTrue(TEXT("And the file set aside during the rebase"), Preview->GetAffectedFiles().Contains(Bob / TEXT("Docs/Readme.txt")));
+	const FSourceControlOperationRef Rebase = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Pull rebases with local edits in place: ") + Messages(Rebase), Run(Provider, Rebase, {Everything}), ECommandResult::Succeeded);
+	TestEqual(TEXT("Bob's commit sits on Alice's"), Head(Bob, TEXT("HEAD~1")), Head(Origin, TEXT("main")));
+	TestEqual(TEXT("The edit came back"), GitTest::ReadFile(Bob, TEXT("Docs/Readme.txt")), FString(TEXT("bob's readme\n")));
+	TestTrue(TEXT("No stash is left behind"), GitTest::Output(GitTest::Git(Bob, {TEXT("stash"), TEXT("list")})).IsEmpty());
+
+	// A new local file where the server adds one of the same name stops the pull.
+	AlicePushes(TEXT("Docs/New.txt"), TEXT("alice's\n"), TEXT("New doc"));
+	GitTest::WriteFile(Bob, TEXT("Docs/New.txt"), TEXT("bob's\n"));
+	TestEqual(TEXT("A new file in the way stops the pull"), Run(Provider, ISourceControlOperation::Create<FSync>(), {Everything}), ECommandResult::Failed);
+	TestEqual(TEXT("Bob's new file is untouched"), GitTest::ReadFile(Bob, TEXT("Docs/New.txt")), FString(TEXT("bob's\n")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitProviderPullMergeTest, "GitWorkspace.Provider.PullMergeAndBranch", ProviderTestFlags)
+bool FGitProviderPullMergeTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Alice = Fixture.InitRepo(TEXT("alice"), TEXT("Alice"));
+	GitTest::WriteFile(Alice, TEXT(".gitignore"), TEXT("Saved/\n"));
+	GitTest::WriteFile(Alice, TEXT("Content/Hero.uasset"), TEXT("hero v1\n"));
+	GitTest::WriteFile(Alice, TEXT("Source/Game.cpp"), TEXT("v1\n"));
+	GitTest::CommitAll(Alice, TEXT("base"));
+	GitTest::Git(Alice, {TEXT("remote"), TEXT("add"), TEXT("origin"), Origin});
+	GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("-u"), TEXT("origin"), TEXT("main")});
+	const FString Bob = Fixture.Clone(Origin, TEXT("bob"), TEXT("Bob"));
+	auto AlicePushesTo = [&Alice](const FString& Branch, const FString& Path, const FString& Content)
+	{
+		GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), Branch});
+		GitTest::WriteFile(Alice, Path, Content);
+		GitTest::CommitAll(Alice, TEXT("Alice on ") + Branch);
+		GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), Branch});
+		GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), TEXT("main")});
+	};
+	AddExpectedErrorPlain(TEXT("already on the server"), EAutomationExpectedErrorFlags::Contains, 1);
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	GitTest::FTestProvider Provider(Bob);
+	const FString Everything = Bob / TEXT("Source");
+
+	// Merge instead of rebase: Bob's commit and Alice's are joined by a merge commit.
+	GitTest::WriteFile(Bob, TEXT("Source/Game.cpp"), TEXT("v2 from bob\n"));
+	GitTest::Git(Bob, {TEXT("commit"), TEXT("-q"), TEXT("-am"), TEXT("Bob's code")});
+	AlicePushesTo(TEXT("main"), TEXT("Content/Hero.uasset"), TEXT("hero v2\n"));
+	GitCore::FPullOptions Merge;
+	Merge.bRebase = false;
+	Provider->SetPullOptions(Merge);
+	const FSourceControlOperationRef Merged = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Pull merges: ") + Messages(Merged), Run(Provider, Merged, {Everything}), ECommandResult::Succeeded);
+	TestTrue(TEXT("The result says it merged: ") + Messages(Merged), Messages(Merged).Contains(TEXT("Merged 1 commit from origin/main")));
+	TArray<FString> Parents;
+	GitTest::Output(GitTest::Git(Bob, {TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), TEXT("HEAD")})).ParseIntoArrayWS(Parents);
+	TestEqual(TEXT("HEAD is a merge commit"), Parents.Num(), 3);
+	TestTrue(TEXT("Both changes are there"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")) == TEXT("hero v2\n") && GitTest::ReadFile(Bob, TEXT("Source/Game.cpp")) == TEXT("v2 from bob\n"));
+
+	// Pulling another branch: Alice's feature comes into Bob's main.
+	GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature")});
+	GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("-u"), TEXT("origin"), TEXT("feature")});
+	GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), TEXT("main")});
+	AlicePushesTo(TEXT("feature"), TEXT("Docs/Feature.txt"), TEXT("feature\n"));
+	GitCore::FPullOptions Feature;
+	Feature.Remote = TEXT("origin");
+	Feature.Branch = TEXT("feature");
+	Feature.bRebase = false;
+	Provider->SetPullOptions(Feature);
+	const FSourceControlOperationRef FromFeature = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Pull brings in another branch: ") + Messages(FromFeature), Run(Provider, FromFeature, {Everything}), ECommandResult::Succeeded);
+	TestTrue(TEXT("The feature's file arrived"), GitTest::FileExists(Bob, TEXT("Docs/Feature.txt")));
+	TestTrue(TEXT("The result names the branch: ") + Messages(FromFeature), Messages(FromFeature).Contains(TEXT("origin/feature")));
+
+	// A rebase never rewrites commits the server already has: Bob published his to a branch of his own.
+	GitTest::Git(Bob, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("HEAD:refs/heads/bob")});
+	AlicePushesTo(TEXT("feature"), TEXT("Docs/Feature.txt"), TEXT("feature v2\n"));
+	const FString HeadBefore = Head(Bob);
+	Feature.bRebase = true;
+	Provider->SetPullOptions(Feature);
+	const FSourceControlOperationRef Rewrite = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("A rebase that rewrites published commits is refused"), Run(Provider, Rewrite, {Everything}), ECommandResult::Failed);
+	Provider->SetPullOptions({});
+	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitProviderPublishTest, "GitWorkspace.Provider.CheckInAsksToPublish", ProviderTestFlags)
 bool FGitProviderPublishTest::RunTest(const FString&)
 {

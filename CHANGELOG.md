@@ -22,6 +22,8 @@
 - Git panel: the notification after a commit no longer offers Push. It appears in the bottom-right corner of the screen, where a second click on Commit could land on it.
 - Pushes no longer send a branch's commits to an upstream with another name, such as `origin/main` for a feature branch made from it: like `git push` (unless `push.default` is `upstream`), Git Workspace publishes the branch under its own name instead. A branch that follows a local branch is no longer pushed into that branch.
 - Every push that would create a branch on the server, or change the branch yours follows, asks first: Push in the Git panel and the status bar, Commit and push, and Check in (where no checks in nothing). **Publish** in the Git panel is its own confirmation.
+- Git panel: **Pull** opens a dialog, like Fork's: the remote and branch to pull (the upstream unless you pick another, so another branch can be merged or rebased into yours), the branch it goes into, **Rebase instead of merge** and **Stash and reapply local changes**. Both choices are remembered (also in Editor Preferences) and used by the status bar's Pull and Unreal's Sync, which still pull without asking.
+- Pull keeps a local edit to a file that also changed on the server when the two can be combined, instead of stopping: the edit is stashed and put back on top, staged if it was. It still stops before changing anything when they cannot be combined (assets, the same lines), and a rebase never rewrites commits that are already on the server.
 
 ## 4.0.0-alpha
 

@@ -69,7 +69,7 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	TestTrue(TEXT("Remote state is read from local refs"), Repository->ReadRemoteState(Status, TEXT("origin"), Remote, Error));
 	TestTrue(TEXT("One incoming commit"), Remote.Behind == 1 && Remote.Ahead == 0);
 	TestTrue(TEXT("Incoming paths are listed"), Remote.IncomingPaths.Contains(TEXT("from-b.txt")));
-	const GitCore::FOpResult FastForward = Repository->Integrate(Remote.Upstream, false, nullptr);
+	const GitCore::FOpResult FastForward = Repository->Integrate(Remote.Upstream, GitCore::EIntegrate::FastForward, nullptr);
 	TestTrue(TEXT("Fast-forward integrates: ") + FastForward.Message + TEXT(" ") + FastForward.Details, FastForward.bOk);
 	TestEqual(TEXT("HEAD now matches B"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})), BHead);
 
@@ -86,7 +86,7 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	bool bConflicts = true;
 	TestTrue(TEXT("Conflict prediction runs"), Repository->PredictConflicts(Remote.Upstream, bConflicts, Error));
 	TestFalse(TEXT("No conflict is predicted"), bConflicts);
-	const GitCore::FOpResult Rebased = Repository->Integrate(Remote.Upstream, true, nullptr);
+	const GitCore::FOpResult Rebased = Repository->Integrate(Remote.Upstream, GitCore::EIntegrate::Rebase, nullptr);
 	TestTrue(TEXT("Rebase integrates: ") + Rebased.Message, Rebased.bOk);
 	TestEqual(TEXT("Local work sits on top of the incoming commit"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-list"), TEXT("--count"), TEXT("origin/main..HEAD")})), FString(TEXT("1")));
 	TestTrue(TEXT("Both files are present"), GitTest::FileExists(Clones.A, TEXT("from-a.txt")) && GitTest::FileExists(Clones.A, TEXT("from-b-2.txt")));
@@ -100,7 +100,7 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	TestTrue(TEXT("Conflict prediction runs again"), Repository->PredictConflicts(TEXT("origin/main"), bConflicts, Error));
 	TestTrue(TEXT("The conflict is predicted"), bConflicts);
 	const FString Before = GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")}));
-	TestFalse(TEXT("A conflicting rebase fails"), Repository->Integrate(TEXT("origin/main"), true, nullptr).bOk);
+	TestFalse(TEXT("A conflicting rebase fails"), Repository->Integrate(TEXT("origin/main"), GitCore::EIntegrate::Rebase, nullptr).bOk);
 	TestEqual(TEXT("HEAD is unchanged"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})), Before);
 	TestFalse(TEXT("No rebase is left in progress"), Repository->IsOperationInProgress());
 	TestEqual(TEXT("The local edit is intact"), GitTest::ReadFile(Clones.A, TEXT("shared.txt")), FString(TEXT("line 1\nA's line 2\nline 3\n")));

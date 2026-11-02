@@ -64,6 +64,10 @@ public:
 	void Push(bool bPublishing = false);
 	/** Unreal's Sync: saves, integrates incoming commits and reloads the changed packages. */
 	void Sync();
+	/** The Git panel's Pull: asks where from and how (the Pull dialog), remembers how, then runs Sync that way. */
+	void PullWithOptions();
+	/** What the Pull dialog offers: each remote's branches, with the upstream picked (without one, the likeliest branch). */
+	static GitCore::FPullOptions PullChoices(const GitCore::FSessionSnapshot& Snapshot, TMap<FString, TArray<FString>>& OutBranches);
 	/** Unreal's Submit Content dialog. */
 	void CheckIn();
 	void CheckLocks();

@@ -11,6 +11,7 @@
 #include "Editor/Panel/SGitLocksView.h"
 #include "Editor/Panel/SGitPanel.h"
 #include "Editor/Panel/SGitStashesView.h"
+#include "Provider/GitSourceControlUserSettings.h"
 
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Curves/CurveFloat.h"
@@ -361,6 +362,42 @@ bool FGitPanelPublishTest::RunTest(const FString&)
 		TestEqual(TEXT("Publish does not ask"), No.Questions.Num(), 1);
 	}
 	TestTrue(TEXT("Publish published the branch"), OnServer(TEXT("spike")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelPullChoicesTest, "GitWorkspace.Panel.PullChoices", PanelTestFlags)
+bool FGitPanelPullChoicesTest::RunTest(const FString&)
+{
+	auto Branch = [](const TCHAR* Name, bool bRemote)
+	{
+		GitCore::FBranchInfo Info;
+		Info.Name = Name;
+		Info.bRemote = bRemote;
+		return Info;
+	};
+	GitCore::FSessionSnapshot Snapshot;
+	// A remote whose name holds a slash: its branches must not be taken for origin's.
+	Snapshot.Remotes = {TEXT("origin"), TEXT("origin/mirror")};
+	Snapshot.Branches = {Branch(TEXT("feature"), false), Branch(TEXT("origin/main"), true), Branch(TEXT("origin/feature"), true), Branch(TEXT("origin/mirror/main"), true)};
+	Snapshot.Status.Branch = TEXT("feature");
+	Snapshot.Status.Upstream = TEXT("origin/feature");
+	UGitSourceControlUserSettings* User = GetMutableDefault<UGitSourceControlUserSettings>();
+	const bool bRebaseWas = User->bPullRebase;
+	User->bPullRebase = false;
+
+	TMap<FString, TArray<FString>> Branches;
+	GitCore::FPullOptions Options = FGitWorkspaceModel::PullChoices(Snapshot, Branches);
+	TestTrue(TEXT("The upstream is picked"), Options.Remote == TEXT("origin") && Options.Branch == TEXT("feature"));
+	TestFalse(TEXT("The remembered choice is offered"), Options.bRebase);
+	TestEqual(TEXT("origin lists its branches"), Branches.FindRef(TEXT("origin")), TArray<FString>({TEXT("main"), TEXT("feature")}));
+	TestEqual(TEXT("The mirror lists its own"), Branches.FindRef(TEXT("origin/mirror")), TArray<FString>({TEXT("main")}));
+
+	// Without an upstream: the branch's own name on origin when it is there, else main.
+	Snapshot.Status.Upstream.Reset();
+	Snapshot.Status.Branch = TEXT("spike");
+	Options = FGitWorkspaceModel::PullChoices(Snapshot, Branches);
+	TestTrue(TEXT("A new branch is offered origin's main"), Options.Remote == TEXT("origin") && Options.Branch == TEXT("main"));
+	User->bPullRebase = bRebaseWas;
 	return true;
 }
 

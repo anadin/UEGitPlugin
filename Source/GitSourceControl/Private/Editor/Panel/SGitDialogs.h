@@ -14,6 +14,11 @@ namespace GitWorkspaceDialogs
 	 * (FPushTarget::NeedsAgreement). True when the user agreed. bCommitFirst: the action commits, then pushes.
 	 */
 	bool ConfirmPush(const GitCore::FPushTarget& Target, bool bCommitFirst);
+	/**
+	 * The Git panel's Pull: which remote branch to pull into the branch Into, and how. RemoteBranches lists each
+	 * remote's branches; InOutOptions comes in with the ones to show picked. False when cancelled.
+	 */
+	bool AskPull(const FString& Into, const TMap<FString, TArray<FString>>& RemoteBranches, GitCore::FPullOptions& InOutOptions);
 	/** Asks for one line of text. Validate returns an error to show, or empty text when the value is fine. */
 	bool AskForText(const FText& Title, const FText& Prompt, const FText& Hint, FString& InOutValue, TFunction<FText(const FString&)> Validate = nullptr);
 

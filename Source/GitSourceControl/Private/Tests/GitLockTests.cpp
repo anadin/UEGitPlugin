@@ -84,7 +84,7 @@ bool FGitLfsPushTest::RunTest(const FString&)
 	TestTrue(TEXT("Push succeeds: ") + Pushed.Message, Pushed.bOk);
 
 	TestTrue(TEXT("Bob fetches"), Bob->Fetch(TEXT("origin"), GitCore::ECallKind::UserNetwork, nullptr).bOk);
-	TestTrue(TEXT("Bob fast-forwards and LFS downloads the new asset"), Bob->Integrate(TEXT("origin/main"), false, nullptr).bOk);
+	TestTrue(TEXT("Bob fast-forwards and LFS downloads the new asset"), Bob->Integrate(TEXT("origin/main"), GitCore::EIntegrate::FastForward, nullptr).bOk);
 	TestEqual(TEXT("Bob has the real bytes"), GitTest::ReadFile(Team.Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v2 from alice\n")));
 
 	Team.Server->SetMode(TEXT("uploadfail"));

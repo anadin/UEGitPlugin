@@ -310,6 +310,15 @@ FGitCommandSettings FGitSourceControlProvider::MakeCommandSettings() const
 	FGitCommandSettings Result;
 	Result.bLockingEnabled = Settings.IsUsingGitLfsLocking();
 	Result.bPushOnSubmit = User->bPushOnSubmit;
+	if (PullOverride.IsSet())
+	{
+		Result.Pull = PullOverride.GetValue();
+	}
+	else
+	{
+		Result.Pull.bRebase = User->bPullRebase;
+		Result.Pull.bStash = User->bPullStash;
+	}
 	Result.BackupsToKeep = User->BackupsToKeep;
 	Result.BackupDays = User->BackupDays;
 	const FString SavedDir = RepositoryFolder.IsEmpty() ? FPaths::ProjectSavedDir() : RepositoryFolder / TEXT("Saved");

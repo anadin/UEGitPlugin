@@ -5,6 +5,7 @@
 #include "GitWorkspaceText.h"
 #include "Provider/GitProviderIdentity.h"
 #include "Provider/GitSourceControlRevision.h"
+#include "Provider/GitSourceControlUserSettings.h"
 #include "Editor/Panel/SGitDiffView.h"
 #include "Editor/Panel/SGitDialogs.h"
 
@@ -29,6 +30,7 @@
 #include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 #include "Misc/ScopedSlowTask.h"
 #include "SourceControlHelpers.h"
 #include "SourceControlOperations.h"
@@ -554,6 +556,102 @@ void FGitWorkspaceModel::Sync()
 	{
 		FSourceControlWindows::SyncLatest();
 	}
+}
+
+void FGitWorkspaceModel::PullWithOptions()
+{
+	if (!IsActive() || IsBusy())
+	{
+		return;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	TMap<FString, TArray<FString>> Branches;
+	GitCore::FPullOptions Options = PullChoices(*Snapshot, Branches);
+	if (Options.Branch.IsEmpty())
+	{
+		Present(FGitActionResult::Failure(LOCTEXT("NothingToPull", "There is no remote branch to pull from. Add a remote, or Fetch first.")));
+		return;
+	}
+	if (!GitWorkspaceDialogs::AskPull(Snapshot->Status.Branch, Branches, Options))
+	{
+		return;
+	}
+	UGitSourceControlUserSettings* User = GetMutableDefault<UGitSourceControlUserSettings>();
+	User->bPullRebase = Options.bRebase;
+	User->bPullStash = Options.bStash;
+	User->SaveConfig();
+	if (Options.Remote + TEXT("/") + Options.Branch == Snapshot->Status.Upstream)
+	{
+		// Every pull uses the upstream; only another branch needs naming.
+		Options.Remote.Reset();
+		Options.Branch.Reset();
+	}
+	// Unreal's Sync runs its preview and the pull before returning, so both see these options.
+	FGitSourceControlProvider& Provider = GetProvider();
+	Provider.SetPullOptions(Options);
+	ON_SCOPE_EXIT
+	{
+		Provider.SetPullOptions({});
+	};
+	FSourceControlWindows::SyncLatest();
+}
+
+GitCore::FPullOptions FGitWorkspaceModel::PullChoices(const GitCore::FSessionSnapshot& Snapshot, TMap<FString, TArray<FString>>& OutBranches)
+{
+	const UGitSourceControlUserSettings* User = GetDefault<UGitSourceControlUserSettings>();
+	GitCore::FPullOptions Options;
+	Options.bRebase = User->bPullRebase;
+	Options.bStash = User->bPullStash;
+	OutBranches.Reset();
+	for (const FString& Remote : Snapshot.Remotes)
+	{
+		OutBranches.Add(Remote);
+	}
+	// A remote branch's name starts with its remote's; remote names may hold slashes, so the longest match wins.
+	auto Split = [&Snapshot](const FString& Name, FString& OutRemote, FString& OutBranch)
+	{
+		for (const FString& Remote : Snapshot.Remotes)
+		{
+			if (Name.StartsWith(Remote + TEXT("/")) && Remote.Len() > OutRemote.Len())
+			{
+				OutRemote = Remote;
+				OutBranch = Name.Mid(Remote.Len() + 1);
+			}
+		}
+		return !OutRemote.IsEmpty();
+	};
+	for (const GitCore::FBranchInfo& Branch : Snapshot.Branches)
+	{
+		FString Remote;
+		FString Name;
+		if (Branch.bRemote && Split(Branch.Name, Remote, Name))
+		{
+			OutBranches.FindOrAdd(Remote).Add(Name);
+		}
+	}
+	if (!Snapshot.Status.Upstream.IsEmpty() && Split(Snapshot.Status.Upstream, Options.Remote, Options.Branch))
+	{
+		OutBranches.FindOrAdd(Options.Remote).AddUnique(Options.Branch);
+		return Options;
+	}
+	// No upstream on a remote: the branch's own name, else main or master, on origin or the first remote.
+	Options.Remote = OutBranches.Contains(TEXT("origin")) ? FString(TEXT("origin")) : Snapshot.Remotes.IsEmpty() ? FString() : Snapshot.Remotes[0];
+	if (const TArray<FString>* Names = OutBranches.Find(Options.Remote))
+	{
+		for (const FString& Candidate : {Snapshot.Status.Branch, FString(TEXT("main")), FString(TEXT("master"))})
+		{
+			if (Names->Contains(Candidate))
+			{
+				Options.Branch = Candidate;
+				break;
+			}
+		}
+		if (Options.Branch.IsEmpty() && !Names->IsEmpty())
+		{
+			Options.Branch = (*Names)[0];
+		}
+	}
+	return Options;
 }
 
 void FGitWorkspaceModel::CheckIn()

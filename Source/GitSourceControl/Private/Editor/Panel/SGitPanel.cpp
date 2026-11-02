@@ -257,9 +257,14 @@ TSharedRef<SWidget> SGitPanel::MakeToolbar()
 			[
 				SNew(SButton)
 				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
-				.ToolTipText(LOCTEXT("PullTooltip", "Get the new commits: Unreal saves your work, updates the files and reloads changed assets."))
-				.IsEnabled_Lambda([Model, Idle]() { return Idle() && Model()->GetSnapshot()->Remote.Behind > 0; })
-				.OnClicked_Lambda([Model]() { if (const TSharedPtr<FGitWorkspaceModel> M = Model()) { M->Sync(); } return FReply::Handled(); })
+				.ToolTipText(LOCTEXT("PullTooltip", "Choose where to pull from and how, then get the commits: Unreal saves your work, updates the files and reloads changed assets."))
+				.IsEnabled_Lambda([Model, Idle]()
+				{
+					// Pulling another branch is possible even when this one is up to date.
+					const GitCore::FSessionSnapshotRef Snapshot = Model()->GetSnapshot();
+					return Idle() && !Snapshot->Status.Branch.IsEmpty() && (!Snapshot->Remotes.IsEmpty() || !Snapshot->Status.Upstream.IsEmpty());
+				})
+				.OnClicked_Lambda([Model]() { if (const TSharedPtr<FGitWorkspaceModel> M = Model()) { M->PullWithOptions(); } return FReply::Handled(); })
 				[
 					IconText(FAppStyle::GetBrush("Icons.CircleArrowDown"), TAttribute<FText>::CreateLambda([this, Model]()
 					{
