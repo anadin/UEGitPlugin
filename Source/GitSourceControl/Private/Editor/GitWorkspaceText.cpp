@@ -3,6 +3,7 @@
 
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Framework/Commands/InputChord.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "RevisionControlStyle/RevisionControlStyle.h"
@@ -111,6 +112,22 @@ namespace GitWorkspaceText
 	{
 		return LOCTEXT("ClaimLockTooltip", "Locked by you in another clone, worktree or computer. Claim the lock to save and check in the file here; "
 			"nothing is sent to the server. Stop editing the file in the other copy.");
+	}
+
+	FText Shortcut(EModifierKey::Type Modifiers, const FKey& Key)
+	{
+		return FInputChord(Modifiers, Key).GetInputText();
+	}
+
+	FText AltKey()
+	{
+		// Without a key, a chord's text is just its modifier's name.
+		return FInputChord(EModifierKey::Alt, EKeys::Invalid).GetModifierText();
+	}
+
+	FText AltClick()
+	{
+		return FText::Format(LOCTEXT("AltClick", "{0}+click"), AltKey());
 	}
 }
 

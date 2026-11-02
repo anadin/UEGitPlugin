@@ -2,6 +2,7 @@
 #include "GitFileTree.h"
 
 #include "Editor/GitWorkspaceModel.h"
+#include "Editor/GitWorkspaceText.h"
 #include "Provider/GitSourceControlUserSettings.h"
 
 #include "Framework/MultiBox/MultiBoxBuilder.h"
@@ -34,7 +35,8 @@ TSharedRef<SWidget> GitFileTree::MakeFoldersToggle()
 	return SNew(SCheckBox)
 		.Style(FAppStyle::Get(), "ToggleButtonCheckbox")
 		.Padding(FMargin(4.0f, 2.0f))
-		.ToolTipText(LOCTEXT("FoldersToggleTooltip", "Show files in their folders (off: one list of paths). Alt+click a folder to open or close everything in it."))
+		.ToolTipText(FText::Format(LOCTEXT("FoldersToggleTooltip", "Show files in their folders (off: one list of paths). {0} a folder to open or close everything in it."),
+			GitWorkspaceText::AltClick()))
 		.IsChecked_Lambda([]() { return ShowFolders() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
 		.OnCheckStateChanged_Lambda([](ECheckBoxState State) { SetShowFolders(State == ECheckBoxState::Checked); })
 		[

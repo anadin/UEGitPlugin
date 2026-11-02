@@ -64,8 +64,8 @@ namespace
 			{
 				return Column == FileColumn
 					? GitFileTree::MakeNameCell(SharedThis(this), true, FText::FromString(Item->Label), FText::AsNumber(Item->FileCount), nullptr,
-						FText::Format(LOCTEXT("FolderTooltip", "{0}\n{1} locked {1}|plural(one=file,other=files). Alt+click opens or closes everything in it."),
-							FText::FromString(Item->Path), Item->FileCount), Highlight)
+						FText::Format(LOCTEXT("FolderTooltip", "{0}\n{1} locked {1}|plural(one=file,other=files). {2} opens or closes everything in it."),
+							FText::FromString(Item->Path), Item->FileCount, GitWorkspaceText::AltClick()), Highlight)
 					: SNullWidget::NullWidget;
 			}
 			const GitCore::FLockInfo& Lock = *Item->Lock;
@@ -134,7 +134,7 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 			.FillWidth(1.0f)
 			[
 				SAssignNew(SearchBox, SSearchBox)
-				.HintText(LOCTEXT("SearchHint", "Search locked files or owners (Ctrl+F)"))
+				.HintText(FText::Format(LOCTEXT("SearchHint", "Search locked files or owners ({0})"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::F)))
 				.OnTextChanged_Lambda([this](const FText& Text)
 				{
 					Filter = Text.ToString().TrimStartAndEnd();
@@ -503,10 +503,12 @@ TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 	if (!Folders.IsEmpty())
 	{
 		Menu.AddMenuSeparator();
-		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"), LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. (Alt+click)"),
+		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"),
+			FText::Format(LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
 			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, true); } })));
-		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"), LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. (Alt+click)"),
+		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"),
+			FText::Format(LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
 			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, false); } })));
 	}

@@ -1,6 +1,7 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "SGitDiffView.h"
 
+#include "Editor/GitWorkspaceText.h"
 #include "Provider/GitSourceControlUserSettings.h"
 
 #include "Fonts/FontMeasure.h"
@@ -633,7 +634,8 @@ TSharedPtr<SWidget> SGitDiffView::OnContextMenu()
 		return nullptr;
 	}
 	FMenuBuilder Menu(true, nullptr);
-	Menu.AddMenuEntry(LOCTEXT("CopyLines", "Copy"), LOCTEXT("CopyLinesTooltip", "Copy the selected lines without their + and - markers. (Ctrl+C)"),
+	Menu.AddMenuEntry(LOCTEXT("CopyLines", "Copy"),
+		FText::Format(LOCTEXT("CopyLinesTooltip", "Copy the selected lines without their + and - markers. ({0})"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::C)),
 		FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
 		FUIAction(FExecuteAction::CreateSP(this, &SGitDiffView::CopySelection), FCanExecuteAction::CreateLambda([this]() { return List->GetNumItemsSelected() > 0; })));
 	Menu.AddMenuEntry(LOCTEXT("SelectAllLines", "Select all"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.SelectAll"),

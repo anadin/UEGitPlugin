@@ -3,6 +3,8 @@
 
 #include "CoreMinimal.h"
 #include "Core/GitTypes.h"
+#include "GenericPlatform/GenericApplication.h"
+#include "InputCoreTypes.h"
 
 struct FSlateBrush;
 
@@ -21,6 +23,12 @@ namespace GitWorkspaceText
 	FString ShortId(const FString& Commit);
 	/** What a lock you took elsewhere (another clone, worktree or computer) means, and what claiming it does. */
 	FText ClaimLockTooltip();
+	/** A keyboard shortcut as Unreal names it on this platform: "Ctrl+S", or "Cmd+S" on macOS, where Control means Command. */
+	FText Shortcut(EModifierKey::Type Modifiers, const FKey& Key);
+	/** "Alt", or "Option" on macOS. */
+	FText AltKey();
+	/** "Alt+click", or "Option+click" on macOS. */
+	FText AltClick();
 	/**
 	 * The folder a file is listed under in the Git panel: its own, without the two hash folders
 	 * World Partition puts between a level's external actors (or objects) folder and the file.

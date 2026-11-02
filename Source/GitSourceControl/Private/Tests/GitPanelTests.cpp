@@ -418,7 +418,10 @@ bool FGitPanelStageKeyTest::RunTest(const FString&)
 	{
 		return false;
 	}
-	// Slate on macOS reports Command as Control, so this is Cmd+S there.
+	// Slate on macOS reports Command as Control, so this is Cmd+S there, and tooltips say so.
+	TestEqual(TEXT("Tooltips name the shortcut as this platform does"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::S).ToString(),
+		FString(PLATFORM_MAC ? TEXT("Cmd+S") : TEXT("Ctrl+S")));
+	TestEqual(TEXT("and Alt+click too"), GitWorkspaceText::AltClick().ToString(), FString(PLATFORM_MAC ? TEXT("Option+click") : TEXT("Alt+click")));
 	auto PressS = [&View](bool bShift)
 	{
 		const FModifierKeysState Keys(bShift, false, true, false, false, false, false, false, false);

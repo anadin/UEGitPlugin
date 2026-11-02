@@ -88,14 +88,10 @@ namespace
 		}
 	}
 
-	/** The key that turns Commit into Commit and push while held over it. */
-	FText PushModifierName()
+	/** Stages or unstages the selected files, like Space: Ctrl+S, or Cmd+S on macOS. */
+	FText StageShortcut()
 	{
-#if PLATFORM_MAC
-		return LOCTEXT("OptionKey", "Option");
-#else
-		return LOCTEXT("AltKey", "Alt");
-#endif
+		return GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::S);
 	}
 
 	/**
@@ -211,8 +207,8 @@ namespace
 				if (Column == NameColumn)
 				{
 					return GitFileTree::MakeNameCell(SharedThis(this), true, FText::FromString(Item->Label), FText::AsNumber(Item->FileCount), nullptr,
-						FText::Format(LOCTEXT("FolderTooltip", "{0}\n{1} {1}|plural(one=file,other=files). Alt+click opens or closes everything in it."),
-							FText::FromString(Item->Path), Item->FileCount), Highlight);
+						FText::Format(LOCTEXT("FolderTooltip", "{0}\n{1} {1}|plural(one=file,other=files). {2} opens or closes everything in it."),
+							FText::FromString(Item->Path), Item->FileCount, GitWorkspaceText::AltClick()), Highlight);
 				}
 				return Column == ActionColumn ? MakeStageButton() : SNullWidget::NullWidget;
 			}
@@ -354,7 +350,7 @@ void SGitChangesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 			[
 				SAssignNew(SearchBox, SSearchBox)
 				.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.Search"))
-				.HintText(LOCTEXT("SearchHint", "Search changed files (Ctrl+F)"))
+				.HintText(FText::Format(LOCTEXT("SearchHint", "Search changed files ({0})"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::F)))
 				.OnTextChanged_Lambda([this](const FText& Text)
 				{
 					Filter = Text.ToString();
@@ -1080,12 +1076,12 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	Menu.BeginSection("Stage", LOCTEXT("StageSection", "Commit"));
 	if (bAnyUnstaged)
 	{
-		Menu.AddMenuEntry(LOCTEXT("StageMenu", "Stage"), LOCTEXT("StageMenuTooltip", "Include these changes in the next commit. (Space or Ctrl+S)"),
+		Menu.AddMenuEntry(LOCTEXT("StageMenu", "Stage"), FText::Format(LOCTEXT("StageMenuTooltip", "Include these changes in the next commit. (Space or {0})"), StageShortcut()),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::StageSelection)));
 	}
 	if (bAnyStaged)
 	{
-		Menu.AddMenuEntry(LOCTEXT("UnstageMenu", "Unstage"), LOCTEXT("UnstageMenuTooltip", "Leave these changes out of the next commit. (Space or Ctrl+S)"),
+		Menu.AddMenuEntry(LOCTEXT("UnstageMenu", "Unstage"), FText::Format(LOCTEXT("UnstageMenuTooltip", "Leave these changes out of the next commit. (Space or {0})"), StageShortcut()),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Minus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::UnstageSelection)));
 	}
 	Menu.AddMenuEntry(LOCTEXT("DiscardMenu", "Discard changes…"), LOCTEXT("DiscardMenuTooltip", "Go back to the last committed version. (Delete)"),
@@ -1096,7 +1092,8 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	if (Single.IsValid())
 	{
 		const FString Path = Single->Entry.Path;
-		Menu.AddMenuEntry(LOCTEXT("DiffMenu", "Compare with last commit"), LOCTEXT("DiffMenuTooltip", "Show what changed. (Ctrl+D)"),
+		Menu.AddMenuEntry(LOCTEXT("DiffMenu", "Compare with last commit"),
+			FText::Format(LOCTEXT("DiffMenuTooltip", "Show what changed. ({0})"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::D)),
 			FSlateIcon(StyleName, "RevisionControl.Actions.Diff"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::DiffSelection)));
 		Menu.AddMenuEntry(LOCTEXT("HistoryMenu", "Show history"), LOCTEXT("HistoryMenuTooltip", "Earlier versions of this asset."),
 			FSlateIcon(StyleName, "RevisionControl.Actions.History"),
@@ -1120,10 +1117,12 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	if (!Folders.IsEmpty())
 	{
 		Menu.BeginSection("Folders", LOCTEXT("FoldersSection", "Folders"));
-		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"), LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. (Alt+click)"),
+		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"),
+			FText::Format(LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
 			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, true); } })));
-		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"), LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. (Alt+click)"),
+		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"),
+			FText::Format(LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
 			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, false); } })));
 		Menu.EndSection();
@@ -1437,9 +1436,9 @@ TSharedRef<SWidget> SGitChangesView::MakePaneHeader(const FItemPtr& Group)
 						}
 						return FText::Format(bStaged ? LOCTEXT("UnstageSelected", "Unstage {0}") : LOCTEXT("StageSelected", "Stage {0}"), Count);
 					})
-					.ToolTipText(bStaged
-						? LOCTEXT("UnstageButtonTooltip", "Move the selected files back to Changes; with none selected, every file listed here. (Space or Ctrl+S)")
-						: LOCTEXT("StageButtonTooltip", "Stage the selected files; with none selected, every file listed here. (Space or Ctrl+S)"))
+					.ToolTipText(FText::Format(bStaged
+						? LOCTEXT("UnstageButtonTooltip", "Move the selected files back to Changes; with none selected, every file listed here. (Space or {0})")
+						: LOCTEXT("StageButtonTooltip", "Stage the selected files; with none selected, every file listed here. (Space or {0})"), StageShortcut()))
 					.IsEnabled_Lambda([Group]() { return Group->FileCount > 0; })
 					.OnClicked_Lambda([this, Kind]() { StageFromHeader(Kind); return FReply::Handled(); })
 					.Cursor(EMouseCursor::Default)
@@ -1474,7 +1473,7 @@ TSharedRef<SWidget> SGitChangesView::MakeInspector()
 				{
 					const int32 Count = SelectedFiles().Num();
 					return Count == 0 ? LOCTEXT("InspectorEmpty", "Select a file to see its details.")
-						: FText::Format(LOCTEXT("InspectorMany", "{0} files selected. Space or Ctrl+S stages or unstages them; Delete discards their changes."), Count);
+						: FText::Format(LOCTEXT("InspectorMany", "{0} files selected. Space or {1} stages or unstages them; Delete discards their changes."), Count, StageShortcut());
 				})
 				.AutoWrapText(true)
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
@@ -1746,8 +1745,10 @@ TSharedRef<SWidget> SGitChangesView::MakeCommitBar()
 					.ToolTipText_Lambda([this]()
 					{
 						return CommitPushes()
-							? LOCTEXT("CommitAndPushTooltip", "Commit the staged files, then push every outgoing commit. (Ctrl+Shift+Enter)")
-							: FText::Format(LOCTEXT("CommitTooltip", "Commit the staged files. Nothing is pushed. (Ctrl+Enter)\nHold {0} to commit and push."), PushModifierName());
+							? FText::Format(LOCTEXT("CommitAndPushTooltip", "Commit the staged files, then push every outgoing commit. ({0})"),
+								GitWorkspaceText::Shortcut(EModifierKey::Control | EModifierKey::Shift, EKeys::Enter))
+							: FText::Format(LOCTEXT("CommitTooltip", "Commit the staged files. Nothing is pushed. ({0})\nHold {1} to commit and push."),
+								GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::Enter), GitWorkspaceText::AltKey());
 					})
 					.IsEnabled(this, &SGitChangesView::CanCommit)
 					.OnClicked_Lambda([this]() { Commit(CommitPushes()); return FReply::Handled(); })
