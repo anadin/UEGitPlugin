@@ -134,10 +134,16 @@ namespace GitCore
 		/** The branch's upstream remote, else "origin", else the only remote; empty when none exist. */
 		FString DefaultRemote() const;
 		FOpResult Fetch(const FString& Remote, ECallKind Kind, const FCancelTokenPtr& Cancel) const;
-		/** Compares HEAD with its upstream using local remote-tracking refs. */
-		bool ReadRemoteState(const FStatusSnapshot& Status, FRemoteState& Out, FString& OutError) const;
-		/** Uploads LFS objects then pushes HEAD to the upstream (or to Remote/Branch with -u when there is none). */
-		FOpResult Push(const FStatusSnapshot& Status, const FString& FallbackRemote, const FCancelTokenPtr& Cancel) const;
+		/** Compares HEAD with its upstream using local remote-tracking refs, and works out where a push would go. */
+		bool ReadRemoteState(const FStatusSnapshot& Status, const FString& FallbackRemote, FRemoteState& Out, FString& OutError) const;
+		/**
+		 * Where a push of the current branch goes. Like git push's default, it never goes to an upstream with
+		 * another name (unless push.default is upstream): the branch is published under its own name instead.
+		 * FallbackRemote is used when the branch has no upstream.
+		 */
+		FOpResult ResolvePush(const FStatusSnapshot& Status, const FString& FallbackRemote, FPushTarget& Out) const;
+		/** Uploads LFS objects then pushes HEAD to Target (setting the upstream when Target says so). */
+		FOpResult Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel) const;
 		/** True when merging Upstream into HEAD would conflict. */
 		bool PredictConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const;
 		/** Fast-forwards to Upstream, or rebases local commits onto it when bRebase. Aborts cleanly on failure. */

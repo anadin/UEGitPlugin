@@ -15,8 +15,6 @@ struct FGitActionResult
 	FString Details;
 	/** Repository paths the action needs or touched (passed between the steps of switches and stashes). */
 	TArray<FString> Paths;
-	/** The action left commits to publish: the notification offers Push. */
-	bool bOfferPush = false;
 
 	static FGitActionResult Success(const FText& InMessage = FText::GetEmpty());
 	static FGitActionResult Failure(const FText& InMessage, const FString& InDetails = FString());
@@ -59,7 +57,11 @@ public:
 	void DismissFailure();
 
 	void Fetch();
-	void Push();
+	/**
+	 * Pushes the branch. A push that would create a branch on the server, or change the branch this one
+	 * follows, asks first, unless bPublishing: the user chose Publish.
+	 */
+	void Push(bool bPublishing = false);
 	/** Unreal's Sync: saves, integrates incoming commits and reloads the changed packages. */
 	void Sync();
 	/** Unreal's Submit Content dialog. */
@@ -68,7 +70,7 @@ public:
 
 	void Stage(const TArray<FString>& Paths);
 	void Unstage(const TArray<FString>& Paths);
-	/** Commits the index as the user last saw it; refuses if HEAD or the index changed since. */
+	/** Commits the index as the user last saw it; refuses if HEAD or the index changed since. A push asks first as Push does. */
 	void Commit(const FString& Message, bool bPush, TFunction<void(bool bCommitted)> OnDone = nullptr);
 	/** Discards local changes. Packages are reverted through the editor, which reloads them. */
 	void Discard(const TArray<FString>& Paths);

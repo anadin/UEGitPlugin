@@ -6,6 +6,7 @@
 #include "Provider/GitProviderIdentity.h"
 #include "Provider/GitSourceControlRevision.h"
 #include "Editor/Panel/SGitDiffView.h"
+#include "Editor/Panel/SGitDialogs.h"
 
 #include "AssetDefinition.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -201,11 +202,27 @@ namespace
 		return Targets;
 	}
 
-	/** Lock check, LFS upload and push of every outgoing commit. Runs on the mutation lane. */
-	FGitActionResult PushNow(GitCore::FGitSession& Session, bool bLocking, const GitCore::FCancelTokenPtr& Cancel)
+	/**
+	 * Lock check, LFS upload and push of every outgoing commit. Runs on the mutation lane.
+	 * bAgreed: the user agreed to a push that creates a branch on the server or changes the branch this one follows.
+	 */
+	FGitActionResult PushNow(GitCore::FGitSession& Session, bool bLocking, bool bAgreed, const GitCore::FCancelTokenPtr& Cancel)
 	{
 		const GitCore::FGitRepository& Repository = Session.GetRepository();
 		Session.RefreshStatus();
+		GitCore::FPushTarget Target;
+		const GitCore::FOpResult Resolved = Repository.ResolvePush(Session.GetSnapshot()->Status, Repository.DefaultRemote(), Target);
+		if (!Resolved.bOk)
+		{
+			return FGitActionResult::FromOp(Resolved);
+		}
+		if (Target.NeedsAgreement() && !bAgreed)
+		{
+			// The question was asked, or skipped, from the last snapshot; the branch has changed since.
+			Session.RefreshRemote();
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("PushNeedsAgreement", "Not pushed: this push would publish {0}. Push again to be asked."),
+				FText::FromString(Target.Remote + TEXT("/") + Target.Branch)));
+		}
 		if (bLocking)
 		{
 			// The server refuses pushes that change files someone else has locked; say so before trying.
@@ -225,9 +242,8 @@ namespace
 				return FGitActionResult::Failure(FText::Format(LOCTEXT("PushBlocked", "Not pushed: {0} is locked by someone else."), GitWorkspaceText::FileList(Blocked)));
 			}
 		}
-		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
 		Session.CancelBackgroundWork();
-		const GitCore::FOpResult Pushed = Repository.Push(Snapshot->Status, Repository.DefaultRemote(), Cancel);
+		const GitCore::FOpResult Pushed = Repository.Push(Target, Cancel);
 		Session.RefreshStatus();
 		Session.RefreshRemote();
 		return FGitActionResult::FromOp(Pushed);
@@ -486,12 +502,6 @@ void FGitWorkspaceModel::Present(const FGitActionResult& Result)
 		Info.Hyperlink = FSimpleDelegate::CreateLambda([]() { FMessageLog("SourceControl").Open(); });
 		Info.HyperlinkText = LOCTEXT("ShowLog", "Show log");
 	}
-	else if (Result.bOfferPush)
-	{
-		Info.ExpireDuration = 8.0f;
-		Info.ButtonDetails.Add(FNotificationButtonInfo(LOCTEXT("PushNow", "Push"), LOCTEXT("PushNowTooltip", "Publish your commits now."),
-			FSimpleDelegate::CreateSP(this, &FGitWorkspaceModel::Push), SNotificationItem::CS_Success));
-	}
 	if (const TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
 	{
 		Item->SetCompletionState(Result.bOk ? SNotificationItem::CS_Success : SNotificationItem::CS_Fail);
@@ -518,12 +528,23 @@ void FGitWorkspaceModel::Fetch()
 	});
 }
 
-void FGitWorkspaceModel::Push()
+void FGitWorkspaceModel::Push(bool bPublishing)
 {
-	const bool bLocking = IsLockingEnabled();
-	Run(LOCTEXT("Pushing", "Pushing…"), ELane::Mutation, [bLocking](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	if (IsBusy())
 	{
-		return PushNow(Session, bLocking, Cancel);
+		return;
+	}
+	const GitCore::FPushTarget Target = GetSnapshot()->Remote.Push;
+	const bool bAsk = !bPublishing && Target.NeedsAgreement();
+	if (bAsk && !GitWorkspaceDialogs::ConfirmPush(Target, false))
+	{
+		return;
+	}
+	const bool bAgreed = bPublishing || bAsk;
+	const bool bLocking = IsLockingEnabled();
+	Run(LOCTEXT("Pushing", "Pushing…"), ELane::Mutation, [bLocking, bAgreed](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		return PushNow(Session, bLocking, bAgreed, Cancel);
 	});
 }
 
@@ -598,8 +619,19 @@ void FGitWorkspaceModel::Commit(const FString& Message, bool bPush, TFunction<vo
 	const FString StagedToken = Seen->Status.StagedToken;
 	const int32 Count = Seen->Status.StagedCount();
 	const bool bLocking = IsLockingEnabled();
+	// A push that would publish the branch asks before committing, so saying no leaves nothing half done.
+	const bool bAsk = bPush && Seen->Remote.Push.NeedsAgreement();
+	const bool bAgreed = bAsk && !IsBusy() && GitWorkspaceDialogs::ConfirmPush(Seen->Remote.Push, true);
+	if (bAsk && !bAgreed)
+	{
+		if (OnDone)
+		{
+			OnDone(false);
+		}
+		return;
+	}
 	const FText Doing = bPush ? LOCTEXT("CommittingAndPushing", "Committing and pushing…") : LOCTEXT("Committing", "Committing…");
-	const bool bStarted = Run(Doing, ELane::Mutation, [Message, bPush, Head, StagedToken, Count, bLocking](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	const bool bStarted = Run(Doing, ELane::Mutation, [Message, bPush, bAgreed, Head, StagedToken, Count, bLocking](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
 	{
 		FString Commit;
 		const GitCore::FOpResult Committed = Session.GetRepository().CommitIndex(Message, Head, StagedToken, Commit);
@@ -613,10 +645,9 @@ void FGitWorkspaceModel::Commit(const FString& Message, bool bPush, TFunction<vo
 		Result.Paths = {Commit};
 		if (!bPush)
 		{
-			Result.bOfferPush = true;
 			return Result;
 		}
-		const FGitActionResult Pushed = PushNow(Session, bLocking, Cancel);
+		const FGitActionResult Pushed = PushNow(Session, bLocking, bAgreed, Cancel);
 		if (!Pushed.bOk)
 		{
 			FGitActionResult Failed = FGitActionResult::Failure(FText::Format(LOCTEXT("CommittedNotPushed", "Committed {0} locally, but not pushed: {1}"), Id, Pushed.Message), Pushed.Details);

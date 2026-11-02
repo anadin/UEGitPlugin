@@ -382,6 +382,7 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& Command)
 
 	bool bPushed = false;
 	FString Remote;
+	FPushTarget Target;
 	if (Command.Settings.bPushOnSubmit)
 	{
 		Snapshot = Session.GetSnapshot();
@@ -410,10 +411,23 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& Command)
 		}
 		Remote = Repository.DefaultRemote();
 		const bool bHasOutgoing = !Commit.IsEmpty() || Snapshot->Remote.Ahead > 0 || (Snapshot->Remote.Upstream.IsEmpty() && !Snapshot->Status.bUnborn);
-		if (bHasOutgoing && (!Snapshot->Remote.Upstream.IsEmpty() || !Remote.IsEmpty()))
+		// Without a remote there is nowhere to push, and the commit is the whole check in.
+		if (bHasOutgoing && Repository.ResolvePush(Snapshot->Status, Remote, Target).bOk)
 		{
+			if (Target.NeedsAgreement() && !Command.Settings.bPushAgreed)
+			{
+				// The provider asks before the check in starts, from the last snapshot; the branch has changed since, or nobody could be asked.
+				const FText Destination = FText::FromString(Target.Remote + TEXT("/") + Target.Branch);
+				Command.AddError(Commit.IsEmpty()
+					? FText::Format(LOCTEXT("PushNeedsAgreement", "Not pushed: this push would publish {0}. Push from the Git panel to be asked."), Destination)
+					: FText::Format(LOCTEXT("CommittedNeedsAgreement", "Committed locally ({0}), but not pushed: this push would publish {1}. Push from the Git panel to be asked."),
+						FText::FromString(ShortId(Commit)), Destination));
+				Session.RefreshStatus();
+				Session.RefreshRemote();
+				return false;
+			}
 			Session.CancelBackgroundWork();
-			const FOpResult Pushed = Repository.Push(Snapshot->Status, Remote, Command.Cancel);
+			const FOpResult Pushed = Repository.Push(Target, Command.Cancel);
 			if (!Pushed.bOk)
 			{
 				Command.AddError(Commit.IsEmpty()
@@ -445,7 +459,7 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& Command)
 	TArray<FText> Summary;
 	if (!Commit.IsEmpty())
 	{
-		const FString PushedTo = Session.GetSnapshot()->Remote.Upstream.IsEmpty() ? Remote : Session.GetSnapshot()->Remote.Upstream;
+		const FString PushedTo = Target.Remote + TEXT("/") + Target.Branch;
 		Summary.Add(bPushed
 			? FText::Format(LOCTEXT("CommittedPushed", "Committed {0} {0}|plural(one=file,other=files) as {1} and pushed to {2}."), CommitPaths.Num(),
 				FText::FromString(ShortId(Commit)), FText::FromString(PushedTo))

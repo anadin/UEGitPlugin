@@ -361,9 +361,9 @@ namespace GitCore
 		if (bRefreshRemote)
 		{
 			FString RemoteError;
-			Repository->ReadRemoteState(Status, Remote, RemoteError);
-			bRemoteChanged = true;
 			const FString DefaultRemote = Repository->DefaultRemote();
+			Repository->ReadRemoteState(Status, DefaultRemote, Remote, RemoteError);
+			bRemoteChanged = true;
 			FScopeLock Lock(&StateLock);
 			CachedDefaultRemote = DefaultRemote;
 		}
@@ -504,7 +504,7 @@ namespace GitCore
 		if (Current->bStatusValid)
 		{
 			FString RemoteError;
-			if (!Repository->ReadRemoteState(Current->Status, State, RemoteError))
+			if (!Repository->ReadRemoteState(Current->Status, Remote, State, RemoteError))
 			{
 				State.Error = RemoteError;
 			}
@@ -529,8 +529,17 @@ namespace GitCore
 			return;
 		}
 		FRemoteState State = Current->Remote;
+		FString Fallback;
+		{
+			FScopeLock Lock(&StateLock);
+			Fallback = CachedDefaultRemote;
+		}
+		if (Fallback.IsEmpty())
+		{
+			Fallback = Repository->DefaultRemote();
+		}
 		FString Error;
-		if (!Repository->ReadRemoteState(Current->Status, State, Error))
+		if (!Repository->ReadRemoteState(Current->Status, Fallback, State, Error))
 		{
 			State.Error = Error;
 		}

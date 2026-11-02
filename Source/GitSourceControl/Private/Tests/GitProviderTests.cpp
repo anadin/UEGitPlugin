@@ -2,6 +2,7 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "GitTestFixtures.h"
+#include "Editor/Panel/SGitDialogs.h"
 #include "Provider/GitStateBuilder.h"
 
 #include "SourceControlOperations.h"
@@ -531,6 +532,45 @@ bool FGitProviderSyncTest::RunTest(const FString&)
 	TestTrue(TEXT("The refusal mentions the conflict: ") + Messages(Conflict), Messages(Conflict).Contains(TEXT("conflict")));
 	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBeforeConflict);
 	TestFalse(TEXT("No rebase was left behind"), IFileManager::Get().DirectoryExists(*(Bob / TEXT(".git/rebase-merge"))));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitProviderPublishTest, "GitWorkspace.Provider.CheckInAsksToPublish", ProviderTestFlags)
+bool FGitProviderPublishTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Seed = Fixture.InitRepo(TEXT("seed"));
+	GitTest::WriteFile(Seed, TEXT("Source/Game.cpp"), TEXT("v1\n"));
+	GitTest::CommitAll(Seed, TEXT("base"));
+	GitTest::Git(Seed, {TEXT("push"), TEXT("-q"), Origin, TEXT("main")});
+	const FString Repo = Fixture.Clone(Origin, TEXT("work"));
+	const FString MainBefore = Head(Origin, TEXT("main"));
+	// A branch made from origin/main follows it: checking in must not put its commit on main.
+	GitTest::Git(Repo, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature"), TEXT("--track"), TEXT("origin/main")});
+	GitTest::WriteFile(Repo, TEXT("Source/Game.cpp"), TEXT("v2\n"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	GitTest::FTestProvider Provider(Repo);
+	const FString Game = Repo / TEXT("Source/Game.cpp");
+	TestTrue(TEXT("The change is seen"), GetState(Provider, Game, EStateCacheUsage::ForceUpdate)->IsModified());
+	const FString HeadBefore = Head(Repo);
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer No(false);
+		const TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = ISourceControlOperation::Create<FCheckIn>();
+		CheckIn->SetDescription(FText::FromString(TEXT("Game v2")));
+		TestEqual(TEXT("No cancels the check in"), Run(Provider, CheckIn, {Game}), ECommandResult::Cancelled);
+		TestEqual(TEXT("Check in asked once"), No.Questions.Num(), 1);
+	}
+	TestEqual(TEXT("Nothing was committed"), Head(Repo), HeadBefore);
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		const TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = ISourceControlOperation::Create<FCheckIn>();
+		CheckIn->SetDescription(FText::FromString(TEXT("Game v2")));
+		TestEqual(TEXT("Yes checks in: ") + Messages(CheckIn), Run(Provider, CheckIn, {Game}), ECommandResult::Succeeded);
+		TestTrue(TEXT("It was pushed to a branch of its own: ") + CheckIn->GetSuccessMessage().ToString(), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("pushed to origin/feature")));
+	}
+	TestEqual(TEXT("origin/feature has the commit"), Head(Origin, TEXT("feature")), Head(Repo));
+	TestEqual(TEXT("main on the server did not move"), Head(Origin, TEXT("main")), MainBefore);
 	return true;
 }
 

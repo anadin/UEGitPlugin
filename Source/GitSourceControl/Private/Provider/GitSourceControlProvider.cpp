@@ -10,6 +10,7 @@
 #include "GitSourceControlWorkers.h"
 #include "GitStateBuilder.h"
 #include "SGitSourceControlSettings.h"
+#include "Editor/Panel/SGitDialogs.h"
 
 #include "Framework/Notifications/NotificationManager.h"
 #include "HAL/FileManager.h"
@@ -516,6 +517,22 @@ ECommandResult::Type FGitSourceControlProvider::Execute(const FSourceControlOper
 		{
 			Command->AbsoluteFiles.Add(Absolute);
 			Command->RelativeFiles.Add(Relative);
+		}
+	}
+
+	if (Name == TEXT("CheckIn") && Command->Settings.bPushOnSubmit && IsInGameThread() && !Session->IsMutationLane())
+	{
+		// Check in pushes. Before that creates a branch on the server, or changes the branch this one follows,
+		// ask as the Git panel does; no checks in nothing.
+		const GitCore::FPushTarget Target = Session->GetSnapshot()->Remote.Push;
+		if (Target.NeedsAgreement())
+		{
+			if (!GitWorkspaceDialogs::ConfirmPush(Target, true))
+			{
+				InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Cancelled);
+				return ECommandResult::Cancelled;
+			}
+			Command->Settings.bPushAgreed = true;
 		}
 	}
 

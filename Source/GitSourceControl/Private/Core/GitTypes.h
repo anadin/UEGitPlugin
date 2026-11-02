@@ -89,6 +89,24 @@ namespace GitCore
 	};
 
 	/** Upstream comparison based on local remote-tracking refs (updated by fetch). */
+	/** Where a push of the current branch goes. */
+	struct FPushTarget
+	{
+		/** Empty when there is nowhere to push. */
+		FString Remote;
+		/** The branch's name on Remote: always its own name, unless push.default says upstream. */
+		FString Branch;
+		/** The branch follows Remote/Branch after the push. */
+		bool bSetUpstream = false;
+		/** Remote/Branch exists, as far as the last fetch knows. */
+		bool bExists = false;
+		/** The upstream the branch follows now, when the push goes to a branch with another name instead. */
+		FString PreviousUpstream;
+
+		/** The push would create a branch on the server, or change the branch this one follows: ask first. */
+		bool NeedsAgreement() const { return !Remote.IsEmpty() && (!bExists || !PreviousUpstream.IsEmpty()); }
+	};
+
 	struct FRemoteState
 	{
 		FString Remote;
@@ -101,6 +119,8 @@ namespace GitCore
 		TSet<FString> IncomingPaths;
 		/** Paths changed by local commits not yet on the upstream. */
 		TSet<FString> OutgoingPaths;
+		/** Where Push would send the branch. */
+		FPushTarget Push;
 		FDateTime FetchedAtUtc;
 		bool bFetched = false;
 		FString Error;

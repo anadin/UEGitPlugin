@@ -74,7 +74,7 @@ namespace GitCore
 		return Result.Succeeded() ? FOpResult::Success() : FOpResult::Failure(DescribeFailure(Result, TEXT("Fetching")), Result.ErrorText());
 	}
 
-	bool FGitRepository::ReadRemoteState(const FStatusSnapshot& Status, FRemoteState& Out, FString& OutError) const
+	bool FGitRepository::ReadRemoteState(const FStatusSnapshot& Status, const FString& FallbackRemote, FRemoteState& Out, FString& OutError) const
 	{
 		Out.Ahead = 0;
 		Out.Behind = 0;
@@ -83,6 +83,8 @@ namespace GitCore
 		Out.Upstream = Status.Upstream;
 		Out.UpstreamHead.Reset();
 		Out.Remote = Status.Branch.IsEmpty() ? FString() : ConfigValue(*this, TEXT("branch.") + Status.Branch + TEXT(".remote"));
+		// Without a branch, a commit or a remote there is nothing to push, and the target stays empty.
+		ResolvePush(Status, FallbackRemote, Out.Push);
 		if (Status.Upstream.IsEmpty())
 		{
 			return true;
@@ -132,8 +134,9 @@ namespace GitCore
 		return true;
 	}
 
-	FOpResult FGitRepository::Push(const FStatusSnapshot& Status, const FString& FallbackRemote, const FCancelTokenPtr& Cancel) const
+	FOpResult FGitRepository::ResolvePush(const FStatusSnapshot& Status, const FString& FallbackRemote, FPushTarget& Out) const
 	{
+		Out = FPushTarget();
 		if (Status.Branch.IsEmpty())
 		{
 			return FOpResult::Failure(TEXT("Switch to a branch before pushing."));
@@ -142,30 +145,57 @@ namespace GitCore
 		{
 			return FOpResult::Failure(TEXT("There are no commits to push yet."));
 		}
-		FString Remote = ConfigValue(*this, TEXT("branch.") + Status.Branch + TEXT(".pushRemote"));
-		if (Remote.IsEmpty())
+		const FString Key = TEXT("branch.") + Status.Branch;
+		Out.Branch = Status.Branch;
+		Out.Remote = ConfigValue(*this, Key + TEXT(".pushRemote"));
+		if (Out.Remote.IsEmpty())
 		{
-			Remote = ConfigValue(*this, TEXT("remote.pushDefault"));
+			Out.Remote = ConfigValue(*this, TEXT("remote.pushDefault"));
 		}
-		FString Destination;
-		bool bSetUpstream = false;
-		if (Remote.IsEmpty() && !Status.Upstream.IsEmpty())
+		if (Out.Remote.IsEmpty() && !Status.Upstream.IsEmpty())
 		{
-			Remote = ConfigValue(*this, TEXT("branch.") + Status.Branch + TEXT(".remote"));
-			Destination = ConfigValue(*this, TEXT("branch.") + Status.Branch + TEXT(".merge"));
+			// An upstream remote of "." is a local branch: pushing there would move that branch.
+			const FString UpstreamRemote = ConfigValue(*this, Key + TEXT(".remote"));
+			const bool bOnRemote = !UpstreamRemote.IsEmpty() && UpstreamRemote != TEXT(".");
+			FString UpstreamBranch = ConfigValue(*this, Key + TEXT(".merge"));
+			UpstreamBranch.RemoveFromStart(TEXT("refs/heads/"));
+			const auto PushesToUpstream = [this]()
+			{
+				const FString Mode = ConfigValue(*this, TEXT("push.default"));
+				return Mode == TEXT("upstream") || Mode == TEXT("tracking");
+			};
+			if (bOnRemote && (UpstreamBranch == Status.Branch || PushesToUpstream()))
+			{
+				Out.Remote = UpstreamRemote;
+				Out.Branch = UpstreamBranch;
+			}
+			else
+			{
+				// A feature branch made from origin/main follows it, but its commits must not land on main.
+				Out.Remote = bOnRemote ? UpstreamRemote : FallbackRemote;
+				Out.bSetUpstream = true;
+				Out.PreviousUpstream = Status.Upstream;
+			}
 		}
-		if (Remote.IsEmpty())
+		else if (Out.Remote.IsEmpty())
 		{
-			Remote = FallbackRemote;
-			bSetUpstream = true;
+			Out.Remote = FallbackRemote;
+			Out.bSetUpstream = true;
 		}
-		if (Remote.IsEmpty())
+		if (Out.Remote.IsEmpty())
 		{
+			Out = FPushTarget();
 			return FOpResult::Failure(TEXT("This repository has no remote to push to. Add one (for example origin) first."));
 		}
-		if (Destination.IsEmpty())
+		Out.bExists = Run(ECallKind::LocalQuick, {TEXT("rev-parse"), TEXT("--verify"), TEXT("--quiet"), TEXT("refs/remotes/") + Out.Remote + TEXT("/") + Out.Branch}).Succeeded();
+		return FOpResult::Success();
+	}
+
+	FOpResult FGitRepository::Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel) const
+	{
+		if (Target.Remote.IsEmpty() || Target.Branch.IsEmpty())
 		{
-			Destination = TEXT("refs/heads/") + Status.Branch;
+			return FOpResult::Failure(TEXT("This repository has no remote to push to. Add one (for example origin) first."));
 		}
 
 		// Upload LFS objects first so a missing pre-push hook can never publish pointers
@@ -174,7 +204,7 @@ namespace GitCore
 		Lfs.Kind = ECallKind::UserNetwork;
 		Lfs.Cancel = Cancel;
 		Lfs.bLiteralPathspecs = false;
-		Lfs.Args = {TEXT("-c"), TEXT("lfs.allowincompletepush=false"), TEXT("lfs"), TEXT("push"), Remote, TEXT("HEAD")};
+		Lfs.Args = {TEXT("-c"), TEXT("lfs.allowincompletepush=false"), TEXT("lfs"), TEXT("push"), Target.Remote, TEXT("HEAD")};
 		const FProcessResult Uploaded = Run(Lfs);
 		if (!Uploaded.Succeeded())
 		{
@@ -191,11 +221,11 @@ namespace GitCore
 		Push.Kind = ECallKind::UserNetwork;
 		Push.Cancel = Cancel;
 		Push.Args = {TEXT("push"), TEXT("--porcelain"), TEXT("--progress")};
-		if (bSetUpstream)
+		if (Target.bSetUpstream)
 		{
 			Push.Args.Add(TEXT("--set-upstream"));
 		}
-		Push.Args.Append({Remote, TEXT("HEAD:") + Destination});
+		Push.Args.Append({Target.Remote, TEXT("HEAD:refs/heads/") + Target.Branch});
 		const FProcessResult Result = Run(Push);
 		if (!Result.Succeeded())
 		{
@@ -206,7 +236,7 @@ namespace GitCore
 			}
 			return FOpResult::Failure(DescribeFailure(Result, TEXT("Pushing")), Output);
 		}
-		return FOpResult::Success(FString::Printf(TEXT("Pushed to %s."), *Remote));
+		return FOpResult::Success(FString::Printf(TEXT("Pushed to %s/%s."), *Target.Remote, *Target.Branch));
 	}
 
 	bool FGitRepository::PredictConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const

@@ -143,6 +143,14 @@ namespace GitTest
 		return Repository;
 	}
 
+	/** Pushes the current branch where Push resolves it should go, without the question the editor asks first. */
+	inline GitCore::FOpResult PushBranch(const GitCore::FGitRepository& Repository, const GitCore::FStatusSnapshot& Status, const FString& FallbackRemote)
+	{
+		GitCore::FPushTarget Target;
+		const GitCore::FOpResult Resolved = Repository.ResolvePush(Status, FallbackRemote, Target);
+		return Resolved.bOk ? Repository.Push(Target, nullptr) : Resolved;
+	}
+
 	/** Pumps game-thread tasks until Predicate holds; false on timeout. */
 	inline bool WaitFor(TFunctionRef<bool()> Predicate, double Seconds = 60.0)
 	{

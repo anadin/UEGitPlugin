@@ -80,7 +80,7 @@ bool FGitLfsPushTest::RunTest(const FString&)
 	GitCore::FStatusSnapshot Status;
 	FString Error;
 	Alice->ReadStatus(Status, Error, true);
-	const GitCore::FOpResult Pushed = Alice->Push(Status, TEXT("origin"), nullptr);
+	const GitCore::FOpResult Pushed = GitTest::PushBranch(*Alice, Status, TEXT("origin"));
 	TestTrue(TEXT("Push succeeds: ") + Pushed.Message, Pushed.bOk);
 
 	TestTrue(TEXT("Bob fetches"), Bob->Fetch(TEXT("origin"), GitCore::ECallKind::UserNetwork, nullptr).bOk);
@@ -92,7 +92,7 @@ bool FGitLfsPushTest::RunTest(const FString&)
 	GitTest::CommitAll(Team.Alice, TEXT("Hero v3"));
 	Alice->ReadStatus(Status, Error, true);
 	const FString RemoteBefore = GitTest::Output(GitTest::Git(Team.Origin, {TEXT("rev-parse"), TEXT("main")}));
-	TestFalse(TEXT("A failed LFS upload stops the push"), Alice->Push(Status, TEXT("origin"), nullptr).bOk);
+	TestFalse(TEXT("A failed LFS upload stops the push"), GitTest::PushBranch(*Alice, Status, TEXT("origin")).bOk);
 	TestEqual(TEXT("The remote branch did not move"), GitTest::Output(GitTest::Git(Team.Origin, {TEXT("rev-parse"), TEXT("main")})), RemoteBefore);
 	return true;
 }

@@ -290,7 +290,16 @@ TSharedRef<SWidget> SGitPanel::MakeToolbar()
 					const GitCore::FSessionSnapshotRef Snapshot = Model()->GetSnapshot();
 					return Snapshot->Remote.Ahead > 0 || (Snapshot->Remote.Upstream.IsEmpty() && !Snapshot->Status.Branch.IsEmpty() && !Snapshot->Status.bUnborn);
 				})
-				.OnClicked_Lambda([Model]() { if (const TSharedPtr<FGitWorkspaceModel> M = Model()) { M->Push(); } return FReply::Handled(); })
+				.OnClicked_Lambda([this, Model]()
+				{
+					// Reading Publish (the branch is not on the server yet), the button is its own confirmation.
+					// Narrow, it shows only an arrow, so the push asks.
+					if (const TSharedPtr<FGitWorkspaceModel> M = Model())
+					{
+						M->Push(!IsCompact() && M->GetSnapshot()->Remote.Upstream.IsEmpty());
+					}
+					return FReply::Handled();
+				})
 				[
 					IconText(FAppStyle::GetBrush("Icons.CircleArrowUp"), TAttribute<FText>::CreateLambda([this, Model]()
 					{
@@ -499,7 +508,7 @@ TSharedRef<SWidget> SGitPanel::MakeBranchMenu()
 	if (Snapshot->Remote.Upstream.IsEmpty() && !Snapshot->Status.Branch.IsEmpty())
 	{
 		Menu.AddMenuEntry(LOCTEXT("PublishBranch", "Publish branch"), LOCTEXT("PublishBranchTooltip", "Push this branch so others can get it."), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.CircleArrowUp"),
-			FUIAction(FExecuteAction::CreateLambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->Push(); } })));
+			FUIAction(FExecuteAction::CreateLambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->Push(true); } })));
 	}
 	Menu.EndSection();
 

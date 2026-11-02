@@ -19,6 +19,9 @@
 - Sync is now **Pull**, the Git term, in the Git panel's toolbar, the status bar and the messages that point to it. Unreal's own menu entries keep their names.
 - Git panel: the hint below the commit message wraps to the panel's width; it could stay as narrow as a shorter hint shown before it.
 - Git panel: Ctrl+S (Cmd+S on macOS) stages or unstages the selected files, like Space. While you type a search or a commit message it is still the editor's Save.
+- Git panel: the notification after a commit no longer offers Push. It appears in the bottom-right corner of the screen, where a second click on Commit could land on it.
+- Pushes no longer send a branch's commits to an upstream with another name, such as `origin/main` for a feature branch made from it: like `git push` (unless `push.default` is `upstream`), Git Workspace publishes the branch under its own name instead. A branch that follows a local branch is no longer pushed into that branch.
+- Every push that would create a branch on the server, or change the branch yours follows, asks first: Push in the Git panel and the status bar, Commit and push, and Check in (where no checks in nothing). **Publish** in the Git panel is its own confirmation.
 
 ## 4.0.0-alpha
 

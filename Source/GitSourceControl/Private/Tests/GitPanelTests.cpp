@@ -4,6 +4,7 @@
 #include "GitTestFixtures.h"
 #include "Editor/GitWorkspaceModel.h"
 #include "Editor/Panel/GitFileTree.h"
+#include "Editor/Panel/SGitDialogs.h"
 #include "Editor/Panel/SGitChangesView.h"
 #include "Editor/Panel/SGitDiffView.h"
 #include "Editor/Panel/SGitHistoryView.h"
@@ -287,6 +288,79 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	Panel.WaitIdle();
 	TestEqual(TEXT("Nothing was committed"), PanelHead(Repo), Before);
 	TestTrue(TEXT("The refusal is shown"), Panel.Model->GetLastFailure().IsSet());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelPublishTest, "GitWorkspace.Panel.PublishAsks", PanelTestFlags)
+bool FGitPanelPublishTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Seed = Fixture.InitRepo(TEXT("seed"));
+	GitTest::WriteFile(Seed, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::CommitAll(Seed, TEXT("base"));
+	GitTest::Git(Seed, {TEXT("push"), TEXT("-q"), Origin, TEXT("main")});
+	const FString Repo = Fixture.Clone(Origin, TEXT("work"));
+	const FString MainBefore = PanelHead(Origin, TEXT("main"));
+	auto OnServer = [&Origin](const TCHAR* Branch) { return GitTest::Git(Origin, {TEXT("rev-parse"), TEXT("--verify"), TEXT("-q"), FString(TEXT("refs/heads/")) + Branch}).Succeeded(); };
+	// A branch made from origin/main follows it.
+	GitTest::Git(Repo, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature"), TEXT("--track"), TEXT("origin/main")});
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("feature\n"));
+	GitTest::CommitAll(Repo, TEXT("Feature work"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	Panel.Refresh();
+	TestTrue(TEXT("The snapshot knows the push needs a yes"), Panel.Provider.Snapshot()->Remote.Push.NeedsAgreement());
+
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer No(false);
+		Panel.Model->Push();
+		Panel.WaitIdle();
+		TestEqual(TEXT("Push asks once"), No.Questions.Num(), 1);
+		TestTrue(TEXT("The question says where the commits go"),
+			No.Questions.Num() == 1 && No.Questions[0].ToString().Contains(TEXT("origin/main")) && No.Questions[0].ToString().Contains(TEXT("origin/feature")));
+	}
+	TestEqual(TEXT("No leaves main on the server alone"), PanelHead(Origin, TEXT("main")), MainBefore);
+	TestFalse(TEXT("No publishes nothing"), OnServer(TEXT("feature")));
+
+	// Commit and push asks before committing.
+	GitTest::WriteFile(Repo, TEXT("b.txt"), TEXT("b\n"));
+	Panel.Model->Stage({TEXT("b.txt")});
+	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; });
+	const FString HeadBefore = PanelHead(Repo);
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer No(false);
+		bool bCommitted = true;
+		Panel.Model->Commit(TEXT("Not yet"), true, [&bCommitted](bool bDone) { bCommitted = bDone; });
+		Panel.WaitIdle();
+		TestEqual(TEXT("Commit and push asks"), No.Questions.Num(), 1);
+		TestFalse(TEXT("No commits nothing"), bCommitted);
+	}
+	TestEqual(TEXT("HEAD did not move"), PanelHead(Repo), HeadBefore);
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		Panel.Model->Commit(TEXT("Publish it"), true);
+		Panel.WaitIdle();
+		TestEqual(TEXT("It asks again"), Yes.Questions.Num(), 1);
+	}
+	TestEqual(TEXT("Yes publishes the branch under its own name"), PanelHead(Origin, TEXT("feature")), PanelHead(Repo));
+	TestEqual(TEXT("main on the server still did not move"), PanelHead(Origin, TEXT("main")), MainBefore);
+	TestEqual(TEXT("The branch follows origin/feature now"), Panel.Provider.Snapshot()->Status.Upstream, FString(TEXT("origin/feature")));
+
+	// A branch that is not on the server: Publish is its own confirmation, other pushes ask.
+	GitTest::Git(Repo, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("spike")});
+	Panel.Refresh();
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer No(false);
+		Panel.Model->Push();
+		Panel.WaitIdle();
+		TestEqual(TEXT("Push on a new branch asks"), No.Questions.Num(), 1);
+		TestFalse(TEXT("And No keeps it local"), OnServer(TEXT("spike")));
+		Panel.Model->Push(true);
+		Panel.WaitIdle();
+		TestEqual(TEXT("Publish does not ask"), No.Questions.Num(), 1);
+	}
+	TestTrue(TEXT("Publish published the branch"), OnServer(TEXT("spike")));
 	return true;
 }
 

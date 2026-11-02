@@ -19,6 +19,8 @@ struct FGitCommandSettings
 	/** The user allows LFS locking. Workers check the repository's lockable rules themselves, after refreshing. */
 	bool bLockingEnabled = false;
 	bool bPushOnSubmit = true;
+	/** The user agreed to a push that creates a branch on the server or changes the branch this one follows. */
+	bool bPushAgreed = false;
 	int32 BackupsToKeep = 20;
 	int32 BackupDays = 14;
 	FString BackupDirectory;
