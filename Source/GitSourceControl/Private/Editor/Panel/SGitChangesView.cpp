@@ -1080,12 +1080,12 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	Menu.BeginSection("Stage", LOCTEXT("StageSection", "Commit"));
 	if (bAnyUnstaged)
 	{
-		Menu.AddMenuEntry(LOCTEXT("StageMenu", "Stage"), LOCTEXT("StageMenuTooltip", "Include these changes in the next commit. (Space)"),
+		Menu.AddMenuEntry(LOCTEXT("StageMenu", "Stage"), LOCTEXT("StageMenuTooltip", "Include these changes in the next commit. (Space or Ctrl+S)"),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::StageSelection)));
 	}
 	if (bAnyStaged)
 	{
-		Menu.AddMenuEntry(LOCTEXT("UnstageMenu", "Unstage"), LOCTEXT("UnstageMenuTooltip", "Leave these changes out of the next commit. (Space)"),
+		Menu.AddMenuEntry(LOCTEXT("UnstageMenu", "Unstage"), LOCTEXT("UnstageMenuTooltip", "Leave these changes out of the next commit. (Space or Ctrl+S)"),
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Minus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::UnstageSelection)));
 	}
 	Menu.AddMenuEntry(LOCTEXT("DiscardMenu", "Discard changes…"), LOCTEXT("DiscardMenuTooltip", "Go back to the last committed version. (Delete)"),
@@ -1161,7 +1161,10 @@ FReply SGitChangesView::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& 
 {
 	const FKey Key = InKeyEvent.GetKey();
 	const bool bControl = InKeyEvent.IsControlDown() || InKeyEvent.IsCommandDown();
-	if (Key == EKeys::SpaceBar && !SelectedFiles().IsEmpty())
+	// Ctrl+S (Cmd+S on macOS) works like Space, except while typing a search or a message: there it stays the editor's Save.
+	const bool bTyping = (SearchBox.IsValid() && SearchBox->HasKeyboardFocus()) || (MessageBox.IsValid() && MessageBox->HasKeyboardFocus());
+	const bool bControlS = Key == EKeys::S && bControl && !InKeyEvent.IsShiftDown() && !InKeyEvent.IsAltDown() && !bTyping;
+	if ((Key == EKeys::SpaceBar || bControlS) && !SelectedFiles().IsEmpty())
 	{
 		// Space moves the selection to the other group.
 		const TArray<FString> Unstaged = SelectedPaths(false);
@@ -1434,8 +1437,9 @@ TSharedRef<SWidget> SGitChangesView::MakePaneHeader(const FItemPtr& Group)
 						}
 						return FText::Format(bStaged ? LOCTEXT("UnstageSelected", "Unstage {0}") : LOCTEXT("StageSelected", "Stage {0}"), Count);
 					})
-					.ToolTipText(bStaged ? LOCTEXT("UnstageButtonTooltip", "Move the selected files back to Changes; with none selected, every file listed here. (Space)")
-						: LOCTEXT("StageButtonTooltip", "Stage the selected files; with none selected, every file listed here. (Space)"))
+					.ToolTipText(bStaged
+						? LOCTEXT("UnstageButtonTooltip", "Move the selected files back to Changes; with none selected, every file listed here. (Space or Ctrl+S)")
+						: LOCTEXT("StageButtonTooltip", "Stage the selected files; with none selected, every file listed here. (Space or Ctrl+S)"))
 					.IsEnabled_Lambda([Group]() { return Group->FileCount > 0; })
 					.OnClicked_Lambda([this, Kind]() { StageFromHeader(Kind); return FReply::Handled(); })
 					.Cursor(EMouseCursor::Default)
@@ -1470,7 +1474,7 @@ TSharedRef<SWidget> SGitChangesView::MakeInspector()
 				{
 					const int32 Count = SelectedFiles().Num();
 					return Count == 0 ? LOCTEXT("InspectorEmpty", "Select a file to see its details.")
-						: FText::Format(LOCTEXT("InspectorMany", "{0} files selected. Space stages or unstages them; Delete discards their changes."), Count);
+						: FText::Format(LOCTEXT("InspectorMany", "{0} files selected. Space or Ctrl+S stages or unstages them; Delete discards their changes."), Count);
 				})
 				.AutoWrapText(true)
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())

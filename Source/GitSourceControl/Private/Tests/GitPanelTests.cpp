@@ -290,6 +290,44 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelStageKeyTest, "GitWorkspace.Panel.StageKey", PanelTestFlags)
+bool FGitPanelStageKeyTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Repo = Fixture.InitRepo();
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::CommitAll(Repo, TEXT("base"));
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a changed\n"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	Panel.Refresh();
+	const TSharedRef<SGitChangesView> View = SNew(SGitChangesView, Panel.Model);
+	const TSharedPtr<STreeView<SGitChangesView::FItemPtr>> StagedTree = ChangesList(View, TEXT("GitPanel.Changes.Staged"));
+	if (!TestTrue(TEXT("The Staged list is tagged"), StagedTree.IsValid()))
+	{
+		return false;
+	}
+	// Slate on macOS reports Command as Control, so this is Cmd+S there.
+	auto PressS = [&View](bool bShift)
+	{
+		const FModifierKeysState Keys(bShift, false, true, false, false, false, false, false, false);
+		return View->OnKeyDown(FGeometry(), FKeyEvent(EKeys::S, Keys, 0, false, 0, 0)).IsEventHandled();
+	};
+
+	View->SelectPaths({TEXT("a.txt")});
+	TestFalse(TEXT("Ctrl+Shift+S stays the editor's Save All"), PressS(true));
+	TestTrue(TEXT("Ctrl+S is taken"), PressS(false));
+	TestTrue(TEXT("Ctrl+S stages the selected file"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
+	TestEqual(TEXT("Only a.txt is staged"), PanelStaged(Repo), FString(TEXT("a.txt")));
+
+	View->SelectPaths({TEXT("a.txt")});
+	TestEqual(TEXT("The staged file is selected"), StagedTree->GetSelectedItems().Num(), 1);
+	TestTrue(TEXT("Ctrl+S is taken again"), PressS(false));
+	TestTrue(TEXT("Ctrl+S unstages it"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 0; }));
+	TestEqual(TEXT("Nothing is staged"), PanelStaged(Repo), FString());
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelBranchesAndStashesTest, "GitWorkspace.Panel.BranchesAndStashes", PanelTestFlags)
 bool FGitPanelBranchesAndStashesTest::RunTest(const FString&)
 {

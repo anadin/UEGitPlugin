@@ -18,6 +18,7 @@
 - Git panel: one **Commit** button instead of Commit and Commit and push. Hold Alt (Option on macOS) over it to make it **Commit and push**, so pushing is never one stray click away. Ctrl+Shift+Enter still commits and pushes.
 - Sync is now **Pull**, the Git term, in the Git panel's toolbar, the status bar and the messages that point to it. Unreal's own menu entries keep their names.
 - Git panel: the hint below the commit message wraps to the panel's width; it could stay as narrow as a shorter hint shown before it.
+- Git panel: Ctrl+S (Cmd+S on macOS) stages or unstages the selected files, like Space. While you type a search or a commit message it is still the editor's Save.
 
 ## 4.0.0-alpha
 

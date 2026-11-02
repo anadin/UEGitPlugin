@@ -84,7 +84,7 @@ Switching branches and restoring stashes refuse to overwrite local edits, downlo
 | Key | Action |
 | --- | --- |
 | Ctrl+F | Search the current tab |
-| Space | Stage or unstage the selected files |
+| Space or Ctrl+S | Stage or unstage the selected files |
 | Enter / double-click | Compare an edited file, or open a new one; open or close a folder |
 | Left / Right | Close or open a folder (with Shift: everything in it) |
 | Ctrl+D | Compare with the last commit, in its own window |
