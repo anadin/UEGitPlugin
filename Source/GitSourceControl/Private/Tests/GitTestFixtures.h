@@ -52,6 +52,26 @@ namespace GitTest
 		return Result.StdoutText().TrimStartAndEnd();
 	}
 
+	/** Whether Items holds Item spelled exactly so: TArray and TSet compare text ignoring case, as FString's == does. */
+	template <typename ContainerType>
+	bool HasExactly(const ContainerType& Items, const FString& Item)
+	{
+		for (const FString& Each : Items)
+		{
+			if (Each.Equals(Item, ESearchCase::CaseSensitive))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** A list as one line, for TestEqualSensitive: TestEqual compares lists of text ignoring case. */
+	inline FString Joined(const TArray<FString>& Items)
+	{
+		return FString::Join(Items, TEXT(" | "));
+	}
+
 	inline bool WriteFile(const FString& Repo, const FString& Relative, const FString& Content)
 	{
 		const FString Full = Repo / Relative;
@@ -267,7 +287,7 @@ namespace GitTest
 			int32 Count = 0;
 			for (const FString& Line : Lines)
 			{
-				Count += Line.Contains(PathFragment) ? 1 : 0;
+				Count += Line.Contains(PathFragment, ESearchCase::CaseSensitive) ? 1 : 0;
 			}
 			return Count;
 		}

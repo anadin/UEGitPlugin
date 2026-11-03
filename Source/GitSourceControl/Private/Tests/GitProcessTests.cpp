@@ -59,7 +59,7 @@ bool FGitProcessArgumentsTest::RunTest(const FString&)
 		Expected += TEXT(" ") + SqQuote(Argument);
 	}
 	TestTrue(TEXT("Quoting succeeded"), Quoted.Succeeded());
-	TestEqual(TEXT("Every argument arrives exactly as given"), Quoted.StdoutText().TrimEnd(), Expected);
+	TestEqualSensitive(TEXT("Every argument arrives exactly as given"), Quoted.StdoutText().TrimEnd(), Expected);
 
 	// stdin in, large binary-safe stdout back out.
 	GitTest::FFixture Fixture;
@@ -83,7 +83,7 @@ bool FGitProcessArgumentsTest::RunTest(const FString&)
 	uint8 Digest[20];
 	Sha.GetHash(Digest);
 	const FString Object = BytesToHex(Digest, 20).ToLower();
-	TestEqual(TEXT("All stdin bytes reached git"), Written.StdoutText().TrimEnd(), Object);
+	TestEqualSensitive(TEXT("All stdin bytes reached git"), Written.StdoutText().TrimEnd(), Object);
 	const GitCore::FProcessResult ReadBack = GitCore::RunProcess(GitSpec({TEXT("-C"), Repo, TEXT("cat-file"), TEXT("blob"), Object}));
 	TestTrue(TEXT("Large binary stdout is exact"), ReadBack.Succeeded() && ReadBack.Stdout == Data);
 
@@ -163,8 +163,8 @@ bool FGitProcessEnvironmentTest::RunTest(const FString&)
 	FPlatformMisc::SetEnvironmentVar(Inherited, TEXT(""));
 	const FString Environment = Result.StdoutText();
 	TestTrue(TEXT("The child runs"), Result.Succeeded());
-	TestTrue(TEXT("The child inherits the editor's variables"), Before.Contains(TEXT("GIT_WORKSPACE_TEST_INHERITED=from the editor")));
-	TestTrue(TEXT("Overrides reach the child"), Environment.Contains(TEXT("GIT_WORKSPACE_TEST_VALUE=set by test")));
+	TestTrue(TEXT("The child inherits the editor's variables"), Before.Contains(TEXT("GIT_WORKSPACE_TEST_INHERITED=from the editor"), ESearchCase::CaseSensitive));
+	TestTrue(TEXT("Overrides reach the child"), Environment.Contains(TEXT("GIT_WORKSPACE_TEST_VALUE=set by test"), ESearchCase::CaseSensitive));
 	TestFalse(TEXT("Removed variables are absent"), Environment.Contains(TEXT("GIT_WORKSPACE_TEST_INHERITED=")));
 
 	// The repository layer scrubs variables that would redirect git elsewhere.
@@ -174,7 +174,7 @@ bool FGitProcessEnvironmentTest::RunTest(const FString&)
 	const bool bStaged = Repository.IsValid() && Repository->Stage({TEXT("file.txt")}).bOk;
 	FPlatformMisc::SetEnvironmentVar(TEXT("GIT_INDEX_FILE"), TEXT(""));
 	TestTrue(TEXT("A stray GIT_INDEX_FILE does not redirect the repository"), bStaged);
-	TestTrue(TEXT("The real index received the file"), GitTest::Output(GitTest::Git(Repo, {TEXT("ls-files"), TEXT("--stage"), TEXT("file.txt")})).Contains(TEXT("file.txt")));
+	TestTrue(TEXT("The real index received the file"), GitTest::Output(GitTest::Git(Repo, {TEXT("ls-files"), TEXT("--stage"), TEXT("file.txt")})).Contains(TEXT("file.txt"), ESearchCase::CaseSensitive));
 	return true;
 }
 

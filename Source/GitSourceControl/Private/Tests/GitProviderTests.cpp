@@ -167,13 +167,13 @@ bool FGitProviderStateMappingTest::RunTest(const FString&)
 		TestEqual(P + TEXT(": IsDeleted"), State->IsDeleted(), Row.bDeleted);
 		TestEqual(P + TEXT(": CanRevert"), State->CanRevert(), Row.bCanRevert);
 		TestEqual(P + TEXT(": CanAdd"), State->CanAdd(), Row.bCanAdd);
-		TestEqual(P + TEXT(": icon"), State->GetIcon().GetStyleName().ToString(), Row.Icon ? FString(Row.Icon) : FName(NAME_None).ToString());
+		TestEqualSensitive(P + TEXT(": icon"), State->GetIcon().GetStyleName().ToString(), Row.Icon ? FString(Row.Icon) : FName(NAME_None).ToString());
 		TestTrue(P + TEXT(": resolved states are fresh"), State->GetTimeStamp() == Context.Now);
 	}
 
 	FString Who;
-	TestTrue(TEXT("Another person's lock names them"), Build(Context, TEXT("Content/Theirs.uasset"))->IsCheckedOutOther(&Who) && Who == TEXT("Bob"));
-	TestTrue(TEXT("The lock owner is shown in the Content Browser"), Build(Context, TEXT("Content/Theirs.uasset"))->GetStatusText().Get(FText()).ToString().Contains(TEXT("Bob")));
+	TestTrue(TEXT("Another person's lock names them"), Build(Context, TEXT("Content/Theirs.uasset"))->IsCheckedOutOther(&Who) && Who.Equals(TEXT("Bob"), ESearchCase::CaseSensitive));
+	TestTrue(TEXT("The lock owner is shown in the Content Browser"), Build(Context, TEXT("Content/Theirs.uasset"))->GetStatusText().Get(FText()).ToString().Contains(TEXT("Bob"), ESearchCase::CaseSensitive));
 	TestTrue(TEXT("Editing without a lock is called out"), Build(Context, TEXT("Content/Modified.uasset"))->GetWarningText().IsSet());
 	TestFalse(TEXT("Clean files say nothing"), Build(Context, TEXT("readme.txt"))->GetStatusText().IsSet());
 
@@ -225,8 +225,8 @@ bool FGitProviderLocalOperationsTest::RunTest(const FString&)
 	const FString New = Repo / TEXT("Content/New.uasset");
 	// Temporary folders are often reached through a symlink (/var -> /private/var on macOS).
 	const GitCore::FGitRepository& Repository = Provider->GetSession()->GetRepository();
-	TestEqual(TEXT("Editor paths map into the repository"), Repository.ToRelative(Hero), FString(TEXT("Content/Hero.uasset")));
-	TestEqual(TEXT("Repository paths map back to the editor's spelling"), Repository.ToAbsolute(TEXT("Content/Hero.uasset")), Hero);
+	TestEqualSensitive(TEXT("Editor paths map into the repository"), Repository.ToRelative(Hero), FString(TEXT("Content/Hero.uasset")));
+	TestEqualSensitive(TEXT("Repository paths map back to the editor's spelling"), Repository.ToAbsolute(TEXT("Content/Hero.uasset")), Hero);
 
 	FSourceControlStatePtr State = GetState(Provider, Hero, EStateCacheUsage::ForceUpdate);
 	if (!TestTrue(TEXT("A state is always returned"), State.IsValid()))
@@ -245,7 +245,7 @@ bool FGitProviderLocalOperationsTest::RunTest(const FString&)
 	TestTrue(TEXT("Nothing is staged by MarkForAdd"), GitTest::Output(GitTest::Git(Repo, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")})).IsEmpty());
 	State = GetState(Provider, New);
 	TestTrue(TEXT("The new asset reads as added"), State->IsAdded() && State->IsSourceControlled() && State->CanCheckIn());
-	TestTrue(TEXT("The mark survives in the git directory"), GitTest::ReadFile(Repo, TEXT(".git/uegit/marked-for-add.json")).Contains(TEXT("Content/New.uasset")));
+	TestTrue(TEXT("The mark survives in the git directory"), GitTest::ReadFile(Repo, TEXT(".git/uegit/marked-for-add.json")).Contains(TEXT("Content/New.uasset"), ESearchCase::CaseSensitive));
 
 	const TSharedRef<FCopy, ESPMode::ThreadSafe> Copy = ISourceControlOperation::Create<FCopy>();
 	Copy->SetDestination(Repo / TEXT("Content/HeroCopy.uasset"));
@@ -257,20 +257,20 @@ bool FGitProviderLocalOperationsTest::RunTest(const FString&)
 	TestTrue(TEXT("Delete stages nothing"), GitTest::Output(GitTest::Git(Repo, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")})).IsEmpty());
 	TestTrue(TEXT("The file reads as deleted"), GetState(Provider, Hero)->IsDeleted());
 	const TArray<FSourceControlStateRef> PendingDeletes = Provider->GetCachedStateByPredicate([](const FSourceControlStateRef& Candidate) { return Candidate->IsDeleted(); });
-	TestTrue(TEXT("Pending deletes are found through the cache"), PendingDeletes.ContainsByPredicate([&Hero](const FSourceControlStateRef& Candidate) { return Candidate->GetFilename() == Hero; }));
+	TestTrue(TEXT("Pending deletes are found through the cache"), PendingDeletes.ContainsByPredicate([&Hero](const FSourceControlStateRef& Candidate) { return Candidate->GetFilename().Equals(Hero, ESearchCase::CaseSensitive); }));
 
 	TestEqual(TEXT("Revert succeeds"), Run(Provider, ISourceControlOperation::Create<FRevert>(), {Hero}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The deleted file is back"), GitTest::ReadFile(Repo, TEXT("Content/Hero.uasset")), FString(TEXT("hero v1\n")));
+	TestEqualSensitive(TEXT("The deleted file is back"), GitTest::ReadFile(Repo, TEXT("Content/Hero.uasset")), FString(TEXT("hero v1\n")));
 	State = GetState(Provider, Hero);
 	TestTrue(TEXT("The restored file is unchanged"), !State->IsModified() && !State->IsDeleted());
 
 	GitTest::WriteFile(Repo, TEXT("Source/Game.cpp"), TEXT("changed\n"));
 	TestTrue(TEXT("A modified file reads as modified"), GetState(Provider, Game, EStateCacheUsage::ForceUpdate)->IsModified());
 	TestEqual(TEXT("Reverting a modified file succeeds"), Run(Provider, ISourceControlOperation::Create<FRevert>(), {Game}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The committed content is restored"), GitTest::ReadFile(Repo, TEXT("Source/Game.cpp")), FString(TEXT("int Main() { return 0; }\n")));
+	TestEqualSensitive(TEXT("The committed content is restored"), GitTest::ReadFile(Repo, TEXT("Source/Game.cpp")), FString(TEXT("int Main() { return 0; }\n")));
 	TArray<FString> Backups;
 	IFileManager::Get().FindFilesRecursive(Backups, *(Repo / TEXT("Saved/GitSourceControl/Backups")), TEXT("Game.cpp"), true, false);
-	TestTrue(TEXT("The reverted content was backed up"), Backups.Num() == 1 && GitTest::ReadFile(FString(), Backups[0]) == TEXT("changed\n"));
+	TestTrue(TEXT("The reverted content was backed up"), Backups.Num() == 1 && GitTest::ReadFile(FString(), Backups[0]).Equals(TEXT("changed\n"), ESearchCase::CaseSensitive));
 
 	const TSharedRef<FRevert, ESPMode::ThreadSafe> SoftRevert = ISourceControlOperation::Create<FRevert>();
 	SoftRevert->SetSoftRevert(true);
@@ -287,11 +287,11 @@ bool FGitProviderLocalOperationsTest::RunTest(const FString&)
 	const TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = ISourceControlOperation::Create<FCheckIn>();
 	CheckIn->SetDescription(FText::FromString(TEXT("Submit test")));
 	TestEqual(TEXT("Submit succeeds: ") + Messages(CheckIn), Run(Provider, CheckIn, {Game, New}), ECommandResult::Succeeded);
-	TestEqual(TEXT("Only the listed files were committed"), Lines(GitTest::Git(Repo, {TEXT("show"), TEXT("--name-only"), TEXT("--format="), TEXT("HEAD")})),
-		TArray<FString>({TEXT("Content/New.uasset"), TEXT("Source/Game.cpp")}));
-	TestEqual(TEXT("The description is the commit message"), GitTest::Output(GitTest::Git(Repo, {TEXT("log"), TEXT("-1"), TEXT("--format=%s")})), FString(TEXT("Submit test")));
-	TestEqual(TEXT("Other staged changes are untouched"), GitTest::Output(GitTest::Git(Repo, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")})), FString(TEXT("notes.txt")));
-	TestTrue(TEXT("The result names the commit"), CheckIn->GetSuccessMessage().ToString().StartsWith(TEXT("Committed 2 files as ")));
+	TestEqualSensitive(TEXT("Only the listed files were committed"), GitTest::Joined(Lines(GitTest::Git(Repo, {TEXT("show"), TEXT("--name-only"), TEXT("--format="), TEXT("HEAD")}))),
+		GitTest::Joined({TEXT("Content/New.uasset"), TEXT("Source/Game.cpp")}));
+	TestEqualSensitive(TEXT("The description is the commit message"), GitTest::Output(GitTest::Git(Repo, {TEXT("log"), TEXT("-1"), TEXT("--format=%s")})), FString(TEXT("Submit test")));
+	TestEqualSensitive(TEXT("Other staged changes are untouched"), GitTest::Output(GitTest::Git(Repo, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")})), FString(TEXT("notes.txt")));
+	TestTrue(TEXT("The result names the commit"), CheckIn->GetSuccessMessage().ToString().StartsWith(TEXT("Committed 2 files as "), ESearchCase::CaseSensitive));
 	TestFalse(TEXT("Without a remote nothing is pushed"), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("pushed")));
 	TestFalse(TEXT("Committed files are no longer marked"), Provider.Snapshot()->MarkedForAdd.Contains(TEXT("Content/New.uasset")));
 	TestTrue(TEXT("The committed file is unchanged"), !GetState(Provider, New)->IsModified());
@@ -341,7 +341,7 @@ bool FGitProviderCheckOutAndSubmitTest::RunTest(const FString&)
 	TestFalse(TEXT("Bob cannot check it out"), State->CanCheckout());
 	const FSourceControlOperationRef BobCheckOut = ISourceControlOperation::Create<FCheckOut>();
 	TestEqual(TEXT("Bob's check out is refused"), Run(Bob, BobCheckOut, {BobHero}), ECommandResult::Failed);
-	TestTrue(TEXT("The refusal says who holds it: ") + Messages(BobCheckOut), Messages(BobCheckOut).Contains(TEXT("locked by")));
+	TestTrue(TEXT("The refusal says who holds it: ") + Messages(BobCheckOut), Messages(BobCheckOut).Contains(TEXT("locked by"), ESearchCase::CaseSensitive));
 
 	// What the editor does around a save: status of the saved files and an add for new ones. No lock traffic.
 	const int32 RequestsBeforeSave = Team.Server->CountRequests(TEXT("/locks"));
@@ -356,9 +356,9 @@ bool FGitProviderCheckOutAndSubmitTest::RunTest(const FString&)
 	const TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = ISourceControlOperation::Create<FCheckIn>();
 	CheckIn->SetDescription(FText::FromString(TEXT("Hero v2")));
 	TestEqual(TEXT("Alice submits: ") + Messages(CheckIn), Run(Alice, CheckIn, {Hero, Prop}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The commit reached the server"), Head(Team.Origin, TEXT("main")), Head(Team.Alice));
-	TestTrue(TEXT("The result says it was pushed: ") + CheckIn->GetSuccessMessage().ToString(), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("pushed to origin/main")));
-	TestTrue(TEXT("The result counts the released lock"), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("Released 1 lock")));
+	TestEqualSensitive(TEXT("The commit reached the server"), Head(Team.Origin, TEXT("main")), Head(Team.Alice));
+	TestTrue(TEXT("The result says it was pushed: ") + CheckIn->GetSuccessMessage().ToString(), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("pushed to origin/main"), ESearchCase::CaseSensitive));
+	TestTrue(TEXT("The result counts the released lock"), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("Released 1 lock"), ESearchCase::CaseSensitive));
 	GitCore::FLockSnapshot ServerLocks;
 	Bob->GetSession()->GetRepository().VerifyLocks(TEXT("origin"), GitCore::ECallKind::UserNetwork, ServerLocks);
 	TestTrue(TEXT("The lock was released on the server"), ServerLocks.Find(TEXT("Content/Hero.uasset")) == nullptr);
@@ -371,7 +371,7 @@ bool FGitProviderCheckOutAndSubmitTest::RunTest(const FString&)
 	KeepLocked->SetDescription(FText::FromString(TEXT("Map v2")));
 	KeepLocked->SetKeepCheckedOut(true);
 	TestEqual(TEXT("Submit keeping the lock: ") + Messages(KeepLocked), Run(Alice, KeepLocked, {Map}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The map commit reached the server"), Head(Team.Origin, TEXT("main")), Head(Team.Alice));
+	TestEqualSensitive(TEXT("The map commit reached the server"), Head(Team.Origin, TEXT("main")), Head(Team.Alice));
 	TestTrue(TEXT("The map is still checked out"), GetState(Alice, Map)->IsCheckedOut());
 	Bob->GetSession()->GetRepository().VerifyLocks(TEXT("origin"), GitCore::ECallKind::UserNetwork, ServerLocks);
 	TestTrue(TEXT("The server still holds the map lock"), ServerLocks.Find(TEXT("Content/Map.umap")) != nullptr);
@@ -385,8 +385,8 @@ bool FGitProviderCheckOutAndSubmitTest::RunTest(const FString&)
 	const TSharedRef<FCheckIn, ESPMode::ThreadSafe> Rejected = ISourceControlOperation::Create<FCheckIn>();
 	Rejected->SetDescription(FText::FromString(TEXT("Map v3")));
 	TestEqual(TEXT("Submit reports the rejected push"), Run(Alice, Rejected, {Map}), ECommandResult::Failed);
-	TestTrue(TEXT("The commit is kept and Pull is suggested: ") + Messages(Rejected), Messages(Rejected).Contains(TEXT("Committed locally")) && Messages(Rejected).Contains(TEXT("Pull")));
-	TestEqual(TEXT("Alice's commit is local"), GitTest::Output(GitTest::Git(Team.Alice, {TEXT("log"), TEXT("-1"), TEXT("--format=%s")})), FString(TEXT("Map v3")));
+	TestTrue(TEXT("The commit is kept and Pull is suggested: ") + Messages(Rejected), Messages(Rejected).Contains(TEXT("Committed locally"), ESearchCase::CaseSensitive) && Messages(Rejected).Contains(TEXT("Pull"), ESearchCase::CaseSensitive));
+	TestEqualSensitive(TEXT("Alice's commit is local"), GitTest::Output(GitTest::Git(Team.Alice, {TEXT("log"), TEXT("-1"), TEXT("--format=%s")})), FString(TEXT("Map v3")));
 	TestTrue(TEXT("The map stays checked out"), GetState(Alice, Map)->IsCheckedOut());
 	return true;
 }
@@ -419,7 +419,7 @@ bool FGitProviderRevertAndDeleteLocksTest::RunTest(const FString&)
 	GitTest::WriteFile(Team.Alice, TEXT("Content/Hero.uasset"), TEXT("experiment\n"));
 	const FSourceControlOperationRef Revert = ISourceControlOperation::Create<FRevert>();
 	TestEqual(TEXT("Revert succeeds: ") + Messages(Revert), Run(Alice, Revert, {Hero}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The committed version is back"), GitTest::ReadFile(Team.Alice, TEXT("Content/Hero.uasset")), FString(TEXT("hero v1\n")));
+	TestEqualSensitive(TEXT("The committed version is back"), GitTest::ReadFile(Team.Alice, TEXT("Content/Hero.uasset")), FString(TEXT("hero v1\n")));
 	TestTrue(TEXT("The lock was released"), ServerLocks().Find(TEXT("Content/Hero.uasset")) == nullptr);
 	TestFalse(TEXT("The hero is no longer checked out"), GetState(Alice, Hero)->IsCheckedOut());
 
@@ -443,7 +443,7 @@ bool FGitProviderRevertAndDeleteLocksTest::RunTest(const FString&)
 
 	// Reverting the delete brings the file back and releases the lock.
 	TestEqual(TEXT("Alice reverts the delete"), Run(Alice, ISourceControlOperation::Create<FRevert>(), {Map}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The map is back"), GitTest::ReadFile(Team.Alice, TEXT("Content/Map.umap")), FString(TEXT("map v1\n")));
+	TestEqualSensitive(TEXT("The map is back"), GitTest::ReadFile(Team.Alice, TEXT("Content/Map.umap")), FString(TEXT("map v1\n")));
 	TestTrue(TEXT("The map lock was released"), ServerLocks().Find(TEXT("Content/Map.umap")) == nullptr);
 	return true;
 }
@@ -480,7 +480,7 @@ bool FGitProviderSyncTest::RunTest(const FString&)
 	AlicePushes(TEXT("Content/Hero.uasset"), TEXT("hero v2\n"), TEXT("Hero v2"));
 	const TSharedRef<FSyncPreview, ESPMode::ThreadSafe> Preview = ISourceControlOperation::Create<FSyncPreview>();
 	TestEqual(TEXT("The preview succeeds: ") + Messages(Preview), Run(Provider, Preview, {Content}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The preview lists exactly the changed file, as the editor spells it"), Preview->GetAffectedFiles(), TArray<FString>({Hero}));
+	TestEqualSensitive(TEXT("The preview lists exactly the changed file, as the editor spells it"), GitTest::Joined(Preview->GetAffectedFiles()), Hero);
 	TestTrue(TEXT("There is something to sync"), Provider->HasChangesToSync().Get(false));
 	TestFalse(TEXT("The incoming file is not current"), GetState(Provider, Hero)->IsCurrent());
 
@@ -488,8 +488,8 @@ bool FGitProviderSyncTest::RunTest(const FString&)
 	GitTest::WriteFile(Bob, TEXT("notes.txt"), TEXT("bob's notes\n"));
 	const FSourceControlOperationRef FastForward = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Sync fast-forwards: ") + Messages(FastForward), Run(Provider, FastForward, {Content}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The new version arrived"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v2\n")));
-	TestEqual(TEXT("The unrelated local edit is untouched"), GitTest::ReadFile(Bob, TEXT("notes.txt")), FString(TEXT("bob's notes\n")));
+	TestEqualSensitive(TEXT("The new version arrived"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v2\n")));
+	TestEqualSensitive(TEXT("The unrelated local edit is untouched"), GitTest::ReadFile(Bob, TEXT("notes.txt")), FString(TEXT("bob's notes\n")));
 	TestFalse(TEXT("Nothing is left to sync"), Provider->HasChangesToSync().Get(true));
 	TestTrue(TEXT("The file is current again"), GetState(Provider, Hero)->IsCurrent());
 
@@ -500,10 +500,10 @@ bool FGitProviderSyncTest::RunTest(const FString&)
 	AlicePushes(TEXT("Content/Hero.uasset"), TEXT("hero v3\n"), TEXT("Hero v3 and code"));
 	const FSourceControlOperationRef Rebase = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Sync rebases local commits: ") + Messages(Rebase), Run(Provider, Rebase, {Content}), ECommandResult::Succeeded);
-	TestEqual(TEXT("The new version arrived"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v3\n")));
-	TestEqual(TEXT("Bob's commit sits on top of the upstream"), Head(Bob, TEXT("HEAD~1")), Head(Bob, TEXT("origin/main")));
-	TestEqual(TEXT("Bob's commit kept its content"), GitTest::ReadFile(Bob, TEXT("Content/Other.uasset")), FString(TEXT("other from bob\n")));
-	TestTrue(TEXT("A code change asks for a rebuild"), Messages(Rebase).Contains(TEXT("Rebuild")));
+	TestEqualSensitive(TEXT("The new version arrived"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v3\n")));
+	TestEqualSensitive(TEXT("Bob's commit sits on top of the upstream"), Head(Bob, TEXT("HEAD~1")), Head(Bob, TEXT("origin/main")));
+	TestEqualSensitive(TEXT("Bob's commit kept its content"), GitTest::ReadFile(Bob, TEXT("Content/Other.uasset")), FString(TEXT("other from bob\n")));
+	TestTrue(TEXT("A code change asks for a rebuild"), Messages(Rebase).Contains(TEXT("Rebuild"), ESearchCase::CaseSensitive));
 
 	// Local edits to an incoming file stop Sync before anything changes.
 	AlicePushes(TEXT("Content/Hero.uasset"), TEXT("hero v4\n"), TEXT("Hero v4"));
@@ -511,9 +511,9 @@ bool FGitProviderSyncTest::RunTest(const FString&)
 	const FString HeadBefore = Head(Bob);
 	const FSourceControlOperationRef Overlap = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Sync refuses to overwrite local edits"), Run(Provider, Overlap, {Content}), ECommandResult::Failed);
-	TestTrue(TEXT("The refusal explains itself: ") + Messages(Overlap), Messages(Overlap).Contains(TEXT("Nothing was changed")));
-	TestEqual(TEXT("The local edit is untouched"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")), FString(TEXT("bob's hero\n")));
-	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	TestTrue(TEXT("The refusal explains itself: ") + Messages(Overlap), Messages(Overlap).Contains(TEXT("Nothing was changed"), ESearchCase::CaseSensitive));
+	TestEqualSensitive(TEXT("The local edit is untouched"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")), FString(TEXT("bob's hero\n")));
+	TestEqualSensitive(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
 
 	// Syncing single files only works when nothing else changed on the server.
 	GitTest::Git(Bob, {TEXT("checkout"), TEXT("--"), TEXT("Content/Hero.uasset")});
@@ -529,8 +529,8 @@ bool FGitProviderSyncTest::RunTest(const FString&)
 	const FString HeadBeforeConflict = Head(Bob);
 	const FSourceControlOperationRef Conflict = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Sync refuses a conflicting rebase"), Run(Provider, Conflict, {Content}), ECommandResult::Failed);
-	TestTrue(TEXT("The refusal mentions the conflict: ") + Messages(Conflict), Messages(Conflict).Contains(TEXT("conflict")));
-	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBeforeConflict);
+	TestTrue(TEXT("The refusal mentions the conflict: ") + Messages(Conflict), Messages(Conflict).Contains(TEXT("conflict"), ESearchCase::CaseSensitive));
+	TestEqualSensitive(TEXT("HEAD did not move"), Head(Bob), HeadBeforeConflict);
 	TestFalse(TEXT("No rebase was left behind"), IFileManager::Get().DirectoryExists(*(Bob / TEXT(".git/rebase-merge"))));
 	return true;
 }
@@ -571,9 +571,9 @@ bool FGitProviderPullStashTest::RunTest(const FString&)
 	GitTest::Git(Bob, {TEXT("add"), IniFile});
 	const FSourceControlOperationRef Combine = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Pull combines a local edit with the server's: ") + Messages(Combine), Run(Provider, Combine, {Everything}), ECommandResult::Succeeded);
-	TestEqual(TEXT("Both edits are in the file"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Hard")));
-	TestEqual(TEXT("Alice's commit arrived"), Head(Bob), Head(Origin, TEXT("main")));
-	TestEqual(TEXT("Bob's edit is still staged, not committed"), GitTest::Output(GitTest::Git(Bob, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")})), IniFile);
+	TestEqualSensitive(TEXT("Both edits are in the file"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Hard")));
+	TestEqualSensitive(TEXT("Alice's commit arrived"), Head(Bob), Head(Origin, TEXT("main")));
+	TestEqualSensitive(TEXT("Bob's edit is still staged, not committed"), GitTest::Output(GitTest::Git(Bob, {TEXT("diff"), TEXT("--cached"), TEXT("--name-only")})), IniFile);
 	TestTrue(TEXT("No stash is left behind"), GitTest::Output(GitTest::Git(Bob, {TEXT("stash"), TEXT("list")})).IsEmpty());
 
 	// Without Stash and reapply, a local edit to an incoming file stops the pull.
@@ -585,15 +585,15 @@ bool FGitProviderPullStashTest::RunTest(const FString&)
 	const FSourceControlOperationRef Refused = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Pull without stashing refuses"), Run(Provider, Refused, {Everything}), ECommandResult::Failed);
 	Provider->SetPullOptions({});
-	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
-	TestEqual(TEXT("The local edit is untouched"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Hard")));
+	TestEqualSensitive(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	TestEqualSensitive(TEXT("The local edit is untouched"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Hard")));
 
 	// Edits to the same line cannot be combined: nothing changes.
 	GitTest::WriteFile(Bob, IniFile, Ini(TEXT("Bob's Demo"), TEXT("Bob's")));
 	const FSourceControlOperationRef Conflict = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Pull refuses edits it cannot combine"), Run(Provider, Conflict, {Everything}), ECommandResult::Failed);
-	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
-	TestEqual(TEXT("The conflicting edit is untouched"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Bob's")));
+	TestEqualSensitive(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	TestEqualSensitive(TEXT("The conflicting edit is untouched"), GitTest::ReadFile(Bob, IniFile), Ini(TEXT("Bob's Demo"), TEXT("Bob's")));
 
 	// A rebase needs a clean working tree: unrelated edits are set aside, and the editor is told to reload them.
 	GitTest::Git(Bob, {TEXT("reset"), TEXT("-q"), TEXT("--hard")});
@@ -602,19 +602,19 @@ bool FGitProviderPullStashTest::RunTest(const FString&)
 	GitTest::WriteFile(Bob, TEXT("Docs/Readme.txt"), TEXT("bob's readme\n"));
 	const TSharedRef<FSyncPreview, ESPMode::ThreadSafe> Preview = ISourceControlOperation::Create<FSyncPreview>();
 	TestEqual(TEXT("The preview succeeds"), Run(Provider, Preview, {Everything}), ECommandResult::Succeeded);
-	TestTrue(TEXT("The preview lists the incoming file"), Preview->GetAffectedFiles().Contains(Bob / IniFile));
-	TestTrue(TEXT("And the file set aside during the rebase"), Preview->GetAffectedFiles().Contains(Bob / TEXT("Docs/Readme.txt")));
+	TestTrue(TEXT("The preview lists the incoming file"), GitTest::HasExactly(Preview->GetAffectedFiles(), Bob / IniFile));
+	TestTrue(TEXT("And the file set aside during the rebase"), GitTest::HasExactly(Preview->GetAffectedFiles(), Bob / TEXT("Docs/Readme.txt")));
 	const FSourceControlOperationRef Rebase = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Pull rebases with local edits in place: ") + Messages(Rebase), Run(Provider, Rebase, {Everything}), ECommandResult::Succeeded);
-	TestEqual(TEXT("Bob's commit sits on Alice's"), Head(Bob, TEXT("HEAD~1")), Head(Origin, TEXT("main")));
-	TestEqual(TEXT("The edit came back"), GitTest::ReadFile(Bob, TEXT("Docs/Readme.txt")), FString(TEXT("bob's readme\n")));
+	TestEqualSensitive(TEXT("Bob's commit sits on Alice's"), Head(Bob, TEXT("HEAD~1")), Head(Origin, TEXT("main")));
+	TestEqualSensitive(TEXT("The edit came back"), GitTest::ReadFile(Bob, TEXT("Docs/Readme.txt")), FString(TEXT("bob's readme\n")));
 	TestTrue(TEXT("No stash is left behind"), GitTest::Output(GitTest::Git(Bob, {TEXT("stash"), TEXT("list")})).IsEmpty());
 
 	// A new local file where the server adds one of the same name stops the pull.
 	AlicePushes(TEXT("Docs/New.txt"), TEXT("alice's\n"), TEXT("New doc"));
 	GitTest::WriteFile(Bob, TEXT("Docs/New.txt"), TEXT("bob's\n"));
 	TestEqual(TEXT("A new file in the way stops the pull"), Run(Provider, ISourceControlOperation::Create<FSync>(), {Everything}), ECommandResult::Failed);
-	TestEqual(TEXT("Bob's new file is untouched"), GitTest::ReadFile(Bob, TEXT("Docs/New.txt")), FString(TEXT("bob's\n")));
+	TestEqualSensitive(TEXT("Bob's new file is untouched"), GitTest::ReadFile(Bob, TEXT("Docs/New.txt")), FString(TEXT("bob's\n")));
 	return true;
 }
 
@@ -653,11 +653,11 @@ bool FGitProviderPullMergeTest::RunTest(const FString&)
 	Provider->SetPullOptions(Merge);
 	const FSourceControlOperationRef Merged = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Pull merges: ") + Messages(Merged), Run(Provider, Merged, {Everything}), ECommandResult::Succeeded);
-	TestTrue(TEXT("The result says it merged: ") + Messages(Merged), Messages(Merged).Contains(TEXT("Merged 1 commit from origin/main")));
+	TestTrue(TEXT("The result says it merged: ") + Messages(Merged), Messages(Merged).Contains(TEXT("Merged 1 commit from origin/main"), ESearchCase::CaseSensitive));
 	TArray<FString> Parents;
 	GitTest::Output(GitTest::Git(Bob, {TEXT("rev-list"), TEXT("--parents"), TEXT("-n"), TEXT("1"), TEXT("HEAD")})).ParseIntoArrayWS(Parents);
 	TestEqual(TEXT("HEAD is a merge commit"), Parents.Num(), 3);
-	TestTrue(TEXT("Both changes are there"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")) == TEXT("hero v2\n") && GitTest::ReadFile(Bob, TEXT("Source/Game.cpp")) == TEXT("v2 from bob\n"));
+	TestTrue(TEXT("Both changes are there"), GitTest::ReadFile(Bob, TEXT("Content/Hero.uasset")).Equals(TEXT("hero v2\n"), ESearchCase::CaseSensitive) && GitTest::ReadFile(Bob, TEXT("Source/Game.cpp")).Equals(TEXT("v2 from bob\n"), ESearchCase::CaseSensitive));
 
 	// Pulling another branch: Alice's feature comes into Bob's main.
 	GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature")});
@@ -672,7 +672,7 @@ bool FGitProviderPullMergeTest::RunTest(const FString&)
 	const FSourceControlOperationRef FromFeature = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("Pull brings in another branch: ") + Messages(FromFeature), Run(Provider, FromFeature, {Everything}), ECommandResult::Succeeded);
 	TestTrue(TEXT("The feature's file arrived"), GitTest::FileExists(Bob, TEXT("Docs/Feature.txt")));
-	TestTrue(TEXT("The result names the branch: ") + Messages(FromFeature), Messages(FromFeature).Contains(TEXT("origin/feature")));
+	TestTrue(TEXT("The result names the branch: ") + Messages(FromFeature), Messages(FromFeature).Contains(TEXT("origin/feature"), ESearchCase::CaseSensitive));
 
 	// A rebase never rewrites commits the server already has: Bob published his to a branch of his own.
 	GitTest::Git(Bob, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("HEAD:refs/heads/bob")});
@@ -683,7 +683,7 @@ bool FGitProviderPullMergeTest::RunTest(const FString&)
 	const FSourceControlOperationRef Rewrite = ISourceControlOperation::Create<FSync>();
 	TestEqual(TEXT("A rebase that rewrites published commits is refused"), Run(Provider, Rewrite, {Everything}), ECommandResult::Failed);
 	Provider->SetPullOptions({});
-	TestEqual(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	TestEqualSensitive(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
 	return true;
 }
 
@@ -713,16 +713,16 @@ bool FGitProviderPublishTest::RunTest(const FString&)
 		TestEqual(TEXT("No cancels the check in"), Run(Provider, CheckIn, {Game}), ECommandResult::Cancelled);
 		TestEqual(TEXT("Check in asked once"), No.Questions.Num(), 1);
 	}
-	TestEqual(TEXT("Nothing was committed"), Head(Repo), HeadBefore);
+	TestEqualSensitive(TEXT("Nothing was committed"), Head(Repo), HeadBefore);
 	{
 		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
 		const TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = ISourceControlOperation::Create<FCheckIn>();
 		CheckIn->SetDescription(FText::FromString(TEXT("Game v2")));
 		TestEqual(TEXT("Yes checks in: ") + Messages(CheckIn), Run(Provider, CheckIn, {Game}), ECommandResult::Succeeded);
-		TestTrue(TEXT("It was pushed to a branch of its own: ") + CheckIn->GetSuccessMessage().ToString(), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("pushed to origin/feature")));
+		TestTrue(TEXT("It was pushed to a branch of its own: ") + CheckIn->GetSuccessMessage().ToString(), CheckIn->GetSuccessMessage().ToString().Contains(TEXT("pushed to origin/feature"), ESearchCase::CaseSensitive));
 	}
-	TestEqual(TEXT("origin/feature has the commit"), Head(Origin, TEXT("feature")), Head(Repo));
-	TestEqual(TEXT("main on the server did not move"), Head(Origin, TEXT("main")), MainBefore);
+	TestEqualSensitive(TEXT("origin/feature has the commit"), Head(Origin, TEXT("feature")), Head(Repo));
+	TestEqualSensitive(TEXT("main on the server did not move"), Head(Origin, TEXT("main")), MainBefore);
 	return true;
 }
 
@@ -751,14 +751,14 @@ bool FGitProviderHistoryTest::RunTest(const FString&)
 	}
 	const TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> Newest = State->GetHistoryItem(0);
 	const TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> Oldest = State->GetHistoryItem(1);
-	TestEqual(TEXT("Newest first"), Newest->GetDescription(), FString(TEXT("Hero v2")));
+	TestEqualSensitive(TEXT("Newest first"), Newest->GetDescription(), FString(TEXT("Hero v2")));
 	TestEqual(TEXT("Revision numbers count up"), Oldest->GetRevisionNumber(), 1);
-	TestEqual(TEXT("The author is recorded"), Oldest->GetUserName(), FString(TEXT("Test User")));
+	TestEqualSensitive(TEXT("The author is recorded"), Oldest->GetUserName(), FString(TEXT("Test User")));
 	TestTrue(TEXT("Revisions are found by number"), State->FindHistoryRevision(1) == Oldest);
 	FString Exported;
 	TestTrue(TEXT("An old revision can be exported"), Oldest->Get(Exported));
-	TestEqual(TEXT("The export keeps the extension"), FPaths::GetExtension(Exported), FString(TEXT("uasset")));
-	TestEqual(TEXT("The export holds the real bytes, not the LFS pointer"), GitTest::ReadFile(FString(), Exported), FString(TEXT("hero v1\n")));
+	TestEqualSensitive(TEXT("The export keeps the extension"), FPaths::GetExtension(Exported), FString(TEXT("uasset")));
+	TestEqualSensitive(TEXT("The export holds the real bytes, not the LFS pointer"), GitTest::ReadFile(FString(), Exported), FString(TEXT("hero v1\n")));
 	IFileManager::Get().Delete(*Exported);
 	return true;
 }

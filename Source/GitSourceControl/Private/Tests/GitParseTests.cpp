@@ -39,18 +39,24 @@ bool FGitParseStatusTest::RunTest(const FString&)
 		AddError(Error);
 		return false;
 	}
-	TestEqual(TEXT("Branch"), Status.Branch, FString(TEXT("feature/test")));
-	TestEqual(TEXT("Upstream"), Status.Upstream, FString(TEXT("origin/feature/test")));
+	TestEqualSensitive(TEXT("Branch"), Status.Branch, FString(TEXT("feature/test")));
+	TestEqualSensitive(TEXT("Upstream"), Status.Upstream, FString(TEXT("origin/feature/test")));
 	TestTrue(TEXT("Ahead and behind"), Status.Ahead == 2 && Status.Behind == 3);
 	TestEqual(TEXT("Five entries"), Status.Entries.Num(), 5);
-	const GitCore::FStatusEntry* Both = Status.Find(TEXT("Content/my asset.uasset"));
+	// Find matches paths ignoring case, as Unreal's maps do; the parser must keep them exactly as git wrote them.
+	auto FindExactly = [&Status](const TCHAR* Path)
+	{
+		const GitCore::FStatusEntry* Entry = Status.Find(Path);
+		return Entry && Entry->Path.Equals(Path, ESearchCase::CaseSensitive) ? Entry : nullptr;
+	};
+	const GitCore::FStatusEntry* Both = FindExactly(TEXT("Content/my asset.uasset"));
 	TestTrue(TEXT("A file can be staged and have later edits"), Both && Both->HasStaged() && Both->HasUnstaged());
-	const GitCore::FStatusEntry* Renamed = Status.Find(TEXT("renamed.txt"));
-	TestTrue(TEXT("Rename source kept"), Renamed && Renamed->OriginalPath == TEXT("original with space.txt"));
-	const GitCore::FStatusEntry* Untracked = Status.Find(TEXT("untracked\nfile.txt"));
+	const GitCore::FStatusEntry* Renamed = FindExactly(TEXT("renamed.txt"));
+	TestTrue(TEXT("Rename source kept"), Renamed && Renamed->OriginalPath.Equals(TEXT("original with space.txt"), ESearchCase::CaseSensitive));
+	const GitCore::FStatusEntry* Untracked = FindExactly(TEXT("untracked\nfile.txt"));
 	TestTrue(TEXT("Untracked paths may contain newlines"), Untracked && Untracked->bUntracked && !Untracked->HasStaged());
 	TestTrue(TEXT("Conflicts are reported"), Status.HasConflicts());
-	const GitCore::FStatusEntry* Submodule = Status.Find(TEXT("Plugins/Sub"));
+	const GitCore::FStatusEntry* Submodule = FindExactly(TEXT("Plugins/Sub"));
 	TestTrue(TEXT("Submodules are flagged"), Submodule && Submodule->bSubmodule);
 
 	GitCore::FStatusSnapshot Unborn;
@@ -105,7 +111,7 @@ bool FGitParseHistoryTest::RunTest(const FString&)
 	{
 		return false;
 	}
-	TestTrue(TEXT("Fields are literal"), Commits[0].Author == TEXT("Artist 水") && Commits[0].Parents.Num() == 1);
+	TestTrue(TEXT("Fields are literal"), Commits[0].Author.Equals(TEXT("Artist 水"), ESearchCase::CaseSensitive) && Commits[0].Parents.Num() == 1);
 	Bytes.Pop();
 	TestFalse(TEXT("Truncated history is rejected"), GitCore::ParseLog(Bytes, Commits, Error));
 	TestTrue(TEXT("No partial history leaks"), Commits.IsEmpty());
@@ -134,8 +140,8 @@ bool FGitParseHistoryTest::RunTest(const FString&)
 	TArray<GitCore::FFileRevision> Revisions;
 	if (TestTrue(TEXT("File history parses"), GitCore::ParseFileLog(FileLog, Revisions, Error)) && TestEqual(TEXT("Two revisions"), Revisions.Num(), 2))
 	{
-		TestTrue(TEXT("Renames use the new path"), Revisions[0].Action == TEXT('R') && Revisions[0].Path == TEXT("b b.txt"));
-		TestTrue(TEXT("Older revisions keep their own path"), Revisions[1].Action == TEXT('A') && Revisions[1].Path == TEXT("a.txt"));
+		TestTrue(TEXT("Renames use the new path"), Revisions[0].Action == TEXT('R') && Revisions[0].Path.Equals(TEXT("b b.txt"), ESearchCase::CaseSensitive));
+		TestTrue(TEXT("Older revisions keep their own path"), Revisions[1].Action == TEXT('A') && Revisions[1].Path.Equals(TEXT("a.txt"), ESearchCase::CaseSensitive));
 	}
 
 	TArray<uint8> Raw = NulRecords({TEXT(":000000 100644 ") + FString::ChrN(40, TEXT('0')) + TEXT(" ") + Hash + TEXT(" A"), TEXT("dir/new file.txt"),

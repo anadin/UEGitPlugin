@@ -73,7 +73,7 @@ bool FGitSessionSnapshotTest::RunTest(const FString&)
 	GitTest::WriteFile(Repo, TEXT("Content/Added.uasset"), TEXT("added\n"));
 	OnMutationLane(*Session, [&]() { Session->RefreshStatus(nullptr, &Error); });
 	Session->SetMarkedForAdd({TEXT("Content/Added.uasset")}, true);
-	TestTrue(TEXT("Marked for add"), Session->GetSnapshot()->MarkedForAdd.Contains(TEXT("Content/Added.uasset")));
+	TestTrue(TEXT("Marked for add"), GitTest::HasExactly(Session->GetSnapshot()->MarkedForAdd, TEXT("Content/Added.uasset")));
 	const GitCore::FGitSessionPtr Reopened = OpenSession(*this, Repo);
 	TestTrue(TEXT("The same worktree reuses its session"), Reopened == Session);
 	GitTest::CommitAll(Repo, TEXT("commit everything"));
@@ -121,20 +121,20 @@ bool FGitSessionLockJournalTest::RunTest(const FString&)
 	ON_SCOPE_EXIT { Session->Close(); };
 	FString Error;
 	OnMutationLane(*Session, [&]() { Session->RefreshStatus(nullptr, &Error); });
-	TestEqual(TEXT("Locks use the upstream remote"), Session->GetLockRemote(), FString(TEXT("origin")));
+	TestEqualSensitive(TEXT("Locks use the upstream remote"), Session->GetLockRemote(), FString(TEXT("origin")));
 	TestTrue(TEXT("Locks verify"), Session->RefreshLocks(GitCore::ECallKind::UserNetwork, &Error));
 
 	GitCore::FLockInfo Lock;
 	TestTrue(TEXT("Lock the asset"), Session->GetRepository().Lock(TEXT("origin"), TEXT("Content/Hero.uasset"), Lock).bOk);
 	Session->RecordLockTaken(Lock);
-	TestTrue(TEXT("The lock is recorded as taken here"), Session->GetSnapshot()->LocksTakenHere.Contains(Lock.Id));
+	TestTrue(TEXT("The lock is recorded as taken here"), GitTest::HasExactly(Session->GetSnapshot()->LocksTakenHere, Lock.Id));
 
 	// Branch switches and configuration edits must not strand the lock.
 	GitTest::Git(Repo, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature")});
 	GitTest::Git(Repo, {TEXT("config"), TEXT("user.name"), TEXT("Renamed User")});
 	OnMutationLane(*Session, [&]() { Session->RefreshStatus(nullptr, &Error); });
 	TestTrue(TEXT("Locks verify after switching branch"), Session->RefreshLocks(GitCore::ECallKind::UserNetwork, &Error));
-	TestTrue(TEXT("The lock is still known as taken here"), Session->GetSnapshot()->LocksTakenHere.Contains(Lock.Id));
+	TestTrue(TEXT("The lock is still known as taken here"), GitTest::HasExactly(Session->GetSnapshot()->LocksTakenHere, Lock.Id));
 
 	// Another worktree of the same clone sees the lock as ours but taken elsewhere.
 	const FString Other = Fixture.Root / TEXT("other-worktree");
@@ -154,7 +154,7 @@ bool FGitSessionLockJournalTest::RunTest(const FString&)
 		// Claiming moves the record to the other worktree: the first one now sees the lock as taken elsewhere.
 		TestTrue(TEXT("Claim the lock in the other worktree"), Seen && OtherSession->RecordLockTaken(*Seen, &Error));
 		TestTrue(TEXT("The other worktree verifies again"), OtherSession->RefreshLocks(GitCore::ECallKind::UserNetwork, &Error));
-		TestTrue(TEXT("The claim survives a lock check"), OtherSession->GetSnapshot()->LocksTakenHere.Contains(Lock.Id));
+		TestTrue(TEXT("The claim survives a lock check"), GitTest::HasExactly(OtherSession->GetSnapshot()->LocksTakenHere, Lock.Id));
 		TestTrue(TEXT("The first worktree verifies"), Session->RefreshLocks(GitCore::ECallKind::UserNetwork, &Error));
 		TestFalse(TEXT("The first worktree no longer holds it here"), Session->GetSnapshot()->LocksTakenHere.Contains(Lock.Id));
 	}

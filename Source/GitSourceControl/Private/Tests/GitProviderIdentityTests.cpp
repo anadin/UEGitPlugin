@@ -11,15 +11,15 @@ bool FGitWorkspaceProviderIdentityTest::RunTest(const FString&)
 {
 	using namespace GitWorkspaceProvider;
 	const FGitSourceControlProvider& Provider = FGitSourceControlModule::Get().GetProvider();
-	TestEqual(TEXT("Registered provider uses the public name"), Provider.GetName().ToString(), FString(TEXT("Git Workspace")));
+	TestEqualSensitive(TEXT("Registered provider uses the public name"), Provider.GetName().ToString(), FString(TEXT("Git Workspace")));
 	const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("GitSourceControl"));
 	if (!TestTrue(TEXT("Technical plugin identifier remains compatible"), Plugin.IsValid()))
 	{
 		return false;
 	}
-	TestEqual(TEXT("Plugin browser uses the public name"), Plugin->GetDescriptor().FriendlyName, FString(TEXT("Git Workspace")));
+	TestEqualSensitive(TEXT("Plugin browser uses the public name"), Plugin->GetDescriptor().FriendlyName, FString(TEXT("Git Workspace")));
 	TestTrue(TEXT("Plugin browser preserves upstream credit"),
-		Plugin->GetDescriptor().CreatedBy.Contains(TEXT("Project Borealis")) && Plugin->GetDescriptor().CreatedBy.Contains(TEXT("SRombauts")));
+		Plugin->GetDescriptor().CreatedBy.Contains(TEXT("Project Borealis"), ESearchCase::CaseSensitive) && Plugin->GetDescriptor().CreatedBy.Contains(TEXT("SRombauts"), ESearchCase::CaseSensitive));
 
 	TestTrue(TEXT("Legacy saved selection migrates"), ShouldMigrateLegacySelection(TEXT("Git LFS 2"), TEXT("-unattended")));
 	TestFalse(TEXT("Disconnected projects stay disconnected"), ShouldMigrateLegacySelection(TEXT("None"), TEXT("")));

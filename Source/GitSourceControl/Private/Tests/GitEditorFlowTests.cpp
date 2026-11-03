@@ -98,7 +98,7 @@ bool FGitEditorNativeFlowsTest::RunTest(const FString&)
 	FSourceControlStatePtr State = Provider.GetState(File, EStateCacheUsage::ForceUpdate);
 	TestTrue(TEXT("The new asset reads as added"), State.IsValid() && State->IsAdded());
 	TestTrue(TEXT("Check in the new asset"), USourceControlHelpers::CheckInFiles({File}, TEXT("Add the hero curve"), true));
-	TestEqual(TEXT("The commit reached the server"), RemoteSubject(), FString(TEXT("Add the hero curve")));
+	TestEqualSensitive(TEXT("The commit reached the server"), RemoteSubject(), FString(TEXT("Add the hero curve")));
 
 	// Edit: Unreal's Check Out takes the lock, Check in commits, pushes and releases it.
 	TestTrue(TEXT("Lockable assets use Check Out"), Provider.UsesCheckout());
@@ -107,10 +107,10 @@ bool FGitEditorNativeFlowsTest::RunTest(const FString&)
 	SetHeroValue(2.0f, false);
 	TestEqual(TEXT("Check Out succeeds"), FEditorFileUtils::CheckoutPackages(TArray<UPackage*>{FindHero()->GetPackage()}), ECommandResult::Succeeded);
 	TestTrue(TEXT("Checked out means locked"), Provider.GetState(File, EStateCacheUsage::Use)->IsCheckedOut());
-	TestTrue(TEXT("Teammates see the lock"), ServerLocks(Bob).Contains(TEXT("Content/E2E/Hero.uasset")));
+	TestTrue(TEXT("Teammates see the lock"), ServerLocks(Bob).Contains(TEXT("Content/E2E/Hero.uasset"), ESearchCase::CaseSensitive));
 	TestTrue(TEXT("The edit saves"), SetHeroValue(2.0f, true));
 	TestTrue(TEXT("Check in the edit"), USourceControlHelpers::CheckInFiles({File}, TEXT("Hero v2"), true));
-	TestEqual(TEXT("The edit reached the server"), RemoteSubject(), FString(TEXT("Hero v2")));
+	TestEqualSensitive(TEXT("The edit reached the server"), RemoteSubject(), FString(TEXT("Hero v2")));
 	TestFalse(TEXT("Check in released the lock"), ServerLocks(Bob).Contains(TEXT("Content/E2E/Hero.uasset")));
 
 	// Git LFS keeps lockable files read-only unless you hold their lock.
@@ -124,7 +124,7 @@ bool FGitEditorNativeFlowsTest::RunTest(const FString&)
 	TestEqual(TEXT("Bob's copy is replaced"), IFileManager::Get().Copy(*(Bob / TEXT("Content/E2E/Hero.uasset")), *File, true, true), static_cast<uint32>(COPY_OK));
 	GitTest::CommitAll(Bob, TEXT("Hero v3 from Bob"));
 	GitTest::Git(Bob, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
-	TestEqual(TEXT("Bob's version reached the server"), RemoteSubject(), FString(TEXT("Hero v3 from Bob")));
+	TestEqualSensitive(TEXT("Bob's version reached the server"), RemoteSubject(), FString(TEXT("Hero v3 from Bob")));
 
 	// Revert throws the local copy away and reloads the committed version.
 	TestTrue(TEXT("Revert and reload"), USourceControlHelpers::RevertAndReloadPackages({File}));
@@ -133,7 +133,7 @@ bool FGitEditorNativeFlowsTest::RunTest(const FString&)
 	// Sync: fetch, preview, integrate and reload only what changed.
 	TestTrue(TEXT("Sync succeeds"), AssetViewUtils::SyncRevisionFromSourceControl(TEXT("")));
 	TestEqual(TEXT("The loaded asset shows the teammate's version"), HeroValue(), 3.0f);
-	TestEqual(TEXT("The project is at the server's commit"),
+	TestEqualSensitive(TEXT("The project is at the server's commit"),
 		GitTest::Output(GitTest::Git(Project, {TEXT("rev-parse"), TEXT("HEAD")})), GitTest::Output(GitTest::Git(Remote, {TEXT("rev-parse"), TEXT("main")})));
 
 	// Revert of a checked-out, saved edit restores the file and gives the lock back.

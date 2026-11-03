@@ -218,11 +218,11 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 		return false;
 	}
 	const TArray<SGitChangesView::FItemPtr> Shown = ChangesTree->GetSelectedItems();
-	TestTrue(TEXT("Only the file shown last is selected"), Shown.Num() == 1 && Shown[0]->Path == TEXT("Content/Hero.uasset"));
+	TestTrue(TEXT("Only the file shown last is selected"), Shown.Num() == 1 && Shown[0]->Path.Equals(TEXT("Content/Hero.uasset"), ESearchCase::CaseSensitive));
 
 	Panel.Model->Stage({TEXT("a.txt")});
 	TestTrue(TEXT("Staging shows up"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
-	TestEqual(TEXT("Only a.txt is staged"), PanelStaged(Repo), FString(TEXT("a.txt")));
+	TestEqualSensitive(TEXT("Only a.txt is staged"), PanelStaged(Repo), FString(TEXT("a.txt")));
 
 	// The lists share one selection: picking in Staged clears Changes, so Space and the menus act on the new pick.
 	Widget->ShowPaths({TEXT("Content/Hero.uasset")});
@@ -237,13 +237,13 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	Panel.Model->Commit(TEXT("Panel commit"), false, [&bCommitted](bool bDone) { bCommitted = bDone; });
 	TestTrue(TEXT("The commit finishes"), Panel.WaitIdle());
 	TestTrue(TEXT("The commit is reported"), bCommitted);
-	TestEqual(TEXT("The staged file was committed"), PanelSubject(Repo), FString(TEXT("Panel commit")));
+	TestEqualSensitive(TEXT("The staged file was committed"), PanelSubject(Repo), FString(TEXT("Panel commit")));
 	TestTrue(TEXT("The unstaged asset stays modified"), Panel.Provider.Snapshot()->Status.Find(TEXT("Content/Hero.uasset")) != nullptr);
 	TestFalse(TEXT("No failure is shown"), Panel.Model->GetLastFailure().IsSet());
 
 	Panel.Model->Push();
 	TestTrue(TEXT("The push finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("The server has the commit"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
+	TestEqualSensitive(TEXT("The server has the commit"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
 
 	// The commit bar has one button: it commits, and pushes as well only while Option (Alt) is held over it.
 	const TSharedPtr<SMultiLineEditableTextBox> MessageBox = StaticCastSharedPtr<SMultiLineEditableTextBox>(FindTagged(Widget, TEXT("GitPanel.Changes.Message")));
@@ -257,13 +257,13 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	MessageBox->SetText(FText::FromString(TEXT("Hero")));
 	{
 		const FScopedStandInPlatform OptionHeld(true);
-		TestEqual(TEXT("Option elsewhere leaves Commit alone"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1")));
+		TestEqualSensitive(TEXT("Option elsewhere leaves Commit alone"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1")));
 	}
 	CommitButton->OnMouseEnter(FGeometry(), FPointerEvent());
-	TestEqual(TEXT("Commit counts the staged files"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1")));
+	TestEqualSensitive(TEXT("Commit counts the staged files"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1")));
 	CommitButton->SimulateClick();
 	TestTrue(TEXT("The commit finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("Commit commits"), PanelSubject(Repo), FString(TEXT("Hero")));
+	TestEqualSensitive(TEXT("Commit commits"), PanelSubject(Repo), FString(TEXT("Hero")));
 	TestNotEqual(TEXT("Commit pushes nothing"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
 
 	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a again\n"));
@@ -272,12 +272,12 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	MessageBox->SetText(FText::FromString(TEXT("Again")));
 	{
 		const FScopedStandInPlatform OptionHeld(true);
-		TestEqual(TEXT("Option over Commit makes it Commit and push"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1 and push")));
+		TestEqualSensitive(TEXT("Option over Commit makes it Commit and push"), ButtonLabel(CommitButton.ToSharedRef()), FString(TEXT("Commit 1 and push")));
 		CommitButton->SimulateClick();
 	}
 	TestTrue(TEXT("Commit and push finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("Commit and push commits"), PanelSubject(Repo), FString(TEXT("Again")));
-	TestEqual(TEXT("Commit and push reaches the server"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
+	TestEqualSensitive(TEXT("Commit and push commits"), PanelSubject(Repo), FString(TEXT("Again")));
+	TestEqualSensitive(TEXT("Commit and push reaches the server"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
 	CommitButton->OnMouseLeave(FPointerEvent());
 
 	// The commit must contain what the user reviewed: staging behind the panel's back is refused.
@@ -289,7 +289,7 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	const FString Before = PanelHead(Repo);
 	Panel.Model->Commit(TEXT("Reviewed"), false);
 	Panel.WaitIdle();
-	TestEqual(TEXT("Nothing was committed"), PanelHead(Repo), Before);
+	TestEqualSensitive(TEXT("Nothing was committed"), PanelHead(Repo), Before);
 	TestTrue(TEXT("The refusal is shown"), Panel.Model->GetLastFailure().IsSet());
 	return true;
 }
@@ -321,9 +321,9 @@ bool FGitPanelPublishTest::RunTest(const FString&)
 		Panel.WaitIdle();
 		TestEqual(TEXT("Push asks once"), No.Questions.Num(), 1);
 		TestTrue(TEXT("The question says where the commits go"),
-			No.Questions.Num() == 1 && No.Questions[0].ToString().Contains(TEXT("origin/main")) && No.Questions[0].ToString().Contains(TEXT("origin/feature")));
+			No.Questions.Num() == 1 && No.Questions[0].ToString().Contains(TEXT("origin/main"), ESearchCase::CaseSensitive) && No.Questions[0].ToString().Contains(TEXT("origin/feature"), ESearchCase::CaseSensitive));
 	}
-	TestEqual(TEXT("No leaves main on the server alone"), PanelHead(Origin, TEXT("main")), MainBefore);
+	TestEqualSensitive(TEXT("No leaves main on the server alone"), PanelHead(Origin, TEXT("main")), MainBefore);
 	TestFalse(TEXT("No publishes nothing"), OnServer(TEXT("feature")));
 
 	// Commit and push asks before committing.
@@ -339,16 +339,16 @@ bool FGitPanelPublishTest::RunTest(const FString&)
 		TestEqual(TEXT("Commit and push asks"), No.Questions.Num(), 1);
 		TestFalse(TEXT("No commits nothing"), bCommitted);
 	}
-	TestEqual(TEXT("HEAD did not move"), PanelHead(Repo), HeadBefore);
+	TestEqualSensitive(TEXT("HEAD did not move"), PanelHead(Repo), HeadBefore);
 	{
 		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
 		Panel.Model->Commit(TEXT("Publish it"), true);
 		Panel.WaitIdle();
 		TestEqual(TEXT("It asks again"), Yes.Questions.Num(), 1);
 	}
-	TestEqual(TEXT("Yes publishes the branch under its own name"), PanelHead(Origin, TEXT("feature")), PanelHead(Repo));
-	TestEqual(TEXT("main on the server still did not move"), PanelHead(Origin, TEXT("main")), MainBefore);
-	TestEqual(TEXT("The branch follows origin/feature now"), Panel.Provider.Snapshot()->Status.Upstream, FString(TEXT("origin/feature")));
+	TestEqualSensitive(TEXT("Yes publishes the branch under its own name"), PanelHead(Origin, TEXT("feature")), PanelHead(Repo));
+	TestEqualSensitive(TEXT("main on the server still did not move"), PanelHead(Origin, TEXT("main")), MainBefore);
+	TestEqualSensitive(TEXT("The branch follows origin/feature now"), Panel.Provider.Snapshot()->Status.Upstream, FString(TEXT("origin/feature")));
 
 	// A branch that is not on the server: Publish is its own confirmation, other pushes ask.
 	GitTest::Git(Repo, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("spike")});
@@ -389,16 +389,16 @@ bool FGitPanelPullChoicesTest::RunTest(const FString&)
 
 	TMap<FString, TArray<FString>> Branches;
 	GitCore::FPullOptions Options = FGitWorkspaceModel::PullChoices(Snapshot, Branches);
-	TestTrue(TEXT("The upstream is picked"), Options.Remote == TEXT("origin") && Options.Branch == TEXT("feature"));
+	TestTrue(TEXT("The upstream is picked"), Options.Remote.Equals(TEXT("origin"), ESearchCase::CaseSensitive) && Options.Branch.Equals(TEXT("feature"), ESearchCase::CaseSensitive));
 	TestFalse(TEXT("The remembered choice is offered"), Options.bRebase);
-	TestEqual(TEXT("origin lists its branches"), Branches.FindRef(TEXT("origin")), TArray<FString>({TEXT("main"), TEXT("feature")}));
-	TestEqual(TEXT("The mirror lists its own"), Branches.FindRef(TEXT("origin/mirror")), TArray<FString>({TEXT("main")}));
+	TestEqualSensitive(TEXT("origin lists its branches"), GitTest::Joined(Branches.FindRef(TEXT("origin"))), GitTest::Joined({TEXT("main"), TEXT("feature")}));
+	TestEqualSensitive(TEXT("The mirror lists its own"), GitTest::Joined(Branches.FindRef(TEXT("origin/mirror"))), FString(TEXT("main")));
 
 	// Without an upstream: the branch's own name on origin when it is there, else main.
 	Snapshot.Status.Upstream.Reset();
 	Snapshot.Status.Branch = TEXT("spike");
 	Options = FGitWorkspaceModel::PullChoices(Snapshot, Branches);
-	TestTrue(TEXT("A new branch is offered origin's main"), Options.Remote == TEXT("origin") && Options.Branch == TEXT("main"));
+	TestTrue(TEXT("A new branch is offered origin's main"), Options.Remote.Equals(TEXT("origin"), ESearchCase::CaseSensitive) && Options.Branch.Equals(TEXT("main"), ESearchCase::CaseSensitive));
 	User->bPullRebase = bRebaseWas;
 	return true;
 }
@@ -421,9 +421,9 @@ bool FGitPanelStageKeyTest::RunTest(const FString&)
 		return false;
 	}
 	// Slate on macOS reports Command as Control, so this is Cmd+S there, and tooltips say so.
-	TestEqual(TEXT("Tooltips name the shortcut as this platform does"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::S).ToString(),
+	TestEqualSensitive(TEXT("Tooltips name the shortcut as this platform does"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::S).ToString(),
 		FString(PLATFORM_MAC ? TEXT("Cmd+S") : TEXT("Ctrl+S")));
-	TestEqual(TEXT("and Alt+click too"), GitWorkspaceText::AltClick().ToString(), FString(PLATFORM_MAC ? TEXT("Option+click") : TEXT("Alt+click")));
+	TestEqualSensitive(TEXT("and Alt+click too"), GitWorkspaceText::AltClick().ToString(), FString(PLATFORM_MAC ? TEXT("Option+click") : TEXT("Alt+click")));
 	auto PressS = [&View](bool bShift)
 	{
 		const FModifierKeysState Keys(bShift, false, true, false, false, false, false, false, false);
@@ -434,13 +434,13 @@ bool FGitPanelStageKeyTest::RunTest(const FString&)
 	TestFalse(TEXT("Ctrl+Shift+S stays the editor's Save All"), PressS(true));
 	TestTrue(TEXT("Ctrl+S is taken"), PressS(false));
 	TestTrue(TEXT("Ctrl+S stages the selected file"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
-	TestEqual(TEXT("Only a.txt is staged"), PanelStaged(Repo), FString(TEXT("a.txt")));
+	TestEqualSensitive(TEXT("Only a.txt is staged"), PanelStaged(Repo), FString(TEXT("a.txt")));
 
 	View->SelectPaths({TEXT("a.txt")});
 	TestEqual(TEXT("The staged file is selected"), StagedTree->GetSelectedItems().Num(), 1);
 	TestTrue(TEXT("Ctrl+S is taken again"), PressS(false));
 	TestTrue(TEXT("Ctrl+S unstages it"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 0; }));
-	TestEqual(TEXT("Nothing is staged"), PanelStaged(Repo), FString());
+	TestEqualSensitive(TEXT("Nothing is staged"), PanelStaged(Repo), FString());
 	return true;
 }
 
@@ -459,7 +459,7 @@ bool FGitPanelBranchesAndStashesTest::RunTest(const FString&)
 
 	Panel.Model->CreateBranch(TEXT("feature"));
 	TestTrue(TEXT("Creating a branch finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("The new branch is current"), Panel.Provider.Snapshot()->Status.Branch, FString(TEXT("feature")));
+	TestEqualSensitive(TEXT("The new branch is current"), Panel.Provider.Snapshot()->Status.Branch, FString(TEXT("feature")));
 	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("feature\n"));
 	GitTest::CommitAll(Repo, TEXT("Feature work"));
 
@@ -467,14 +467,14 @@ bool FGitPanelBranchesAndStashesTest::RunTest(const FString&)
 	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("uncommitted\n"));
 	Panel.Model->SwitchBranch(TEXT("main"));
 	Panel.WaitIdle();
-	TestEqual(TEXT("Still on feature"), GitTest::Output(GitTest::Git(Repo, {TEXT("branch"), TEXT("--show-current")})), FString(TEXT("feature")));
-	TestEqual(TEXT("The local edit is untouched"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("uncommitted\n")));
+	TestEqualSensitive(TEXT("Still on feature"), GitTest::Output(GitTest::Git(Repo, {TEXT("branch"), TEXT("--show-current")})), FString(TEXT("feature")));
+	TestEqualSensitive(TEXT("The local edit is untouched"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("uncommitted\n")));
 
 	GitTest::Git(Repo, {TEXT("checkout"), TEXT("--"), TEXT("a.txt")});
 	Panel.Model->SwitchBranch(TEXT("main"));
 	TestTrue(TEXT("Switching finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("Now on main"), GitTest::Output(GitTest::Git(Repo, {TEXT("branch"), TEXT("--show-current")})), FString(TEXT("main")));
-	TestEqual(TEXT("Files match main"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("base\n")));
+	TestEqualSensitive(TEXT("Now on main"), GitTest::Output(GitTest::Git(Repo, {TEXT("branch"), TEXT("--show-current")})), FString(TEXT("main")));
+	TestEqualSensitive(TEXT("Files match main"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("base\n")));
 
 	// Stash everything (new files too), then bring it back.
 	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("work in progress\n"));
@@ -482,13 +482,13 @@ bool FGitPanelBranchesAndStashesTest::RunTest(const FString&)
 	Panel.Refresh();
 	Panel.Model->StashChanges(TEXT("wip"), true);
 	TestTrue(TEXT("Stashing finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("The edit was put aside"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("base\n")));
+	TestEqualSensitive(TEXT("The edit was put aside"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("base\n")));
 	TestFalse(TEXT("The new file was put aside"), GitTest::FileExists(Repo, TEXT("new.txt")));
 	TestEqual(TEXT("One stash is listed"), Panel.Provider.Snapshot()->Stashes.Num(), 1);
 
 	Panel.Model->ApplyStash(TEXT("stash@{0}"), true);
 	TestTrue(TEXT("Restoring finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("The edit is back"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("work in progress\n")));
+	TestEqualSensitive(TEXT("The edit is back"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("work in progress\n")));
 	TestTrue(TEXT("The new file is back"), GitTest::FileExists(Repo, TEXT("new.txt")));
 	TestEqual(TEXT("The stash was removed"), Panel.Provider.Snapshot()->Stashes.Num(), 0);
 
@@ -497,7 +497,7 @@ bool FGitPanelBranchesAndStashesTest::RunTest(const FString&)
 	Panel.Model->DropStash(TEXT("stash@{0}"));
 	TestTrue(TEXT("Deleting finishes"), Panel.WaitIdle());
 	TestEqual(TEXT("No stash is left"), Panel.Provider.Snapshot()->Stashes.Num(), 0);
-	TestEqual(TEXT("The tracked edit is gone"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("base\n")));
+	TestEqualSensitive(TEXT("The tracked edit is gone"), GitTest::ReadFile(Repo, TEXT("a.txt")), FString(TEXT("base\n")));
 	TestTrue(TEXT("Untracked files were not stashed"), GitTest::FileExists(Repo, TEXT("new.txt")));
 	return true;
 }
@@ -569,7 +569,7 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 	Panel.Refresh();
 	Panel.Model->Discard({TEXT("readme.txt"), TEXT("scratch.txt")});
 	TestTrue(TEXT("Discarding finishes"), Panel.WaitIdle());
-	TestEqual(TEXT("The edit is gone"), GitTest::ReadFile(Team.Alice, TEXT("readme.txt")), FString(TEXT("text\n")));
+	TestEqualSensitive(TEXT("The edit is gone"), GitTest::ReadFile(Team.Alice, TEXT("readme.txt")), FString(TEXT("text\n")));
 	TestFalse(TEXT("The new file is deleted"), GitTest::FileExists(Team.Alice, TEXT("scratch.txt")));
 	return true;
 }
@@ -577,10 +577,10 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelFileTreeTest, "GitWorkspace.Panel.FileTree", PanelTestFlags)
 bool FGitPanelFileTreeTest::RunTest(const FString&)
 {
-	TestEqual(TEXT("A World Partition actor is listed under its level"), GitWorkspaceText::TreeFolder(TEXT("Content/__ExternalActors__/Maps/Main/A/7Q/0F2KD8XN3PZ4W1.uasset")),
+	TestEqualSensitive(TEXT("A World Partition actor is listed under its level"), GitWorkspaceText::TreeFolder(TEXT("Content/__ExternalActors__/Maps/Main/A/7Q/0F2KD8XN3PZ4W1.uasset")),
 		FString(TEXT("Content/__ExternalActors__/Maps/Main")));
-	TestEqual(TEXT("Other files are listed under their folder"), GitWorkspaceText::TreeFolder(TEXT("Content/Props/Barrel.uasset")), FString(TEXT("Content/Props")));
-	TestEqual(TEXT("Top-level files have no folder"), GitWorkspaceText::TreeFolder(TEXT("readme.txt")), FString());
+	TestEqualSensitive(TEXT("Other files are listed under their folder"), GitWorkspaceText::TreeFolder(TEXT("Content/Props/Barrel.uasset")), FString(TEXT("Content/Props")));
+	TestEqualSensitive(TEXT("Top-level files have no folder"), GitWorkspaceText::TreeFolder(TEXT("readme.txt")), FString());
 
 	const TArray<FString> Paths = {TEXT("Content/Props/Barrel.uasset"), TEXT("Content/Props/Crate.uasset"), TEXT("Content/Maps/Main.umap"),
 		TEXT("Content/__ExternalActors__/Maps/Main/A/7Q/0F2KD8XN3PZ4W1.uasset"), TEXT("Content/__ExternalActors__/Maps/Main/B/3X/1ABCDEF.uasset"),
@@ -597,19 +597,19 @@ bool FGitPanelFileTreeTest::RunTest(const FString&)
 	{
 		return false;
 	}
-	TestTrue(TEXT("Content comes first"), Roots[0]->bFolder && Roots[0]->Label == TEXT("Content") && Roots[0]->FileCount == 5);
-	TestTrue(TEXT("A chain of single folders is one row"), Roots[1]->bFolder && Roots[1]->Label == TEXT("Source/Demo/Private") && Roots[1]->Path == TEXT("Source/Demo/Private"));
-	TestTrue(TEXT("Files follow the folders"), !Roots[2]->bFolder && Roots[2]->Path == TEXT("readme.txt"));
+	TestTrue(TEXT("Content comes first"), Roots[0]->bFolder && Roots[0]->Label.Equals(TEXT("Content"), ESearchCase::CaseSensitive) && Roots[0]->FileCount == 5);
+	TestTrue(TEXT("A chain of single folders is one row"), Roots[1]->bFolder && Roots[1]->Label.Equals(TEXT("Source/Demo/Private"), ESearchCase::CaseSensitive) && Roots[1]->Path.Equals(TEXT("Source/Demo/Private"), ESearchCase::CaseSensitive));
+	TestTrue(TEXT("Files follow the folders"), !Roots[2]->bFolder && Roots[2]->Path.Equals(TEXT("readme.txt"), ESearchCase::CaseSensitive));
 	auto Child = [](const TSharedPtr<FGitPathItem>& Folder, const TCHAR* Label)
 	{
-		const TSharedPtr<FGitPathItem>* Found = Folder->Children.FindByPredicate([Label](const TSharedPtr<FGitPathItem>& Item) { return Item->Label == Label; });
+		const TSharedPtr<FGitPathItem>* Found = Folder->Children.FindByPredicate([Label](const TSharedPtr<FGitPathItem>& Item) { return Item->Label.Equals(Label, ESearchCase::CaseSensitive); });
 		return Found ? *Found : TSharedPtr<FGitPathItem>();
 	};
 	const TSharedPtr<FGitPathItem> Actors = Child(Roots[0], TEXT("__ExternalActors__/Maps/Main"));
 	TestTrue(TEXT("A level's actors sit in one folder, without the hash folders"),
-		Actors.IsValid() && Actors->Path == TEXT("Content/__ExternalActors__/Maps/Main") && Actors->Children.Num() == 2 && !Actors->Children[0]->bFolder);
+		Actors.IsValid() && Actors->Path.Equals(TEXT("Content/__ExternalActors__/Maps/Main"), ESearchCase::CaseSensitive) && Actors->Children.Num() == 2 && !Actors->Children[0]->bFolder);
 	const TSharedPtr<FGitPathItem> Props = Child(Roots[0], TEXT("Props"));
-	if (!TestTrue(TEXT("Files keep the order given"), Props.IsValid() && Props->Children.Num() == 2 && Props->Children[0]->Path == TEXT("Content/Props/Barrel.uasset")))
+	if (!TestTrue(TEXT("Files keep the order given"), Props.IsValid() && Props->Children.Num() == 2 && Props->Children[0]->Path.Equals(TEXT("Content/Props/Barrel.uasset"), ESearchCase::CaseSensitive)))
 	{
 		return false;
 	}
@@ -650,11 +650,11 @@ bool FGitPanelTextDiffTest::RunTest(const FString&)
 	TestTrue(TEXT("Context lines carry both line numbers"), Lines[1]->Kind == EKind::Context && Lines[1]->OldLine == 1 && Lines[1]->NewLine == 1);
 	TestTrue(TEXT("Removed lines carry the old number"), Lines[2]->Kind == EKind::Removed && Lines[2]->OldLine == 2 && Lines[2]->NewLine == 0);
 	TestTrue(TEXT("Added lines carry the new number"), Lines[3]->Kind == EKind::Added && Lines[3]->OldLine == 0 && Lines[3]->NewLine == 2);
-	TestTrue(TEXT("An edited line marks the part that changed"), Lines[3]->HasChange() && Lines[3]->Text.Mid(Lines[3]->ChangeStart, Lines[3]->ChangeEnd - Lines[3]->ChangeStart) == TEXT(" Two"));
+	TestTrue(TEXT("An edited line marks the part that changed"), Lines[3]->HasChange() && Lines[3]->Text.Mid(Lines[3]->ChangeStart, Lines[3]->ChangeEnd - Lines[3]->ChangeStart).Equals(TEXT(" Two"), ESearchCase::CaseSensitive));
 	TestFalse(TEXT("Nothing was taken out of the old line"), Lines[2]->HasChange());
 	TestTrue(TEXT("An added line without a partner is not marked"), Lines[4]->Kind == EKind::Added && Lines[4]->NewLine == 3 && !Lines[4]->HasChange());
-	TestTrue(TEXT("Tabs are expanded"), Lines[5]->Kind == EKind::Context && Lines[5]->Text == TEXT("    Indented=1") && Lines[5]->OldLine == 3 && Lines[5]->NewLine == 4);
-	TestTrue(TEXT("Remarks are kept"), Lines[6]->Kind == EKind::Note && Lines[6]->Text == TEXT("No newline at end of file"));
+	TestTrue(TEXT("Tabs are expanded"), Lines[5]->Kind == EKind::Context && Lines[5]->Text.Equals(TEXT("    Indented=1"), ESearchCase::CaseSensitive) && Lines[5]->OldLine == 3 && Lines[5]->NewLine == 4);
+	TestTrue(TEXT("Remarks are kept"), Lines[6]->Kind == EKind::Note && Lines[6]->Text.Equals(TEXT("No newline at end of file"), ESearchCase::CaseSensitive));
 
 	const TArray<TSharedPtr<FGitDiffLine>> Rewritten = GitDiff::Parse(TEXT("@@ -1 +1 @@\n-alpha\n+zzzzzzzz\n"));
 	TestTrue(TEXT("A rewritten line is not marked part by part"), Rewritten.Num() == 3 && !Rewritten[1]->HasChange() && !Rewritten[2]->HasChange());
@@ -665,11 +665,11 @@ bool FGitPanelTextDiffTest::RunTest(const FString&)
 	TestEqual(TEXT("No output means no differences"), GitDiff::Parse(FString()).Num(), 0);
 	const TArray<TSharedPtr<FGitDiffLine>> Merge = GitDiff::Parse(TEXT("@@@ -1,1 -1,1 +1,3 @@@\n  shared\n+ ours\n ++both\n"));
 	TestTrue(TEXT("A merge commit's combined diff reads both marker columns"),
-		Merge.Num() == 4 && Merge[1]->Kind == EKind::Context && Merge[2]->Kind == EKind::Added && Merge[2]->Text == TEXT("ours") && Merge[3]->Kind == EKind::Added && Merge[3]->NewLine == 3);
+		Merge.Num() == 4 && Merge[1]->Kind == EKind::Context && Merge[2]->Kind == EKind::Added && Merge[2]->Text.Equals(TEXT("ours"), ESearchCase::CaseSensitive) && Merge[3]->Kind == EKind::Added && Merge[3]->NewLine == 3);
 
 	const FTCHARToUTF8 Utf8(TEXT("one\ntwo\n"));
 	const TArray<TSharedPtr<FGitDiffLine>> NewFile = GitDiff::Parse(GitCore::NewFileDiff(TArray<uint8>(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length())));
-	TestTrue(TEXT("A new file is all added lines"), NewFile.Num() == 3 && NewFile[1]->Kind == EKind::Added && NewFile[1]->NewLine == 1 && NewFile[2]->Text == TEXT("two"));
+	TestTrue(TEXT("A new file is all added lines"), NewFile.Num() == 3 && NewFile[1]->Kind == EKind::Added && NewFile[1]->NewLine == 1 && NewFile[2]->Text.Equals(TEXT("two"), ESearchCase::CaseSensitive));
 	const TArray<TSharedPtr<FGitDiffLine>> NewBinary = GitDiff::Parse(GitCore::NewFileDiff({0x89, 'P', 'N', 'G', 0, 1}));
 	TestTrue(TEXT("A new binary file is one note"), NewBinary.Num() == 1 && NewBinary[0]->Kind == EKind::Note);
 
@@ -679,11 +679,11 @@ bool FGitPanelTextDiffTest::RunTest(const FString&)
 	Code.Text = TEXT("if (A < B && C > \"D\")");
 	Code.ChangeStart = 4;
 	Code.ChangeEnd = 5;
-	TestEqual(TEXT("Rich text escapes code and tags the changed part"), GitDiff::ToMarkup(Code), FString(TEXT("if (<add>A</> &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
+	TestEqualSensitive(TEXT("Rich text escapes code and tags the changed part"), GitDiff::ToMarkup(Code), FString(TEXT("if (<add>A</> &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
 	Code.Kind = EKind::Removed;
-	TestEqual(TEXT("A removed line's change is tagged del"), GitDiff::ToMarkup(Code), FString(TEXT("if (<del>A</> &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
+	TestEqualSensitive(TEXT("A removed line's change is tagged del"), GitDiff::ToMarkup(Code), FString(TEXT("if (<del>A</> &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
 	Code.Kind = EKind::Context;
-	TestEqual(TEXT("Context lines carry no tags"), GitDiff::ToMarkup(Code), FString(TEXT("if (A &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
+	TestEqualSensitive(TEXT("Context lines carry no tags"), GitDiff::ToMarkup(Code), FString(TEXT("if (A &lt; B &amp;&amp; C &gt; &quot;D&quot;)")));
 	return true;
 }
 
@@ -717,7 +717,7 @@ bool FGitPanelFileDiffsTest::RunTest(const FString&)
 	};
 	auto Has = [](const TArray<TSharedPtr<FGitDiffLine>>& Lines, FGitDiffLine::EKind Kind, const TCHAR* Text)
 	{
-		return Lines.ContainsByPredicate([Kind, Text](const TSharedPtr<FGitDiffLine>& Line) { return Line->Kind == Kind && Line->Text == Text; });
+		return Lines.ContainsByPredicate([Kind, Text](const TSharedPtr<FGitDiffLine>& Line) { return Line->Kind == Kind && Line->Text.Equals(Text, ESearchCase::CaseSensitive); });
 	};
 	const TArray<TSharedPtr<FGitDiffLine>> Edited = Load([&Panel](auto Done) { Panel.Model->LoadDiff(TEXT("a.txt"), false, MoveTemp(Done)); });
 	TestTrue(TEXT("An edit shows the old and the new line"), Has(Edited, FGitDiffLine::EKind::Removed, TEXT("two")) && Has(Edited, FGitDiffLine::EKind::Added, TEXT("two too")));
@@ -907,25 +907,25 @@ bool FGitPanelShowInTest::RunTest(const FString&)
 		}
 		return FString::Join(Shown, TEXT(", "));
 	};
-	TestEqual(TEXT("An asset in a content folder is selected"), Browse({TEXT("Content/Props/Barrel.uasset")}), FString(TEXT("/GitShowInTest/Props/Barrel")));
-	TestEqual(TEXT("A content folder shows itself"), Browse({TEXT("Content/Props")}), FString(TEXT("/GitShowInTest/Props/")));
-	TestEqual(TEXT("A deleted asset shows its folder"), Browse({TEXT("Content/Props/Gone.uasset")}), FString(TEXT("/GitShowInTest/Props/")));
-	TestEqual(TEXT("A World Partition actor without its level shows the level's folder"),
+	TestEqualSensitive(TEXT("An asset in a content folder is selected"), Browse({TEXT("Content/Props/Barrel.uasset")}), FString(TEXT("/GitShowInTest/Props/Barrel")));
+	TestEqualSensitive(TEXT("A content folder shows itself"), Browse({TEXT("Content/Props")}), FString(TEXT("/GitShowInTest/Props/")));
+	TestEqualSensitive(TEXT("A deleted asset shows its folder"), Browse({TEXT("Content/Props/Gone.uasset")}), FString(TEXT("/GitShowInTest/Props/")));
+	TestEqualSensitive(TEXT("A World Partition actor without its level shows the level's folder"),
 		Browse({TEXT("Content/__ExternalActors__/Maps/Main/A/7Q/Actor.uasset")}), FString(TEXT("/GitShowInTest/Maps/")));
-	TestEqual(TEXT("A level's actor folder without the level shows the folder the level would be in"),
+	TestEqualSensitive(TEXT("A level's actor folder without the level shows the folder the level would be in"),
 		Browse({TEXT("Content/__ExternalActors__/Maps/Main")}), FString(TEXT("/GitShowInTest/Maps/")));
-	TestEqual(TEXT("Files and folders outside content folders are left out"),
+	TestEqualSensitive(TEXT("Files and folders outside content folders are left out"),
 		Browse({TEXT("Config/DefaultGame.ini"), TEXT("Source/Demo"), TEXT("Source/Demo/Demo.cpp"), TEXT("Docs/Loose.uasset")}), FString());
 	TestFalse(TEXT("So Show in Content Browser is not offered for them"), Panel.Model->CanBrowseTo({TEXT("Config/DefaultGame.ini"), TEXT("Docs/Loose.uasset")}));
 	TestTrue(TEXT("It is offered when one of them is an asset"), Panel.Model->CanBrowseTo({TEXT("Config/DefaultGame.ini"), TEXT("Content/Props/Barrel.uasset")}));
 
 	auto Reveal = [&Panel](const TArray<FString>& Paths) { return FString::Join(Panel.Model->GetRevealTargets(Paths), TEXT(", ")); };
 	auto Absolute = [&Panel](const FString& Path) { return Panel.Model->ToAbsolute(Path); };
-	TestEqual(TEXT("Files show selected in their folders"), Reveal({TEXT("Config/DefaultGame.ini"), TEXT("Content/Props/Barrel.uasset")}),
+	TestEqualSensitive(TEXT("Files show selected in their folders"), Reveal({TEXT("Config/DefaultGame.ini"), TEXT("Content/Props/Barrel.uasset")}),
 		Absolute(TEXT("Config/DefaultGame.ini")) + TEXT(", ") + Absolute(TEXT("Content/Props/Barrel.uasset")));
-	TestEqual(TEXT("Each folder opens once"), Reveal({TEXT("Content/Props/Barrel.uasset"), TEXT("Content/Props/Gone.uasset")}), Absolute(TEXT("Content/Props/Barrel.uasset")));
-	TestEqual(TEXT("A folder shows itself"), Reveal({TEXT("Source/Demo")}), Absolute(TEXT("Source/Demo")));
-	TestEqual(TEXT("A file that is gone shows the nearest folder that exists"), Reveal({TEXT("Old/Deep/Gone.txt")}), Absolute(FString()));
+	TestEqualSensitive(TEXT("Each folder opens once"), Reveal({TEXT("Content/Props/Barrel.uasset"), TEXT("Content/Props/Gone.uasset")}), Absolute(TEXT("Content/Props/Barrel.uasset")));
+	TestEqualSensitive(TEXT("A folder shows itself"), Reveal({TEXT("Source/Demo")}), Absolute(TEXT("Source/Demo")));
+	TestEqualSensitive(TEXT("A file that is gone shows the nearest folder that exists"), Reveal({TEXT("Old/Deep/Gone.txt")}), Absolute(FString()));
 	TestTrue(TEXT("Show in Finder / Explorer is offered outside content folders too"), Panel.Model->CanReveal({TEXT("Docs/Loose.uasset")}));
 	return true;
 }

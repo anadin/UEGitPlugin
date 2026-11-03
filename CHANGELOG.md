@@ -27,6 +27,7 @@
 - Git panel: tooltips and hints name shortcuts as Unreal does on each platform: Cmd+S and Option+click on macOS, Ctrl+S and Alt+click elsewhere.
 - Git panel: stage, unstage and discard single lines of a text file. Select lines in its diff (drag over them, Shift+click, or click a hunk's header for the whole hunk) and **Stage lines** and **Discard lines…** appear beside them in Changes, **Unstage lines** in Staged; the right-click menu has them too, and Space, Ctrl+S (Cmd+S on macOS) and Delete work on the selected lines while the diff has focus. An edit staged on its own keeps its place among the lines around it. Discarding asks first and keeps a copy of the file in Saved/GitSourceControl/Backups. New files work too; binary files, files stored through Git LFS or another filter, conflicts, submodules and text that is not UTF-8 are staged whole.
 - Git panel: a refresh no longer clears the selection in a diff, or scrolls it back to the top, when the diff did not change; after a change to the same file the diff keeps its place.
+- Tests compare text exactly. Unreal's TestEqual and FString comparisons ignore letter case, so a check could pass with a letter in the wrong case.
 
 ## 4.0.0-alpha
 

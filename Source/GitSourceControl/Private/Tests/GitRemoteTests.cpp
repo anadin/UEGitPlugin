@@ -56,22 +56,22 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	{
 		return false;
 	}
-	TestEqual(TEXT("The upstream remote is the default"), Repository->DefaultRemote(), FString(TEXT("origin")));
+	TestEqualSensitive(TEXT("The upstream remote is the default"), Repository->DefaultRemote(), FString(TEXT("origin")));
 
 	Clones.PushFromB(TEXT("from-b.txt"), TEXT("b\n"), TEXT("B adds a file"));
 	const FString BHead = GitTest::Output(GitTest::Git(Clones.B, {TEXT("rev-parse"), TEXT("HEAD")}));
 	TestTrue(TEXT("Fetch succeeds"), Repository->Fetch(TEXT("origin"), GitCore::ECallKind::UserNetwork, nullptr).bOk);
-	TestEqual(TEXT("Fetch updates the remote-tracking branch"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("origin/main")})), BHead);
+	TestEqualSensitive(TEXT("Fetch updates the remote-tracking branch"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("origin/main")})), BHead);
 	GitCore::FStatusSnapshot Status = ReadStatus(*this, *Repository);
-	TestEqual(TEXT("Status knows the upstream"), Status.Upstream, FString(TEXT("origin/main")));
+	TestEqualSensitive(TEXT("Status knows the upstream"), Status.Upstream, FString(TEXT("origin/main")));
 	GitCore::FRemoteState Remote;
 	FString Error;
 	TestTrue(TEXT("Remote state is read from local refs"), Repository->ReadRemoteState(Status, TEXT("origin"), Remote, Error));
 	TestTrue(TEXT("One incoming commit"), Remote.Behind == 1 && Remote.Ahead == 0);
-	TestTrue(TEXT("Incoming paths are listed"), Remote.IncomingPaths.Contains(TEXT("from-b.txt")));
+	TestTrue(TEXT("Incoming paths are listed"), GitTest::HasExactly(Remote.IncomingPaths, TEXT("from-b.txt")));
 	const GitCore::FOpResult FastForward = Repository->Integrate(Remote.Upstream, GitCore::EIntegrate::FastForward, nullptr);
 	TestTrue(TEXT("Fast-forward integrates: ") + FastForward.Message + TEXT(" ") + FastForward.Details, FastForward.bOk);
-	TestEqual(TEXT("HEAD now matches B"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})), BHead);
+	TestEqualSensitive(TEXT("HEAD now matches B"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})), BHead);
 
 	// Diverged but compatible: local commits are rebased onto the incoming ones.
 	GitTest::WriteFile(Clones.A, TEXT("from-a.txt"), TEXT("a\n"));
@@ -82,15 +82,15 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	Status = ReadStatus(*this, *Repository);
 	Repository->ReadRemoteState(Status, TEXT("origin"), Remote, Error);
 	TestTrue(TEXT("Diverged history is reported"), Remote.Ahead == 1 && Remote.Behind == 1);
-	TestTrue(TEXT("Outgoing paths are listed"), Remote.OutgoingPaths.Contains(TEXT("from-a.txt")));
+	TestTrue(TEXT("Outgoing paths are listed"), GitTest::HasExactly(Remote.OutgoingPaths, TEXT("from-a.txt")));
 	bool bConflicts = true;
 	TestTrue(TEXT("Conflict prediction runs"), Repository->PredictConflicts(Remote.Upstream, bConflicts, Error));
 	TestFalse(TEXT("No conflict is predicted"), bConflicts);
 	const GitCore::FOpResult Rebased = Repository->Integrate(Remote.Upstream, GitCore::EIntegrate::Rebase, nullptr);
 	TestTrue(TEXT("Rebase integrates: ") + Rebased.Message, Rebased.bOk);
-	TestEqual(TEXT("Local work sits on top of the incoming commit"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-list"), TEXT("--count"), TEXT("origin/main..HEAD")})), FString(TEXT("1")));
+	TestEqualSensitive(TEXT("Local work sits on top of the incoming commit"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-list"), TEXT("--count"), TEXT("origin/main..HEAD")})), FString(TEXT("1")));
 	TestTrue(TEXT("Both files are present"), GitTest::FileExists(Clones.A, TEXT("from-a.txt")) && GitTest::FileExists(Clones.A, TEXT("from-b-2.txt")));
-	TestEqual(TEXT("Uncommitted work survives"), GitTest::ReadFile(Clones.A, TEXT("uncommitted.txt")), FString(TEXT("keep me\n")));
+	TestEqualSensitive(TEXT("Uncommitted work survives"), GitTest::ReadFile(Clones.A, TEXT("uncommitted.txt")), FString(TEXT("keep me\n")));
 
 	// Conflicting history: prediction says so, and a forced attempt leaves nothing half-done.
 	GitTest::WriteFile(Clones.A, TEXT("shared.txt"), TEXT("line 1\nA's line 2\nline 3\n"));
@@ -101,9 +101,9 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	TestTrue(TEXT("The conflict is predicted"), bConflicts);
 	const FString Before = GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")}));
 	TestFalse(TEXT("A conflicting rebase fails"), Repository->Integrate(TEXT("origin/main"), GitCore::EIntegrate::Rebase, nullptr).bOk);
-	TestEqual(TEXT("HEAD is unchanged"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})), Before);
+	TestEqualSensitive(TEXT("HEAD is unchanged"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})), Before);
 	TestFalse(TEXT("No rebase is left in progress"), Repository->IsOperationInProgress());
-	TestEqual(TEXT("The local edit is intact"), GitTest::ReadFile(Clones.A, TEXT("shared.txt")), FString(TEXT("line 1\nA's line 2\nline 3\n")));
+	TestEqualSensitive(TEXT("The local edit is intact"), GitTest::ReadFile(Clones.A, TEXT("shared.txt")), FString(TEXT("line 1\nA's line 2\nline 3\n")));
 	return true;
 }
 
@@ -124,7 +124,7 @@ bool FGitRemotePushTest::RunTest(const FString&)
 	const GitCore::FOpResult Published = GitTest::PushBranch(*Repository, Status, Repository->DefaultRemote());
 	TestTrue(TEXT("Pushing publishes the branch: ") + Published.Message, Published.bOk);
 	TestTrue(TEXT("The remote has the branch"), GitTest::Git(Clones.Origin, {TEXT("rev-parse"), TEXT("--verify"), TEXT("refs/heads/feature/new")}).Succeeded());
-	TestEqual(TEXT("The upstream is now set"), ReadStatus(*this, *Repository).Upstream, FString(TEXT("origin/feature/new")));
+	TestEqualSensitive(TEXT("The upstream is now set"), ReadStatus(*this, *Repository).Upstream, FString(TEXT("origin/feature/new")));
 
 	GitTest::Git(Clones.A, {TEXT("switch"), TEXT("-q"), TEXT("main")});
 	Clones.PushFromB(TEXT("b.txt"), TEXT("b\n"), TEXT("B moves main"));
@@ -133,7 +133,7 @@ bool FGitRemotePushTest::RunTest(const FString&)
 	Status = ReadStatus(*this, *Repository);
 	const GitCore::FOpResult Rejected = GitTest::PushBranch(*Repository, Status, TEXT("origin"));
 	TestFalse(TEXT("A push behind the server is rejected"), Rejected.bOk);
-	TestTrue(TEXT("The message says to pull first"), Rejected.Message.Contains(TEXT("Pull")));
+	TestTrue(TEXT("The message says to pull first"), Rejected.Message.Contains(TEXT("Pull"), ESearchCase::CaseSensitive));
 	return true;
 }
 
@@ -150,7 +150,7 @@ bool FGitRemotePushTargetTest::RunTest(const FString&)
 	const FString MainBefore = GitTest::Output(GitTest::Git(Clones.Origin, {TEXT("rev-parse"), TEXT("main")}));
 	GitCore::FPushTarget Target;
 	TestTrue(TEXT("main resolves"), Repository->ResolvePush(ReadStatus(*this, *Repository), TEXT("origin"), Target).bOk);
-	TestTrue(TEXT("main pushes to origin/main"), Target.Remote == TEXT("origin") && Target.Branch == TEXT("main") && !Target.bSetUpstream);
+	TestTrue(TEXT("main pushes to origin/main"), Target.Remote.Equals(TEXT("origin"), ESearchCase::CaseSensitive) && Target.Branch.Equals(TEXT("main"), ESearchCase::CaseSensitive) && !Target.bSetUpstream);
 	TestFalse(TEXT("Pushing main asks nothing"), Target.NeedsAgreement());
 
 	// A branch made from origin/main follows it, but its commits go to a branch with its own name.
@@ -158,18 +158,18 @@ bool FGitRemotePushTargetTest::RunTest(const FString&)
 	GitTest::WriteFile(Clones.A, TEXT("feature.txt"), TEXT("feature\n"));
 	GitTest::CommitAll(Clones.A, TEXT("feature work"));
 	GitCore::FStatusSnapshot Status = ReadStatus(*this, *Repository);
-	TestEqual(TEXT("feature follows origin/main"), Status.Upstream, FString(TEXT("origin/main")));
+	TestEqualSensitive(TEXT("feature follows origin/main"), Status.Upstream, FString(TEXT("origin/main")));
 	TestTrue(TEXT("feature resolves"), Repository->ResolvePush(Status, TEXT("origin"), Target).bOk);
-	TestTrue(TEXT("It goes to origin/feature, not main"), Target.Remote == TEXT("origin") && Target.Branch == TEXT("feature") && Target.bSetUpstream);
-	TestEqual(TEXT("It names the upstream it leaves"), Target.PreviousUpstream, FString(TEXT("origin/main")));
+	TestTrue(TEXT("It goes to origin/feature, not main"), Target.Remote.Equals(TEXT("origin"), ESearchCase::CaseSensitive) && Target.Branch.Equals(TEXT("feature"), ESearchCase::CaseSensitive) && Target.bSetUpstream);
+	TestEqualSensitive(TEXT("It names the upstream it leaves"), Target.PreviousUpstream, FString(TEXT("origin/main")));
 	TestTrue(TEXT("Publishing it asks first"), !Target.bExists && Target.NeedsAgreement());
 	const GitCore::FOpResult Pushed = Repository->Push(Target, nullptr);
 	TestTrue(TEXT("The push succeeds: ") + Pushed.Message, Pushed.bOk);
-	TestEqual(TEXT("main on the server did not move"), GitTest::Output(GitTest::Git(Clones.Origin, {TEXT("rev-parse"), TEXT("main")})), MainBefore);
-	TestEqual(TEXT("origin/feature has the commit"), GitTest::Output(GitTest::Git(Clones.Origin, {TEXT("rev-parse"), TEXT("feature")})),
+	TestEqualSensitive(TEXT("main on the server did not move"), GitTest::Output(GitTest::Git(Clones.Origin, {TEXT("rev-parse"), TEXT("main")})), MainBefore);
+	TestEqualSensitive(TEXT("origin/feature has the commit"), GitTest::Output(GitTest::Git(Clones.Origin, {TEXT("rev-parse"), TEXT("feature")})),
 		GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})));
 	Status = ReadStatus(*this, *Repository);
-	TestEqual(TEXT("feature follows origin/feature now"), Status.Upstream, FString(TEXT("origin/feature")));
+	TestEqualSensitive(TEXT("feature follows origin/feature now"), Status.Upstream, FString(TEXT("origin/feature")));
 	Repository->ResolvePush(Status, TEXT("origin"), Target);
 	TestFalse(TEXT("Its next push asks nothing"), Target.NeedsAgreement());
 
@@ -177,15 +177,15 @@ bool FGitRemotePushTargetTest::RunTest(const FString&)
 	GitTest::Git(Clones.A, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("hotfix"), TEXT("--track"), TEXT("origin/main")});
 	GitTest::Git(Clones.A, {TEXT("config"), TEXT("push.default"), TEXT("upstream")});
 	Repository->ResolvePush(ReadStatus(*this, *Repository), TEXT("origin"), Target);
-	TestTrue(TEXT("With push.default=upstream it goes to main"), Target.Branch == TEXT("main") && !Target.bSetUpstream && !Target.NeedsAgreement());
+	TestTrue(TEXT("With push.default=upstream it goes to main"), Target.Branch.Equals(TEXT("main"), ESearchCase::CaseSensitive) && !Target.bSetUpstream && !Target.NeedsAgreement());
 	GitTest::Git(Clones.A, {TEXT("config"), TEXT("--unset"), TEXT("push.default")});
 
 	// A branch following a local branch is published on the remote; pushing to "." would move that branch.
 	GitTest::Git(Clones.A, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("local"), TEXT("--track"), TEXT("main")});
 	Status = ReadStatus(*this, *Repository);
-	TestEqual(TEXT("local follows main"), Status.Upstream, FString(TEXT("main")));
+	TestEqualSensitive(TEXT("local follows main"), Status.Upstream, FString(TEXT("main")));
 	Repository->ResolvePush(Status, TEXT("origin"), Target);
-	TestTrue(TEXT("It goes to origin/local"), Target.Remote == TEXT("origin") && Target.Branch == TEXT("local") && Target.bSetUpstream && Target.NeedsAgreement());
+	TestTrue(TEXT("It goes to origin/local"), Target.Remote.Equals(TEXT("origin"), ESearchCase::CaseSensitive) && Target.Branch.Equals(TEXT("local"), ESearchCase::CaseSensitive) && Target.bSetUpstream && Target.NeedsAgreement());
 	return true;
 }
 

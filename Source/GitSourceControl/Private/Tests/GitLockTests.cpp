@@ -24,7 +24,7 @@ bool FGitLockLifecycleTest::RunTest(const FString&)
 	}
 	FString Endpoint;
 	FString Error;
-	TestTrue(TEXT("The lock endpoint resolves"), Alice->ResolveLockEndpoint(TEXT("origin"), Endpoint, Error) && Endpoint.Contains(TEXT("/users/alice/")));
+	TestTrue(TEXT("The lock endpoint resolves"), Alice->ResolveLockEndpoint(TEXT("origin"), Endpoint, Error) && Endpoint.Contains(TEXT("/users/alice/"), ESearchCase::CaseSensitive));
 
 	GitCore::FLockSnapshot AliceLocks;
 	TestTrue(TEXT("Verification succeeds"), Alice->VerifyLocks(TEXT("origin"), GitCore::ECallKind::UserNetwork, AliceLocks) && AliceLocks.bVerified);
@@ -40,7 +40,7 @@ bool FGitLockLifecycleTest::RunTest(const FString&)
 	GitCore::FLockInfo Refused;
 	const GitCore::FOpResult Conflict = Bob->Lock(TEXT("origin"), TEXT("Content/Hero.uasset"), Refused);
 	TestFalse(TEXT("Bob cannot take the same lock"), Conflict.bOk);
-	TestTrue(TEXT("The refusal says it is already locked"), Conflict.Message.Contains(TEXT("already locked")));
+	TestTrue(TEXT("The refusal says it is already locked"), Conflict.Message.Contains(TEXT("already locked"), ESearchCase::CaseSensitive));
 	TestFalse(TEXT("Bob cannot release Alice's lock without forcing"), Bob->Unlock(TEXT("origin"), Taken.Id, false).bOk);
 
 	TestTrue(TEXT("Alice releases by id"), Alice->Unlock(TEXT("origin"), Taken.Id, false).bOk);
@@ -85,7 +85,7 @@ bool FGitLfsPushTest::RunTest(const FString&)
 
 	TestTrue(TEXT("Bob fetches"), Bob->Fetch(TEXT("origin"), GitCore::ECallKind::UserNetwork, nullptr).bOk);
 	TestTrue(TEXT("Bob fast-forwards and LFS downloads the new asset"), Bob->Integrate(TEXT("origin/main"), GitCore::EIntegrate::FastForward, nullptr).bOk);
-	TestEqual(TEXT("Bob has the real bytes"), GitTest::ReadFile(Team.Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v2 from alice\n")));
+	TestEqualSensitive(TEXT("Bob has the real bytes"), GitTest::ReadFile(Team.Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v2 from alice\n")));
 
 	Team.Server->SetMode(TEXT("uploadfail"));
 	GitTest::WriteFile(Team.Alice, TEXT("Content/Hero.uasset"), TEXT("hero v3\n"));
@@ -93,7 +93,7 @@ bool FGitLfsPushTest::RunTest(const FString&)
 	Alice->ReadStatus(Status, Error, true);
 	const FString RemoteBefore = GitTest::Output(GitTest::Git(Team.Origin, {TEXT("rev-parse"), TEXT("main")}));
 	TestFalse(TEXT("A failed LFS upload stops the push"), GitTest::PushBranch(*Alice, Status, TEXT("origin")).bOk);
-	TestEqual(TEXT("The remote branch did not move"), GitTest::Output(GitTest::Git(Team.Origin, {TEXT("rev-parse"), TEXT("main")})), RemoteBefore);
+	TestEqualSensitive(TEXT("The remote branch did not move"), GitTest::Output(GitTest::Git(Team.Origin, {TEXT("rev-parse"), TEXT("main")})), RemoteBefore);
 	return true;
 }
 
