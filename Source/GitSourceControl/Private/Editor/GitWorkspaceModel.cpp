@@ -6,6 +6,7 @@
 #include "Provider/GitProviderIdentity.h"
 #include "Provider/GitSourceControlRevision.h"
 #include "Provider/GitSourceControlUserSettings.h"
+#include "Provider/GitSourceControlWorkers.h"
 #include "Editor/Panel/SGitDiffView.h"
 #include "Editor/Panel/SGitDialogs.h"
 
@@ -832,6 +833,24 @@ void FGitWorkspaceModel::Discard(const TArray<FString>& Paths)
 	});
 }
 
+void FGitWorkspaceModel::ApplyLines(const FString& RelativePath, GitCore::ELineAction Action, const FString& ShownDiff, const GitCore::FLineSelection& Lines)
+{
+	if (Lines.IsEmpty() || !IsActive())
+	{
+		return;
+	}
+	const FGitCommandSettings Settings = GetProvider().MakeCommandSettings();
+	RunQuick([RelativePath, Action, ShownDiff, Lines, Settings](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		const GitCore::FGitRepository& Repository = Session.GetRepository();
+		const GitCore::FOpResult Result = Repository.ApplyLines(RelativePath, Action, ShownDiff, Lines,
+			[&Repository, &RelativePath, &Settings]() { GitWorkers::BackUpFiles(Repository, {RelativePath}, Settings); });
+		const TArray<FString> Paths = {RelativePath};
+		Session.RefreshStatus(&Paths);
+		return FGitActionResult::FromOp(Result);
+	});
+}
+
 void FGitWorkspaceModel::Lock(const TArray<FString>& Paths)
 {
 	TArray<FString> Files;
@@ -1224,15 +1243,14 @@ void FGitWorkspaceModel::LoadDiff(const FString& RelativePath, bool bStaged, TFu
 		FString Error;
 		if (!NewFile.IsEmpty())
 		{
-			constexpr int64 MaxNewFileBytes = 4 * 1024 * 1024;
 			TArray<uint8> Bytes;
-			if (IFileManager::Get().FileSize(*NewFile) > MaxNewFileBytes)
+			if (IFileManager::Get().FileSize(*NewFile) > GitCore::NewFileDiffLimit)
 			{
 				Error = LOCTEXT("NewFileTooLarge", "This new file is too large to show.").ToString();
 			}
 			else if (FFileHelper::LoadFileToArray(Bytes, *NewFile, FILEREAD_Silent))
 			{
-				Diff = GitDiff::FromNewFile(Bytes);
+				Diff = GitCore::NewFileDiff(Bytes);
 			}
 			else
 			{

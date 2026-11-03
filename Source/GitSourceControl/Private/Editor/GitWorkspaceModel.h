@@ -78,6 +78,11 @@ public:
 	void Commit(const FString& Message, bool bPush, TFunction<void(bool bCommitted)> OnDone = nullptr);
 	/** Discards local changes. Packages are reverted through the editor, which reloads them. */
 	void Discard(const TArray<FString>& Paths);
+	/**
+	 * Stages, unstages or discards some lines of a text file. ShownDiff is the diff from LoadDiff they were picked in;
+	 * nothing changes if the file's diff is no longer the same. Discarding keeps a copy of the file, as Revert does.
+	 */
+	void ApplyLines(const FString& RelativePath, GitCore::ELineAction Action, const FString& ShownDiff, const GitCore::FLineSelection& Lines);
 	/** Unreal's Check Out: takes the LFS locks. */
 	void Lock(const TArray<FString>& Paths);
 	/** Releases locks held on Paths; bForce also releases other people's locks. */

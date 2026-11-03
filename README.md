@@ -79,17 +79,19 @@ Each tab has a search box (Ctrl+F); matches are highlighted and their folders op
 
 Text changes are colored: added lines green, removed lines red, and in an edited line the part that changed is highlighted. Each line shows its old and new line number; select lines and press Ctrl+C to copy them. **Wrap lines**, above each diff next to the count of added and removed lines, wraps long lines instead of scrolling sideways, in every diff view. **Compare** (Ctrl+D) opens the same view in its own window. For Unreal assets, Compare opens Unreal's own diff instead: Blueprints (including Animation and Widget Blueprints), materials, data tables, curves, behavior trees and other types with a diff view show their own comparison, and other assets open as text in the **Tool for diffing text** set under Editor Preferences > Loading & Saving. New and deleted assets, and World Partition actors on their own, cannot be compared.
 
+**Staging lines.** A text file's diff in Changes can stage part of the file. Select lines (drag over them, click and Shift+click, or click a hunk's header for the whole hunk) and buttons appear beside them: **Stage lines** and **Discard lines…** for a file in Changes, **Unstage lines** for one in Staged; the right-click menu has them too. While the diff has focus, Space or Ctrl+S stages or unstages the selected lines and Delete discards them. Only the selected added and removed lines change, whole lines at a time; an edited line is a removed line and an added one, so select both to stage the edit. Discarding asks first and keeps a copy of the file in `Saved/GitSourceControl/Backups`. New files work too: discarding every line of one deletes it. Binary files, files stored through Git LFS or another filter, conflicts, submodules and text that is not UTF-8 are staged whole.
+
 Switching branches and restoring stashes refuse to overwrite local edits, download Git LFS files first, and reload any open assets that change.
 
 | Key | Action |
 | --- | --- |
 | Ctrl+F | Search the current tab |
-| Space or Ctrl+S | Stage or unstage the selected files |
+| Space or Ctrl+S | Stage or unstage the selected files, or the selected lines of a diff |
 | Enter / double-click | Compare an edited file, or open a new one; open or close a folder |
 | Left / Right | Close or open a folder (with Shift: everything in it) |
 | Ctrl+D | Compare with the last commit, in its own window |
 | Ctrl+C | Copy the selected lines of a diff |
-| Delete | Discard changes to the selected files |
+| Delete | Discard changes to the selected files, or to the selected lines of a diff |
 | Ctrl+Enter | Commit (Ctrl+Shift+Enter: commit and push) |
 | F5 | Refresh |
 | Ctrl+1 … Ctrl+4 | Changes, History, Stashes, Locks |

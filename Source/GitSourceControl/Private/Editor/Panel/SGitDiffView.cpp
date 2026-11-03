@@ -11,11 +11,13 @@
 #include "Framework/Text/ITextDecorator.h"
 #include "Framework/Text/SlateTextRun.h"
 #include "HAL/PlatformApplicationMisc.h"
-#include "Misc/FileHelper.h"
 #include "Rendering/DrawElements.h"
 #include "Rendering/SlateRenderer.h"
+#include "RevisionControlStyle/RevisionControlStyle.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
+#include "Types/ISlateMetaData.h"
+#include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
@@ -121,6 +123,51 @@ namespace
 	FString EscapeMarkup(const FString& Text)
 	{
 		return Text.Replace(TEXT("&"), TEXT("&amp;")).Replace(TEXT("<"), TEXT("&lt;")).Replace(TEXT(">"), TEXT("&gt;")).Replace(TEXT("\""), TEXT("&quot;"));
+	}
+
+	bool IsChange(const FGitDiffLine& Line)
+	{
+		return Line.Kind == FGitDiffLine::EKind::Added || Line.Kind == FGitDiffLine::EKind::Removed;
+	}
+
+	FText LineActionLabel(GitCore::ELineAction Action)
+	{
+		switch (Action)
+		{
+		case GitCore::ELineAction::Stage:
+			return LOCTEXT("StageLines", "Stage lines");
+		case GitCore::ELineAction::Unstage:
+			return LOCTEXT("UnstageLines", "Unstage lines");
+		default:
+			return LOCTEXT("DiscardLines", "Discard lines…");
+		}
+	}
+
+	FText LineActionTooltip(GitCore::ELineAction Action)
+	{
+		const FText StageKeys = FText::Format(LOCTEXT("StageLineKeys", "Space or {0}"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::S));
+		switch (Action)
+		{
+		case GitCore::ELineAction::Stage:
+			return FText::Format(LOCTEXT("StageLinesTooltip", "Stage the changes in the selected lines; the rest of the file stays as it is. ({0})"), StageKeys);
+		case GitCore::ELineAction::Unstage:
+			return FText::Format(LOCTEXT("UnstageLinesTooltip", "Take the changes in the selected lines out of the staged file. ({0})"), StageKeys);
+		default:
+			return LOCTEXT("DiscardLinesTooltip", "Undo your changes in the selected lines; staged changes stay. (Delete)");
+		}
+	}
+
+	FSlateIcon LineActionIcon(GitCore::ELineAction Action)
+	{
+		switch (Action)
+		{
+		case GitCore::ELineAction::Stage:
+			return FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus");
+		case GitCore::ELineAction::Unstage:
+			return FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Minus");
+		default:
+			return FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Actions.Revert");
+		}
 	}
 
 	/** Text on a tinted background; each wrapped piece paints its own. */
@@ -302,33 +349,6 @@ TArray<TSharedPtr<FGitDiffLine>> GitDiff::Parse(const FString& UnifiedDiff)
 	return Lines;
 }
 
-FString GitDiff::FromNewFile(const TArray<uint8>& Bytes)
-{
-	// Git's own test: a NUL byte near the start means binary.
-	const int32 Sniff = FMath::Min(Bytes.Num(), 8000);
-	for (int32 Index = 0; Index < Sniff; ++Index)
-	{
-		if (Bytes[Index] == 0)
-		{
-			return TEXT("Binary files /dev/null and b/file differ\n");
-		}
-	}
-	FString Content;
-	FFileHelper::BufferToString(Content, Bytes.GetData(), Bytes.Num());
-	TArray<FString> Lines;
-	Content.ParseIntoArray(Lines, TEXT("\n"), false);
-	if (!Lines.IsEmpty() && Lines.Last().IsEmpty())
-	{
-		Lines.Pop();
-	}
-	FString Diff = FString::Printf(TEXT("@@ -0,0 +1,%d @@\n"), Lines.Num());
-	for (const FString& Line : Lines)
-	{
-		Diff += TEXT("+") + Line + TEXT("\n");
-	}
-	return Diff;
-}
-
 FString GitDiff::ToMarkup(const FGitDiffLine& Line)
 {
 	if (!Line.HasChange() || (Line.Kind != FGitDiffLine::EKind::Added && Line.Kind != FGitDiffLine::EKind::Removed))
@@ -358,6 +378,7 @@ void GitDiff::SetWrapLines(bool bWrap)
 
 void SGitDiffView::Construct(const FArguments& InArgs)
 {
+	OnLineAction = InArgs._OnLineAction;
 	Font = FCoreStyle::GetDefaultFontStyle("Mono", 9);
 	TextStyle = FTextBlockStyle(FAppStyle::GetWidgetStyle<FTextBlockStyle>("NormalText")).SetFont(Font).SetColorAndOpacity(FSlateColor::UseForeground());
 	NoteStyle = FTextBlockStyle(TextStyle).SetColorAndOpacity(FSlateColor::UseSubduedForeground());
@@ -426,23 +447,37 @@ void SGitDiffView::Construct(const FArguments& InArgs)
 				+ SHorizontalBox::Slot()
 				.FillWidth(1.0f)
 				[
-					// Long lines scroll sideways unless they wrap; the gutter scrolls with them.
-					SAssignNew(Scroll, SScrollBox)
-					.Orientation(Orient_Horizontal)
-					.ExternalScrollbar(Horizontal)
-					+ SScrollBox::Slot()
+					SAssignNew(ListArea, SOverlay)
+					+ SOverlay::Slot()
 					[
-						SNew(SBox)
-						.WidthOverride(this, &SGitDiffView::GetContentWidth)
+						// Long lines scroll sideways unless they wrap; the gutter scrolls with them.
+						SAssignNew(Scroll, SScrollBox)
+						.Orientation(Orient_Horizontal)
+						.ExternalScrollbar(Horizontal)
+						+ SScrollBox::Slot()
 						[
-							SAssignNew(List, SListView<FLinePtr>)
-							.ListItemsSource(&Lines)
-							.SelectionMode(ESelectionMode::Multi)
-							.OnGenerateRow(this, &SGitDiffView::OnGenerateRow)
-							.OnContextMenuOpening(this, &SGitDiffView::OnContextMenu)
-							.ExternalScrollbar(Vertical)
-							.ConsumeMouseWheel(EConsumeMouseWheel::Always)
+							SNew(SBox)
+							.WidthOverride(this, &SGitDiffView::GetContentWidth)
+							[
+								SAssignNew(List, SListView<FLinePtr>)
+								.AddMetaData<FTagMetaData>(TEXT("GitPanel.Diff.Lines"))
+								.ListItemsSource(&Lines)
+								.SelectionMode(ESelectionMode::Multi)
+								.OnGenerateRow(this, &SGitDiffView::OnGenerateRow)
+								.OnSelectionChanged(this, &SGitDiffView::OnSelectionChanged)
+								.OnContextMenuOpening(this, &SGitDiffView::OnContextMenu)
+								.ExternalScrollbar(Vertical)
+								.ConsumeMouseWheel(EConsumeMouseWheel::Always)
+							]
 						]
+					]
+					// What the selected lines can do, level with the first of them in view.
+					+ SOverlay::Slot()
+					.HAlign(HAlign_Right)
+					.VAlign(VAlign_Top)
+					.Padding(TAttribute<FMargin>::CreateSP(this, &SGitDiffView::GetLineActionsPadding))
+					[
+						MakeLineActions()
 					]
 				]
 				+ SHorizontalBox::Slot()
@@ -476,8 +511,17 @@ void SGitDiffView::Construct(const FArguments& InArgs)
 	];
 }
 
-void SGitDiffView::SetDiff(const FString& UnifiedDiff)
+void SGitDiffView::SetDiff(const FString& UnifiedDiff, bool bKeepPosition)
 {
+	bLineActionPending = false;
+	if (Message.IsEmpty() && !Lines.IsEmpty() && UnifiedDiff.Equals(DiffText, ESearchCase::CaseSensitive))
+	{
+		// A refresh found the same diff: keep the selection and the scroll position.
+		return;
+	}
+	const float Position = bKeepPosition && Message.IsEmpty() ? List->GetScrollOffset() : 0.0f;
+	DiffText = UnifiedDiff;
+	bDragSelecting = false;
 	const bool bCut = UnifiedDiff.Len() > MaxDiffCharacters;
 	Lines = GitDiff::Parse(bCut ? UnifiedDiff.Left(MaxDiffCharacters) : UnifiedDiff);
 	if (bCut)
@@ -499,14 +543,226 @@ void SGitDiffView::SetDiff(const FString& UnifiedDiff)
 	Message = Lines.IsEmpty() ? LOCTEXT("NoDifferences", "No differences.") : FText::GetEmpty();
 	List->ClearSelection();
 	List->RequestListRefresh();
-	List->ScrollToTop();
+	List->SetScrollOffset(Position);
 }
 
 void SGitDiffView::SetMessage(const FText& InMessage)
 {
 	Message = InMessage;
+	DiffText.Reset();
 	Lines.Reset();
+	bLineActionPending = false;
+	bDragSelecting = false;
+	List->ClearSelection();
 	List->RequestListRefresh();
+}
+
+void SGitDiffView::SetLineActions(const TArray<GitCore::ELineAction>& Actions)
+{
+	LineActions = Actions;
+}
+
+GitCore::FLineSelection SGitDiffView::GetSelectedLines() const
+{
+	GitCore::FLineSelection Picked;
+	for (const FLinePtr& Line : List->GetSelectedItems())
+	{
+		if (Line->Kind == FGitDiffLine::EKind::Removed)
+		{
+			Picked.Removed.Add(Line->OldLine);
+		}
+		else if (Line->Kind == FGitDiffLine::EKind::Added)
+		{
+			Picked.Added.Add(Line->NewLine);
+		}
+	}
+	return Picked;
+}
+
+bool SGitDiffView::CanRunLineAction(GitCore::ELineAction Action) const
+{
+	return LineActions.Contains(Action) && bChangedLinesSelected && !bLineActionPending && OnLineAction.IsBound();
+}
+
+bool SGitDiffView::RunLineAction(GitCore::ELineAction Action)
+{
+	if (!CanRunLineAction(Action))
+	{
+		return false;
+	}
+	// Until the diff comes back changed, the same lines must not be picked twice.
+	bLineActionPending = OnLineAction.Execute(Action, GetSelectedLines());
+	return true;
+}
+
+void SGitDiffView::OnSelectionChanged(FLinePtr Line, ESelectInfo::Type SelectInfo)
+{
+	if (SelectInfo != ESelectInfo::Direct)
+	{
+		// The user picked again: whatever was asked for before no longer holds the keys back.
+		bLineActionPending = false;
+	}
+	// Clicking a hunk's header selects the hunk.
+	if (SelectInfo == ESelectInfo::OnMouseClick && Line.IsValid() && Line->Kind == FGitDiffLine::EKind::Hunk && List->GetNumItemsSelected() == 1)
+	{
+		const int32 Header = Lines.IndexOfByKey(Line);
+		int32 End = Header + 1;
+		while (End < Lines.Num() && Lines[End]->Kind != FGitDiffLine::EKind::Hunk)
+		{
+			++End;
+		}
+		if (Header != INDEX_NONE && End > Header + 1)
+		{
+			// That selection comes back here.
+			List->SetItemSelection(TConstArrayView<FLinePtr>(Lines.GetData() + Header + 1, End - Header - 1), true);
+			return;
+		}
+	}
+	const TArray<FLinePtr> Selected = List->GetSelectedItems();
+	bChangedLinesSelected = Selected.ContainsByPredicate([](const FLinePtr& Picked) { return IsChange(*Picked); });
+}
+
+TSharedRef<SWidget> SGitDiffView::MakeLineActions()
+{
+	const TSharedRef<SHorizontalBox> Buttons = SNew(SHorizontalBox)
+		.Visibility(this, &SGitDiffView::GetLineActionsVisibility);
+	for (const GitCore::ELineAction Action : {GitCore::ELineAction::Stage, GitCore::ELineAction::Unstage, GitCore::ELineAction::Discard})
+	{
+		Buttons->AddSlot()
+		.AutoWidth()
+		.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+		[
+			SNew(SButton)
+			.Text(LineActionLabel(Action))
+			.ToolTipText(LineActionTooltip(Action))
+			// Focus stays on the lines, so Space keeps working on them.
+			.IsFocusable(false)
+			.Visibility_Lambda([this, Action]() { return LineActions.Contains(Action) ? EVisibility::Visible : EVisibility::Collapsed; })
+			.IsEnabled_Lambda([this]() { return !bLineActionPending; })
+			.OnClicked_Lambda([this, Action]() { RunLineAction(Action); return FReply::Handled(); })
+		];
+	}
+	LineActionsBox = Buttons;
+	return Buttons;
+}
+
+EVisibility SGitDiffView::GetLineActionsVisibility() const
+{
+	// Clicks between the buttons reach the lines below.
+	return OnLineAction.IsBound() && !LineActions.IsEmpty() && bChangedLinesSelected && !bDragSelecting && FindSelectedRowTop().IsSet()
+		? EVisibility::SelfHitTestInvisible : EVisibility::Collapsed;
+}
+
+FMargin SGitDiffView::GetLineActionsPadding() const
+{
+	// Level with the first selected line in view, and inside the view.
+	const float Top = FindSelectedRowTop().Get(0.0f);
+	const float Room = ListArea.IsValid() ? static_cast<float>(ListArea->GetCachedGeometry().GetLocalSize().Y) : 0.0f;
+	const float Height = LineActionsBox.IsValid() ? static_cast<float>(LineActionsBox->GetDesiredSize().Y) : 0.0f;
+	return FMargin(0.0f, FMath::Clamp(Top, 0.0f, FMath::Max(0.0f, Room - Height)), 6.0f, 0.0f);
+}
+
+void SGitDiffView::GetLinesInView(int32& OutFirst, int32& OutLast) const
+{
+	// The list makes rows for the lines in view only, from the first one on.
+	OutFirst = FMath::Clamp(FMath::FloorToInt(List->GetScrollOffset()), 0, Lines.Num());
+	OutLast = OutFirst - 1;
+	while (OutLast + 1 < Lines.Num() && List->WidgetFromItem(Lines[OutLast + 1]).IsValid())
+	{
+		++OutLast;
+	}
+}
+
+TOptional<float> SGitDiffView::FindSelectedRowTop() const
+{
+	if (!ListArea.IsValid() || List->GetNumItemsSelected() == 0)
+	{
+		return {};
+	}
+	int32 First = 0;
+	int32 Last = 0;
+	GetLinesInView(First, Last);
+	for (int32 Index = First; Index <= Last; ++Index)
+	{
+		if (!List->IsItemSelected(Lines[Index]))
+		{
+			continue;
+		}
+		if (const TSharedPtr<ITableRow> Row = List->WidgetFromItem(Lines[Index]))
+		{
+			const FVector2f RowTop = Row->AsWidget()->GetCachedGeometry().GetAbsolutePosition();
+			return static_cast<float>(ListArea->GetCachedGeometry().AbsoluteToLocal(RowTop).Y);
+		}
+	}
+	return {};
+}
+
+int32 SGitDiffView::FindLineAt(float ScreenY) const
+{
+	int32 First = 0;
+	int32 Last = 0;
+	GetLinesInView(First, Last);
+	int32 Found = INDEX_NONE;
+	for (int32 Index = First; Index <= Last; ++Index)
+	{
+		const TSharedPtr<ITableRow> Row = List->WidgetFromItem(Lines[Index]);
+		// The last line that starts above the pointer, or the first line when the pointer is above them all.
+		if (Row.IsValid() && (Found == INDEX_NONE || Row->AsWidget()->GetCachedGeometry().GetAbsolutePosition().Y <= ScreenY))
+		{
+			Found = Index;
+		}
+	}
+	return Found;
+}
+
+FReply SGitDiffView::OnRowDragDetected(const FGeometry& Geometry, const FPointerEvent& MouseEvent, FLinePtr Line)
+{
+	DragAnchor = Line;
+	DragY = MouseEvent.GetScreenSpacePosition().Y;
+	bDragSelecting = true;
+	SelectDraggedLines();
+	return FReply::Handled().CaptureMouse(SharedThis(this));
+}
+
+void SGitDiffView::SelectDraggedLines()
+{
+	const int32 Anchor = Lines.IndexOfByKey(DragAnchor);
+	const int32 Under = FindLineAt(DragY);
+	if (Anchor == INDEX_NONE || Under == INDEX_NONE)
+	{
+		return;
+	}
+	const int32 First = FMath::Min(Anchor, Under);
+	List->ClearSelection();
+	List->SetItemSelection(TConstArrayView<FLinePtr>(Lines.GetData() + First, FMath::Abs(Under - Anchor) + 1), true);
+}
+
+FReply SGitDiffView::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (bDragSelecting && HasMouseCapture())
+	{
+		DragY = MouseEvent.GetScreenSpacePosition().Y;
+		SelectDraggedLines();
+		return FReply::Handled();
+	}
+	return SCompoundWidget::OnMouseMove(MyGeometry, MouseEvent);
+}
+
+FReply SGitDiffView::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	// The view holds the mouse only while lines are dragged over, even if a refresh ended the drag.
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton && HasMouseCapture())
+	{
+		bDragSelecting = false;
+		return FReply::Handled().ReleaseMouseCapture();
+	}
+	return SCompoundWidget::OnMouseButtonUp(MyGeometry, MouseEvent);
+}
+
+void SGitDiffView::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
+{
+	bDragSelecting = false;
+	SCompoundWidget::OnMouseCaptureLost(CaptureLostEvent);
 }
 
 float SGitDiffView::GetViewportWidth() const
@@ -534,6 +790,21 @@ void SGitDiffView::Tick(const FGeometry& AllottedGeometry, const double InCurren
 		bBuiltWrapped = GitDiff::WrapLines();
 		List->RebuildList();
 		Scroll->ScrollToStart();
+	}
+	if (bDragSelecting)
+	{
+		// Dragged past the top or the bottom, the lines scroll: faster the farther the pointer is.
+		const FGeometry& View = List->GetCachedGeometry();
+		const float Top = View.GetAbsolutePosition().Y;
+		const float Bottom = Top + View.GetAbsoluteSize().Y;
+		const float Beyond = DragY < Top ? DragY - Top : (DragY > Bottom ? DragY - Bottom : 0.0f);
+		if (Beyond != 0.0f)
+		{
+			const float LinesPerSecond = FMath::Clamp(FMath::Abs(Beyond) * 0.5f, 5.0f, 100.0f);
+			const float Offset = List->GetScrollOffset() + FMath::Sign(Beyond) * LinesPerSecond * InDeltaTime;
+			List->SetScrollOffset(FMath::Clamp(Offset, 0.0f, static_cast<float>(Lines.Num())));
+			SelectDraggedLines();
+		}
 	}
 }
 
@@ -589,6 +860,7 @@ TSharedRef<ITableRow> SGitDiffView::OnGenerateRow(FLinePtr Line, const TSharedRe
 		+ SRichTextBlock::Decorator(RemovedDecorator.ToSharedRef());
 	return SNew(STableRow<FLinePtr>, Owner)
 		.Padding(0.0f)
+		.OnDragDetected(this, &SGitDiffView::OnRowDragDetected, Line)
 		[
 			SNew(SBorder)
 			.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
@@ -634,6 +906,16 @@ TSharedPtr<SWidget> SGitDiffView::OnContextMenu()
 		return nullptr;
 	}
 	FMenuBuilder Menu(true, nullptr);
+	if (OnLineAction.IsBound() && !LineActions.IsEmpty())
+	{
+		for (const GitCore::ELineAction Action : LineActions)
+		{
+			Menu.AddMenuEntry(LineActionLabel(Action), LineActionTooltip(Action), LineActionIcon(Action),
+				FUIAction(FExecuteAction::CreateLambda([this, Action]() { RunLineAction(Action); }),
+					FCanExecuteAction::CreateSP(this, &SGitDiffView::CanRunLineAction, Action)));
+		}
+		Menu.AddMenuSeparator();
+	}
 	Menu.AddMenuEntry(LOCTEXT("CopyLines", "Copy"),
 		FText::Format(LOCTEXT("CopyLinesTooltip", "Copy the selected lines without their + and - markers. ({0})"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::C)),
 		FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
@@ -666,7 +948,30 @@ void SGitDiffView::CopySelection() const
 
 FReply SGitDiffView::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
-	if (InKeyEvent.IsControlDown() || InKeyEvent.IsCommandDown())
+	const FKey Key = InKeyEvent.GetKey();
+	const bool bControl = InKeyEvent.IsControlDown() || InKeyEvent.IsCommandDown();
+	const bool bPlain = !InKeyEvent.IsShiftDown() && !InKeyEvent.IsAltDown();
+	// Space and Ctrl+S stage or unstage the selected lines, and Delete discards them, as they do files in the lists.
+	// Without changed lines selected, the keys go on to the file.
+	const bool bStageKey = bPlain && ((Key == EKeys::SpaceBar && !bControl) || (Key == EKeys::S && bControl));
+	const bool bDiscardKey = bPlain && !bControl && (Key == EKeys::Delete || Key == EKeys::BackSpace);
+	if ((bStageKey || bDiscardKey) && bChangedLinesSelected && !LineActions.IsEmpty())
+	{
+		if (bLineActionPending)
+		{
+			// The last press is still being applied.
+			return FReply::Handled();
+		}
+		if (bStageKey && (RunLineAction(GitCore::ELineAction::Stage) || RunLineAction(GitCore::ELineAction::Unstage)))
+		{
+			return FReply::Handled();
+		}
+		if (bDiscardKey && RunLineAction(GitCore::ELineAction::Discard))
+		{
+			return FReply::Handled();
+		}
+	}
+	if (bControl)
 	{
 		if (InKeyEvent.GetKey() == EKeys::C)
 		{

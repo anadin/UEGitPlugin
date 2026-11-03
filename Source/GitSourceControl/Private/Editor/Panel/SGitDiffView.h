@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Core/GitPatch.h"
 #include "Fonts/SlateFontInfo.h"
 #include "Styling/SlateTypes.h"
 #include "Types/SlateStructs.h"
@@ -9,6 +10,7 @@
 #include "Widgets/Views/SListView.h"
 
 class ITextDecorator;
+class SOverlay;
 class SScrollBox;
 
 /** One line of a text diff, ready to show. */
@@ -46,8 +48,6 @@ namespace GitDiff
 	 * Git LFS pointers come back as a single note.
 	 */
 	TArray<TSharedPtr<FGitDiffLine>> Parse(const FString& UnifiedDiff);
-	/** A new file's content as a diff that adds every line; binary content becomes a note. */
-	FString FromNewFile(const TArray<uint8>& Bytes);
 	/** Rich text for a line: its text escaped, with the changed part in <add> or <del>. */
 	FString ToMarkup(const FGitDiffLine& Line);
 	/** Whether diffs wrap long lines; one preference for every diff view. */
@@ -55,11 +55,19 @@ namespace GitDiff
 	void SetWrapLines(bool bWrap);
 }
 
-/** A colored, line-numbered view of a text diff. Selected lines copy with Ctrl+C. */
+/**
+ * A colored, line-numbered view of a text diff. Drag over lines, or click and Shift+click, to select them; selected
+ * lines copy with Ctrl+C, and clicking a hunk's header selects the hunk. When the owner offers line actions, buttons
+ * next to the selection stage, unstage or discard its changed lines, as do Space and Delete.
+ */
 class SGitDiffView : public SCompoundWidget
 {
 public:
+	/** Stage, unstage or discard the changed lines picked in the diff shown (GetDiffText). False when nothing started (a discard the user cancelled). */
+	DECLARE_DELEGATE_RetVal_TwoParams(bool, FOnLineAction, GitCore::ELineAction, const GitCore::FLineSelection&);
+
 	SLATE_BEGIN_ARGS(SGitDiffView) {}
+		SLATE_EVENT(FOnLineAction, OnLineAction)
 	SLATE_END_ARGS()
 
 	using FLinePtr = TSharedPtr<FGitDiffLine>;
@@ -67,26 +75,70 @@ public:
 	void Construct(const FArguments& InArgs);
 	virtual bool SupportsKeyboardFocus() const override { return true; }
 	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
+	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override;
 	virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
 
-	/** Shows a unified diff. */
-	void SetDiff(const FString& UnifiedDiff);
+	/**
+	 * Shows a unified diff. The same diff again changes nothing, so a refresh keeps the selection. bKeepPosition keeps
+	 * the scroll position of a different one: the same file, reloaded after a change.
+	 */
+	void SetDiff(const FString& UnifiedDiff, bool bKeepPosition = false);
 	/** Shows a message in place of a diff (loading, nothing to compare, an error). */
 	void SetMessage(const FText& InMessage);
+	/** What the selected lines offer to do; none (the default) shows no buttons. */
+	void SetLineActions(const TArray<GitCore::ELineAction>& Actions);
+	/** The diff shown, as given to SetDiff; empty while a message shows. */
+	const FString& GetDiffText() const { return DiffText; }
+	/** The added and removed lines selected. */
+	GitCore::FLineSelection GetSelectedLines() const;
+	/** Asks the owner to apply Action to the selected lines, as its button does. False when Action is not offered or no changed line is selected. */
+	bool RunLineAction(GitCore::ELineAction Action);
 	/** Lines shown, for tests. */
 	const TArray<FLinePtr>& GetLines() const { return Lines; }
 
 private:
 	TSharedRef<ITableRow> OnGenerateRow(FLinePtr Line, const TSharedRef<STableViewBase>& Owner);
 	TSharedPtr<SWidget> OnContextMenu();
+	void OnSelectionChanged(FLinePtr Line, ESelectInfo::Type SelectInfo);
 	void CopySelection() const;
 	/** Unwrapped: wide enough for the longest line. Wrapped: the visible width. */
 	FOptionalSize GetContentWidth() const;
 	float GetViewportWidth() const;
 
+	/** Stage, Unstage and Discard buttons, shown next to the first selected line in view. */
+	TSharedRef<SWidget> MakeLineActions();
+	bool CanRunLineAction(GitCore::ELineAction Action) const;
+	EVisibility GetLineActionsVisibility() const;
+	FMargin GetLineActionsPadding() const;
+	/** Where the first selected line in view starts, down from the top of the list. */
+	TOptional<float> FindSelectedRowTop() const;
+	/** The line under a screen position: above the lines in view the first of them, below them the last. */
+	int32 FindLineAt(float ScreenY) const;
+	/** The range of lines in view, some of them possibly only partly. */
+	void GetLinesInView(int32& OutFirst, int32& OutLast) const;
+
+	/** Dragging over lines selects them, from the line the drag started on. */
+	FReply OnRowDragDetected(const FGeometry& Geometry, const FPointerEvent& MouseEvent, FLinePtr Line);
+	void SelectDraggedLines();
+
+	FOnLineAction OnLineAction;
+	TArray<GitCore::ELineAction> LineActions;
+	/** A line action was asked for and the diff has not been reloaded since: Space and Delete wait for it. */
+	bool bLineActionPending = false;
+	/** The selection holds an added or removed line. */
+	bool bChangedLinesSelected = false;
+
+	FString DiffText;
 	TArray<FLinePtr> Lines;
 	TSharedPtr<SListView<FLinePtr>> List;
 	TSharedPtr<SScrollBox> Scroll;
+	TSharedPtr<SOverlay> ListArea;
+	TSharedPtr<SWidget> LineActionsBox;
+	FLinePtr DragAnchor;
+	bool bDragSelecting = false;
+	float DragY = 0.0f;
 	FText Message;
 	FSlateFontInfo Font;
 	FTextBlockStyle TextStyle;

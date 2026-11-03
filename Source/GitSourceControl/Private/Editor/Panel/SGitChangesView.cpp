@@ -9,6 +9,7 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "HAL/PlatformApplicationMisc.h"
+#include "Misc/Paths.h"
 #include "RevisionControlStyle/RevisionControlStyle.h"
 #include "Styling/AppStyle.h"
 #include "Types/ISlateMetaData.h"
@@ -751,12 +752,24 @@ void SGitChangesView::UpdateDiff()
 	{
 		return;
 	}
-	if (!DiffKey.StartsWith(File))
+	const bool bSameFile = DiffKey.StartsWith(File);
+	if (!bSameFile)
 	{
 		DiffView->SetMessage(LOCTEXT("DiffLoading", "Loading changes…"));
 	}
 	DiffKey = Key;
-	Model->LoadDiff(Item->Path, Item->IsStagedSide(), [WeakThis = TWeakPtr<SGitChangesView>(SharedThis(this)), Key](FString&& Diff, const FString& Error)
+	// Lines can be staged from Changes and unstaged from Staged; a conflict or a submodule is resolved or staged whole.
+	TArray<GitCore::ELineAction> Actions;
+	if (!Item->Entry.bSubmodule && Item->Group == FGitChangeItem::EGroup::Unstaged)
+	{
+		Actions = {GitCore::ELineAction::Stage, GitCore::ELineAction::Discard};
+	}
+	else if (!Item->Entry.bSubmodule && Item->Group == FGitChangeItem::EGroup::Staged)
+	{
+		Actions = {GitCore::ELineAction::Unstage};
+	}
+	Model->LoadDiff(Item->Path, Item->IsStagedSide(),
+		[WeakThis = TWeakPtr<SGitChangesView>(SharedThis(this)), Key, Path = Item->Path, Actions, bSameFile](FString&& Diff, const FString& Error)
 	{
 		const TSharedPtr<SGitChangesView> Self = WeakThis.Pin();
 		if (!Self.IsValid() || Self->DiffKey != Key)
@@ -765,13 +778,36 @@ void SGitChangesView::UpdateDiff()
 		}
 		if (Error.IsEmpty())
 		{
-			Self->DiffView->SetDiff(Diff);
+			Self->DiffPath = Path;
+			Self->DiffView->SetLineActions(Actions);
+			Self->DiffView->SetDiff(Diff, bSameFile);
 		}
 		else
 		{
 			Self->DiffView->SetMessage(FText::FromString(Error));
 		}
 	});
+}
+
+bool SGitChangesView::OnDiffLineAction(GitCore::ELineAction Action, const GitCore::FLineSelection& Lines)
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	if (!Model.IsValid() || DiffPath.IsEmpty())
+	{
+		return false;
+	}
+	if (Action == GitCore::ELineAction::Discard)
+	{
+		const FText Message = FText::Format(LOCTEXT("DiscardLinesMessage",
+			"Discard your changes to the selected lines of {0}? Changes you staged stay. A copy of the file is kept in Saved/GitSourceControl/Backups."),
+			FText::FromString(FPaths::GetCleanFilename(DiffPath)));
+		if (!GitWorkspaceDialogs::Confirm(LOCTEXT("DiscardLinesTitle", "Discard lines"), Message, {}, LOCTEXT("DiscardLinesButton", "Discard")))
+		{
+			return false;
+		}
+	}
+	Model->ApplyLines(DiffPath, Action, DiffView->GetDiffText(), Lines);
+	return true;
 }
 
 FText SGitChangesView::GetAssetDiffHint() const
@@ -1645,6 +1681,8 @@ TSharedRef<SWidget> SGitChangesView::MakeInspector()
 					.Visibility_Lambda([this]() { return bDiffShown ? EVisibility::Visible : EVisibility::Collapsed; })
 					[
 						SAssignNew(DiffView, SGitDiffView)
+						.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.Diff"))
+						.OnLineAction(this, &SGitChangesView::OnDiffLineAction)
 					]
 				]
 				+ SOverlay::Slot()

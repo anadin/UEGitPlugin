@@ -16,6 +16,11 @@ namespace GitWorkers
 	/** Creates the worker for an operation name, or null when the operation is not supported. */
 	TSharedPtr<IGitSourceControlWorker, ESPMode::ThreadSafe> Create(FName OperationName);
 	bool IsSupported(FName OperationName);
+	/**
+	 * Copies files that are about to be overwritten (repository paths) into a new timestamped folder of the backup
+	 * directory, and prunes old folders. Returns the new folder, or empty when nothing was copied.
+	 */
+	FString BackUpFiles(const GitCore::FGitRepository& Repository, const TArray<FString>& Paths, const FGitCommandSettings& Settings);
 }
 
 class FGitConnectWorker final : public IGitSourceControlWorker

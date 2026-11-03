@@ -25,6 +25,132 @@ namespace GitCore
 			const FProcessResult Head = Repository.Run(ECallKind::LocalQuick, {TEXT("rev-parse"), TEXT("--verify"), TEXT("--quiet"), TEXT("HEAD")});
 			return Head.Succeeded() ? Head.StdoutText().TrimStartAndEnd() : FString();
 		}
+
+		/** One file's diff in the shape picking lines needs, whatever the user's diff settings. */
+		FProcessResult RunFileDiff(const FGitRepository& Repository, const FString& Path, bool bStaged)
+		{
+			// Empty context lines keep their space, file names their a/ and b/, and hunks three lines of context.
+			TArray<FString> Args = {TEXT("-c"), TEXT("diff.suppressBlankEmpty=false"), TEXT("diff"), TEXT("--no-ext-diff"), TEXT("--no-textconv"),
+				TEXT("--no-color"), TEXT("--no-renames"), TEXT("--unified=3"), TEXT("--src-prefix=a/"), TEXT("--dst-prefix=b/")};
+			if (bStaged)
+			{
+				Args.Add(TEXT("--cached"));
+			}
+			Args.Append({TEXT("--"), Path});
+			return Repository.Run(ECallKind::LocalScan, Args);
+		}
+
+		/** A file's lines, each with its line break. */
+		TArray<TArrayView<const uint8>> SplitLines(const TArray<uint8>& Bytes)
+		{
+			TArray<TArrayView<const uint8>> Lines;
+			for (int32 Start = 0; Start < Bytes.Num();)
+			{
+				int32 End = Start;
+				while (End < Bytes.Num() && Bytes[End] != '\n')
+				{
+					++End;
+				}
+				End = FMath::Min(End + 1, Bytes.Num());
+				Lines.Emplace(Bytes.GetData() + Start, End - Start);
+				Start = End;
+			}
+			return Lines;
+		}
+
+		/** The same line, ignoring its line break: staging may turn "\r\n" into "\n". */
+		bool SameLine(TArrayView<const uint8> A, TArrayView<const uint8> B)
+		{
+			auto Trim = [](TArrayView<const uint8> Line)
+			{
+				int32 Size = Line.Num();
+				Size -= Size > 0 && Line[Size - 1] == '\n' ? 1 : 0;
+				Size -= Size > 0 && Line[Size - 1] == '\r' ? 1 : 0;
+				return Line.Slice(0, Size);
+			};
+			A = Trim(A);
+			B = Trim(B);
+			return A.Num() == B.Num() && FMemory::Memcmp(A.GetData(), B.GetData(), A.Num()) == 0;
+		}
+
+		const TCHAR* const ChangedSinceShown = TEXT("The file changed since its lines were shown. Select them again.");
+		const TCHAR* const NotUtf8 = TEXT("Only UTF-8 text can be staged line by line. Stage the whole file instead.");
+		const TCHAR* const NothingPicked = TEXT("Select added or removed lines first.");
+
+		/** ApplyLines for a file Git does not track: its diff is its content (NewFileDiff), so its lines are numbered from 1. */
+		FOpResult ApplyNewFileLines(const FGitRepository& Repository, const FString& Path, ELineAction Action, const FString& ShownDiff,
+			const FLineSelection& Lines, const TFunction<void()>& BeforeDiscard)
+		{
+			const FString File = Repository.ToAbsolute(Path);
+			TArray<uint8> Bytes;
+			if (IFileManager::Get().FileSize(*File) > NewFileDiffLimit || !FFileHelper::LoadFileToArray(Bytes, *File, FILEREAD_Silent) ||
+				!NewFileDiff(Bytes).Equals(ShownDiff, ESearchCase::CaseSensitive))
+			{
+				return FOpResult::Failure(ChangedSinceShown);
+			}
+			if (!IsValidUtf8(Bytes.GetData(), Bytes.Num()))
+			{
+				return FOpResult::Failure(NotUtf8);
+			}
+			const TArray<TArrayView<const uint8>> FileLines = SplitLines(Bytes);
+			FLineSelection Rest;
+			TArray<uint8> Kept;
+			for (int32 Number = 1; Number <= FileLines.Num(); ++Number)
+			{
+				if (!Lines.Added.Contains(Number))
+				{
+					Rest.Added.Add(Number);
+					Kept.Append(FileLines[Number - 1].GetData(), FileLines[Number - 1].Num());
+				}
+			}
+			if (Rest.Added.Num() == FileLines.Num())
+			{
+				return FOpResult::Failure(NothingPicked);
+			}
+			if (Action == ELineAction::Discard)
+			{
+				if (BeforeDiscard)
+				{
+					BeforeDiscard();
+				}
+				// Discarding every line discards the new file, as Discard does for the whole file.
+				const bool bWritten = Rest.IsEmpty() ? IFileManager::Get().Delete(*File, false, true, true) : FFileHelper::SaveArrayToFile(Kept, *File);
+				return bWritten ? FOpResult::Success() : FOpResult::Failure(FString::Printf(TEXT("Could not change %s."), *Path));
+			}
+
+			// Staged whole, the file gets the mode, filters and line endings Git gives it; then the lines left out come back out.
+			const FOpResult Added = Repository.Stage({Path});
+			if (!Added.bOk || Rest.IsEmpty())
+			{
+				return Added;
+			}
+			auto Undo = [&Repository, &Path](const FString& Message, const FString& Details)
+			{
+				Repository.Unstage({Path});
+				return FOpResult::Failure(Message, Details);
+			};
+			const FProcessResult Blob = Repository.Run(ECallKind::LocalScan, {TEXT("cat-file"), TEXT("blob"), TEXT(":") + Path});
+			const TArray<TArrayView<const uint8>> StagedLines = SplitLines(Blob.Stdout);
+			bool bSame = Blob.Succeeded() && StagedLines.Num() == FileLines.Num();
+			for (int32 Index = 0; bSame && Index < FileLines.Num(); ++Index)
+			{
+				bSame = SameLine(StagedLines[Index], FileLines[Index]);
+			}
+			if (!bSame)
+			{
+				return Undo(TEXT("Git changes this file as it stages it (a filter, or Git LFS), so its lines cannot be staged one by one. ")
+					TEXT("Stage the whole file instead."), Blob.ErrorText());
+			}
+			const FProcessResult Staged = RunFileDiff(Repository, Path, true);
+			FString Patch;
+			FString Error;
+			if (!Staged.Succeeded() || !BuildLinePatch(Staged.StdoutText(), Rest, true, Patch, Error) || Patch.IsEmpty())
+			{
+				return Undo(TEXT("Staging the lines failed."), Error.IsEmpty() ? Staged.ErrorText() : Error);
+			}
+			const FOpResult Applied = Repository.ApplyPatch(Patch, true, true);
+			return Applied.bOk ? Applied : Undo(Applied.Message, Applied.Details);
+		}
 	}
 
 	FOpResult FGitRepository::Stage(const TArray<FString>& Paths) const
@@ -214,18 +340,83 @@ namespace GitCore
 
 	FOpResult FGitRepository::Diff(const FString& Path, bool bStaged, FString& OutText) const
 	{
-		TArray<FString> Args = {TEXT("diff"), TEXT("--no-ext-diff"), TEXT("--no-textconv"), TEXT("--no-color")};
-		if (bStaged)
-		{
-			Args.Add(TEXT("--cached"));
-		}
-		Args.Append({TEXT("--"), Path});
-		const FProcessResult Result = Run(ECallKind::LocalScan, Args);
+		const FProcessResult Result = RunFileDiff(*this, Path, bStaged);
 		if (!Result.Succeeded())
 		{
 			return FOpResult::Failure(DescribeFailure(Result, TEXT("Comparing")), Result.ErrorText());
 		}
 		OutText = Result.StdoutText();
 		return FOpResult::Success();
+	}
+
+	FOpResult FGitRepository::ApplyPatch(const FString& Patch, bool bIndex, bool bReverse) const
+	{
+		FGitCall Apply;
+		Apply.Kind = ECallKind::LocalMutate;
+		// The lines' whitespace is the user's: never warn about it, or "fix" it.
+		Apply.Args = {TEXT("apply"), TEXT("--whitespace=nowarn")};
+		if (bIndex)
+		{
+			Apply.Args.Add(TEXT("--cached"));
+		}
+		if (bReverse)
+		{
+			Apply.Args.Add(TEXT("--reverse"));
+		}
+		AppendUtf8(Apply.Stdin, Patch);
+		const FProcessResult Result = Run(Apply);
+		return Result.Succeeded() ? FOpResult::Success() : FOpResult::Failure(DescribeFailure(Result, TEXT("Applying the lines")), Result.ErrorText());
+	}
+
+	FOpResult FGitRepository::ApplyLines(const FString& Path, ELineAction Action, const FString& ShownDiff, const FLineSelection& Lines,
+		const TFunction<void()>& BeforeDiscard) const
+	{
+		if (Lines.IsEmpty())
+		{
+			return FOpResult::Failure(NothingPicked);
+		}
+		const bool bStaged = Action == ELineAction::Unstage;
+		if (!bStaged)
+		{
+			// Git has no diff of a file it does not track: what was shown is the file's content.
+			const FProcessResult Listed = Run(ECallKind::LocalQuick, {TEXT("ls-files"), TEXT("-z"), TEXT("--"), Path});
+			if (!Listed.Succeeded())
+			{
+				return FOpResult::Failure(DescribeFailure(Listed, TEXT("Reading the index")), Listed.ErrorText());
+			}
+			if (Listed.Stdout.IsEmpty())
+			{
+				return ApplyNewFileLines(*this, Path, Action, ShownDiff, Lines, BeforeDiscard);
+			}
+		}
+		const FProcessResult Fresh = RunFileDiff(*this, Path, bStaged);
+		if (!Fresh.Succeeded())
+		{
+			return FOpResult::Failure(DescribeFailure(Fresh, TEXT("Comparing")), Fresh.ErrorText());
+		}
+		if (!Fresh.StdoutText().Equals(ShownDiff, ESearchCase::CaseSensitive))
+		{
+			return FOpResult::Failure(ChangedSinceShown);
+		}
+		// Text that does not round-trip would come back into the file changed.
+		if (!IsValidUtf8(Fresh.Stdout.GetData(), Fresh.Stdout.Num()))
+		{
+			return FOpResult::Failure(NotUtf8);
+		}
+		FString Patch;
+		FString Error;
+		if (!BuildLinePatch(ShownDiff, Lines, Action != ELineAction::Stage, Patch, Error))
+		{
+			return FOpResult::Failure(Error);
+		}
+		if (Patch.IsEmpty())
+		{
+			return FOpResult::Failure(NothingPicked);
+		}
+		if (Action == ELineAction::Discard && BeforeDiscard)
+		{
+			BeforeDiscard();
+		}
+		return ApplyPatch(Patch, Action != ELineAction::Discard, Action != ELineAction::Stage);
 	}
 }

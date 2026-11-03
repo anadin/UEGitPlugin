@@ -29,6 +29,8 @@
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
 
+#include <initializer_list>
+
 namespace
 {
 	constexpr EAutomationTestFlags PanelTestFlags = EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter;
@@ -666,9 +668,9 @@ bool FGitPanelTextDiffTest::RunTest(const FString&)
 		Merge.Num() == 4 && Merge[1]->Kind == EKind::Context && Merge[2]->Kind == EKind::Added && Merge[2]->Text == TEXT("ours") && Merge[3]->Kind == EKind::Added && Merge[3]->NewLine == 3);
 
 	const FTCHARToUTF8 Utf8(TEXT("one\ntwo\n"));
-	const TArray<TSharedPtr<FGitDiffLine>> NewFile = GitDiff::Parse(GitDiff::FromNewFile(TArray<uint8>(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length())));
+	const TArray<TSharedPtr<FGitDiffLine>> NewFile = GitDiff::Parse(GitCore::NewFileDiff(TArray<uint8>(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length())));
 	TestTrue(TEXT("A new file is all added lines"), NewFile.Num() == 3 && NewFile[1]->Kind == EKind::Added && NewFile[1]->NewLine == 1 && NewFile[2]->Text == TEXT("two"));
-	const TArray<TSharedPtr<FGitDiffLine>> NewBinary = GitDiff::Parse(GitDiff::FromNewFile({0x89, 'P', 'N', 'G', 0, 1}));
+	const TArray<TSharedPtr<FGitDiffLine>> NewBinary = GitDiff::Parse(GitCore::NewFileDiff({0x89, 'P', 'N', 'G', 0, 1}));
 	TestTrue(TEXT("A new binary file is one note"), NewBinary.Num() == 1 && NewBinary[0]->Kind == EKind::Note);
 
 	// Lines are shown as rich text, so code must not read as markup.
@@ -726,6 +728,128 @@ bool FGitPanelFileDiffsTest::RunTest(const FString&)
 	TestTrue(TEXT("A file Git does not track yet shows its content"), Has(Untracked, FGitDiffLine::EKind::Added, TEXT("hello")));
 	const TArray<TSharedPtr<FGitDiffLine>> Committed = Load([&Panel, &Base](auto Done) { Panel.Model->LoadCommitDiff(Base, TEXT("a.txt"), MoveTemp(Done)); });
 	TestTrue(TEXT("A commit shows how it changed the file"), Has(Committed, FGitDiffLine::EKind::Added, TEXT("one")) && Has(Committed, FGitDiffLine::EKind::Added, TEXT("two")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelLineStagingTest, "GitWorkspace.Panel.LineStaging", PanelTestFlags)
+bool FGitPanelLineStagingTest::RunTest(const FString&)
+{
+	using GitCore::ELineAction;
+	using FLineList = SListView<SGitDiffView::FLinePtr>;
+	auto PressKey = [](const TSharedRef<SGitDiffView>& Diff, FKey Key, bool bControl = false)
+	{
+		const FModifierKeysState Keys(false, false, bControl, false, false, false, false, false, false);
+		return Diff->OnKeyDown(FGeometry(), FKeyEvent(Key, Keys, 0, false, 0, 0)).IsEventHandled();
+	};
+
+	// The diff view on its own: what is selected, and what the keys ask its owner to do.
+	TArray<TPair<ELineAction, GitCore::FLineSelection>> Asked;
+	bool bStarts = true;
+	const TSharedRef<SGitDiffView> Diff = SNew(SGitDiffView)
+		.OnLineAction_Lambda([&Asked, &bStarts](ELineAction Action, const GitCore::FLineSelection& Lines) { Asked.Emplace(Action, Lines); return bStarts; });
+	Diff->SetLineActions({ELineAction::Stage, ELineAction::Discard});
+	const FString Text = TEXT("diff --git a/a.ini b/a.ini\n--- a/a.ini\n+++ b/a.ini\n@@ -1,3 +1,3 @@\n [A]\n-One=1\n+One=one\n Two=2\n")
+		TEXT("@@ -10,2 +10,3 @@\n Nine=9\n Ten=10\n+Eleven=11\n");
+	Diff->SetDiff(Text);
+	const TSharedPtr<FLineList> List = StaticCastSharedPtr<FLineList>(FindTagged(Diff, TEXT("GitPanel.Diff.Lines")));
+	const TArray<SGitDiffView::FLinePtr>& Lines = Diff->GetLines();
+	if (!TestTrue(TEXT("The diff's lines are tagged"), List.IsValid()) || !TestEqual(TEXT("Both hunks show"), Lines.Num(), 9))
+	{
+		return false;
+	}
+	TestFalse(TEXT("Without changed lines selected, Space goes on to the file"), PressKey(Diff, EKeys::SpaceBar));
+	List->SetSelection(Lines[0], ESelectInfo::OnMouseClick);
+	const GitCore::FLineSelection Hunk = Diff->GetSelectedLines();
+	TestTrue(TEXT("Clicking a hunk's header selects its changes"), Hunk.Removed.Num() == 1 && Hunk.Removed.Contains(2) && Hunk.Added.Num() == 1 && Hunk.Added.Contains(2));
+	List->SetSelection(Lines[8], ESelectInfo::OnMouseClick);
+	TestTrue(TEXT("Space stages the selected lines"), PressKey(Diff, EKeys::SpaceBar) && Asked.Num() == 1 && Asked[0].Key == ELineAction::Stage &&
+		Asked[0].Value.Added.Num() == 1 && Asked[0].Value.Added.Contains(12) && Asked[0].Value.Removed.IsEmpty());
+	TestTrue(TEXT("Pressed again before the diff comes back, it waits"), PressKey(Diff, EKeys::SpaceBar) && Asked.Num() == 1);
+	Diff->SetDiff(Text);
+	TestEqual(TEXT("The same diff again keeps the selection"), Diff->GetSelectedLines().Added.Num(), 1);
+	TestTrue(TEXT("Ctrl+S stages too"), PressKey(Diff, EKeys::S, true) && Asked.Num() == 2 && Asked[1].Key == ELineAction::Stage);
+	Diff->SetDiff(Text);
+	bStarts = false;
+	TestTrue(TEXT("Delete asks to discard them"), PressKey(Diff, EKeys::Delete) && Asked.Num() == 3 && Asked[2].Key == ELineAction::Discard);
+	TestTrue(TEXT("After a cancelled discard the keys work at once"), PressKey(Diff, EKeys::Delete) && Asked.Num() == 4);
+	TestFalse(TEXT("Unstaging is not offered here"), Diff->RunLineAction(ELineAction::Unstage));
+	Diff->SetDiff(Text.Replace(TEXT("+Eleven=11"), TEXT("+Eleven=eleven")), true);
+	TestTrue(TEXT("A changed diff clears the selection"), Diff->GetSelectedLines().IsEmpty());
+	const FString Upper = Diff->GetDiffText().Replace(TEXT("Eleven=eleven"), TEXT("ELEVEN=ELEVEN"));
+	Diff->SetDiff(Upper, true);
+	TestEqualSensitive(TEXT("A diff that differs only in case is shown"), Diff->GetDiffText(), Upper);
+
+	// Through the Changes tab, on a repository.
+	GitTest::FFixture Fixture;
+	const FString Repo = Fixture.InitRepo();
+	GitTest::WriteFile(Repo, TEXT("Game.ini"), TEXT("[A]\nOne=1\nTwo=2\n"));
+	GitTest::CommitAll(Repo, TEXT("base"));
+	const FString Edited = TEXT("[A]\nOne=one\nTwo=2\nThree=3\n");
+	GitTest::WriteFile(Repo, TEXT("Game.ini"), Edited);
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	Panel.Refresh();
+	const TSharedRef<SGitChangesView> View = SNew(SGitChangesView, Panel.Model);
+	const TSharedPtr<SGitDiffView> PanelDiff = StaticCastSharedPtr<SGitDiffView>(FindTagged(View, TEXT("GitPanel.Changes.Diff")));
+	if (!TestTrue(TEXT("The Changes tab's diff is tagged"), PanelDiff.IsValid()))
+	{
+		return false;
+	}
+	const TSharedRef<FLineList> PanelList = StaticCastSharedRef<FLineList>(FindTagged(PanelDiff.ToSharedRef(), TEXT("GitPanel.Diff.Lines")).ToSharedRef());
+	auto Shows = [&Panel, &PanelDiff](const TCHAR* Line, bool bShown)
+	{
+		return GitTest::WaitFor([&]() { Panel.Provider->Tick(); return PanelDiff->GetDiffText().Contains(Line, ESearchCase::CaseSensitive) == bShown && !PanelDiff->GetDiffText().IsEmpty(); });
+	};
+	auto Select = [&PanelDiff, &PanelList](std::initializer_list<const TCHAR*> Texts)
+	{
+		TArray<SGitDiffView::FLinePtr> Picked;
+		for (const SGitDiffView::FLinePtr& Line : PanelDiff->GetLines())
+		{
+			for (const TCHAR* Wanted : Texts)
+			{
+				const FGitDiffLine::EKind Kind = Wanted[0] == TEXT('+') ? FGitDiffLine::EKind::Added : FGitDiffLine::EKind::Removed;
+				if (Line->Kind == Kind && Line->Text.Equals(Wanted + 1, ESearchCase::CaseSensitive))
+				{
+					Picked.Add(Line);
+				}
+			}
+		}
+		PanelList->ClearSelection();
+		PanelList->SetItemSelection(Picked, true, ESelectInfo::OnMouseClick);
+	};
+
+	View->SelectPaths({TEXT("Game.ini")});
+	TestTrue(TEXT("The file's diff shows"), Shows(TEXT("+Three=3"), true));
+	Select({TEXT("+Three=3")});
+	TestTrue(TEXT("Space in the diff is taken"), PressKey(PanelDiff.ToSharedRef(), EKeys::SpaceBar));
+	TestTrue(TEXT("and stages the line"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
+	TestEqualSensitive(TEXT("Only that line is staged"), GitTest::Git(Repo, {TEXT("cat-file"), TEXT("blob"), TEXT(":Game.ini")}).StdoutText(), FString(TEXT("[A]\nOne=1\nTwo=2\nThree=3\n")));
+	TestEqualSensitive(TEXT("The file is untouched"), GitTest::ReadFile(Repo, TEXT("Game.ini")), Edited);
+	TestTrue(TEXT("The diff comes back without it"), Shows(TEXT("+Three=3"), false) && PanelDiff->GetDiffText().Contains(TEXT("+One=one"), ESearchCase::CaseSensitive));
+
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		Select({TEXT("-One=1"), TEXT("+One=one")});
+		TestTrue(TEXT("Delete in the diff is taken"), PressKey(PanelDiff.ToSharedRef(), EKeys::Delete));
+		TestEqual(TEXT("and asks first"), Yes.Questions.Num(), 1);
+	}
+	TestTrue(TEXT("The edit is discarded"), GitTest::WaitFor([&Panel, &Repo]()
+	{
+		Panel.Provider->Tick();
+		return GitTest::ReadFile(Repo, TEXT("Game.ini")).Equals(TEXT("[A]\nOne=1\nTwo=2\nThree=3\n"), ESearchCase::CaseSensitive);
+	}));
+	TArray<FString> Backups;
+	IFileManager::Get().FindFilesRecursive(Backups, *(Repo / TEXT("Saved/GitSourceControl/Backups")), TEXT("Game.ini"), true, false);
+	TestTrue(TEXT("after a copy of the file was kept"), Backups.Num() == 1 && GitTest::ReadFile(FString(), Backups[0]).Equals(Edited, ESearchCase::CaseSensitive));
+
+	// Now the file has staged changes only: its staged diff offers Unstage.
+	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { const GitCore::FStatusEntry* Entry = Snapshot.Status.Find(TEXT("Game.ini")); return Entry && !Entry->HasUnstaged(); });
+	View->SelectPaths({TEXT("Game.ini")});
+	TestTrue(TEXT("The staged diff shows"), Shows(TEXT("+Three=3"), true) && !PanelDiff->GetDiffText().Contains(TEXT("One=one"), ESearchCase::CaseSensitive));
+	Select({TEXT("+Three=3")});
+	TestTrue(TEXT("Space unstages the line"), PressKey(PanelDiff.ToSharedRef(), EKeys::SpaceBar) &&
+		Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 0; }));
+	TestEqualSensitive(TEXT("The line stays in the file"), GitTest::ReadFile(Repo, TEXT("Game.ini")), FString(TEXT("[A]\nOne=1\nTwo=2\nThree=3\n")));
 	return true;
 }
 
@@ -912,9 +1036,26 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
 	{
 		State->Capture(TEXT("changes-diff"));
+		// Lines picked in the diff: the buttons that stage or discard them show beside the first one.
+		const TSharedPtr<SWidget> Diff = FindTagged(State->Widget.ToSharedRef(), TEXT("GitPanel.Changes.Diff"));
+		if (const TSharedPtr<SWidget> Found = Diff.IsValid() ? FindTagged(Diff.ToSharedRef(), TEXT("GitPanel.Diff.Lines")) : nullptr)
+		{
+			const TSharedPtr<SListView<SGitDiffView::FLinePtr>> Lines = StaticCastSharedPtr<SListView<SGitDiffView::FLinePtr>>(Found);
+			for (const SGitDiffView::FLinePtr& Line : Lines->GetItems())
+			{
+				if (Line->Kind == FGitDiffLine::EKind::Removed || Line->Kind == FGitDiffLine::EKind::Added)
+				{
+					Lines->SetItemSelection(Line, true, ESelectInfo::OnMouseClick);
+				}
+			}
+		}
+	}, 1.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		State->Capture(TEXT("changes-diff-lines"));
 		State->bWrapWas = GetDefault<UGitSourceControlUserSettings>()->bWrapDiffLines;
 		GetMutableDefault<UGitSourceControlUserSettings>()->bWrapDiffLines = true;
-	}, 1.5f));
+	}, 1.0f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
 	{
 		State->Capture(TEXT("changes-diff-wrapped"));

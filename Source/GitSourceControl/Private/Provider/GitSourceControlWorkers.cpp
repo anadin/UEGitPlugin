@@ -40,6 +40,34 @@ namespace GitWorkers
 	{
 		return Create(OperationName).IsValid();
 	}
+
+	FString BackUpFiles(const GitCore::FGitRepository& Repository, const TArray<FString>& Paths, const FGitCommandSettings& Settings)
+	{
+		IFileManager& Files = IFileManager::Get();
+		const FString Folder = Settings.BackupDirectory / FDateTime::UtcNow().ToString(TEXT("%Y%m%d-%H%M%S-%s"));
+		int32 Copied = 0;
+		for (const FString& Path : Paths)
+		{
+			const FString Source = Repository.ToAbsolute(Path);
+			if (Files.FileExists(*Source) && Files.FileSize(*Source) <= 256ll * 1024 * 1024)
+			{
+				Copied += Files.Copy(*(Folder / Path), *Source) == COPY_OK ? 1 : 0;
+			}
+		}
+		TArray<FString> Sets;
+		Files.FindFiles(Sets, *(Settings.BackupDirectory / TEXT("*")), false, true);
+		Sets.Sort([](const FString& A, const FString& B) { return A > B; });
+		const FDateTime Oldest = FDateTime::UtcNow() - FTimespan::FromDays(Settings.BackupDays);
+		for (int32 Index = 0; Index < Sets.Num(); ++Index)
+		{
+			const FString SetFolder = Settings.BackupDirectory / Sets[Index];
+			if (Index >= Settings.BackupsToKeep || Files.GetTimeStamp(*SetFolder) < Oldest)
+			{
+				Files.DeleteDirectory(*SetFolder, false, true);
+			}
+		}
+		return Copied > 0 ? Folder : FString();
+	}
 }
 
 namespace
@@ -168,39 +196,6 @@ namespace
 		}
 		Session.RecordLockReleased(Path);
 		OutReleased.Add(Path);
-	}
-
-	/** Copies files that are about to be overwritten into a timestamped backup folder and prunes old ones. */
-	void BackUpFiles(FGitSourceControlCommand& Command, const TArray<FString>& Paths)
-	{
-		const FGitRepository& Repository = Command.Session->GetRepository();
-		IFileManager& Files = IFileManager::Get();
-		const FString Folder = Command.Settings.BackupDirectory / FDateTime::UtcNow().ToString(TEXT("%Y%m%d-%H%M%S-%s"));
-		int32 Copied = 0;
-		for (const FString& Path : Paths)
-		{
-			const FString Source = Repository.ToAbsolute(Path);
-			if (Files.FileExists(*Source) && Files.FileSize(*Source) <= 256ll * 1024 * 1024)
-			{
-				Copied += Files.Copy(*(Folder / Path), *Source) == COPY_OK ? 1 : 0;
-			}
-		}
-		if (Copied > 0)
-		{
-			Command.AddInfo(FText::Format(LOCTEXT("BackupSaved", "A copy of the reverted files was saved in {0}."), FText::FromString(Folder)));
-		}
-		TArray<FString> Sets;
-		Files.FindFiles(Sets, *(Command.Settings.BackupDirectory / TEXT("*")), false, true);
-		Sets.Sort([](const FString& A, const FString& B) { return A > B; });
-		const FDateTime Oldest = FDateTime::UtcNow() - FTimespan::FromDays(Command.Settings.BackupDays);
-		for (int32 Index = 0; Index < Sets.Num(); ++Index)
-		{
-			const FString SetFolder = Command.Settings.BackupDirectory / Sets[Index];
-			if (Index >= Command.Settings.BackupsToKeep || Files.GetTimeStamp(*SetFolder) < Oldest)
-			{
-				Files.DeleteDirectory(*SetFolder, false, true);
-			}
-		}
 	}
 
 	bool NeedsEditorRestart(const FString& Path)
@@ -613,7 +608,11 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& Command)
 	{
 		Overwritten.Append(NewFiles);
 	}
-	BackUpFiles(Command, Overwritten);
+	const FString Backup = GitWorkers::BackUpFiles(Repository, Overwritten, Command.Settings);
+	if (!Backup.IsEmpty())
+	{
+		Command.AddInfo(FText::Format(LOCTEXT("BackupSaved", "A copy of the reverted files was saved in {0}."), FText::FromString(Backup)));
+	}
 	if (!Restore.IsEmpty() || (Operation->ShouldDeleteNewFiles() && !NewFiles.IsEmpty()))
 	{
 		const FOpResult Restored = Repository.RestorePaths(Operation->ShouldDeleteNewFiles() ? Overwritten : Restore);

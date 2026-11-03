@@ -90,6 +90,8 @@ private:
 	void OnDoubleClick(FItemPtr Item);
 	/** Shows what changed in the single selected text file, below its details. */
 	void UpdateDiff();
+	/** Stages, unstages or discards lines picked in that diff. False when the user cancelled. */
+	bool OnDiffLineAction(GitCore::ELineAction Action, const GitCore::FLineSelection& Lines);
 	/** What Compare does for the selected asset, which has no text diff. */
 	FText GetAssetDiffHint() const;
 	TSharedPtr<SWidget> OnContextMenu();
@@ -163,6 +165,8 @@ private:
 	TSharedPtr<SGitDiffView> DiffView;
 	/** The file, side and repository state of the diff shown. */
 	FString DiffKey;
+	/** The file whose diff is shown. */
+	FString DiffPath;
 	/** The selection is a text file, so the inspector shows its diff. */
 	bool bDiffShown = false;
 	/** Folders the user closed, by group and path. */

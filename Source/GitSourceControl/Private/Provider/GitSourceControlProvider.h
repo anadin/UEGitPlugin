@@ -80,13 +80,14 @@ public:
 	void SetHistory(const FString& AbsoluteFile, const TArray<GitCore::FFileRevision>& Revisions);
 	/** Until reset, Sync and its preview pull as these say instead of the user's settings (the Git panel's Pull dialog). */
 	void SetPullOptions(const TOptional<GitCore::FPullOptions>& Options) { PullOverride = Options; }
+	/** The settings a command runs with, read now (game thread). */
+	FGitCommandSettings MakeCommandSettings() const;
 
 	/** Fired on the game thread after the repository state changed (status bar, panel). */
 	DECLARE_MULTICAST_DELEGATE(FOnRepositoryChanged);
 	FOnRepositoryChanged& OnRepositoryChanged() { return RepositoryChanged; }
 
 private:
-	FGitCommandSettings MakeCommandSettings() const;
 	FGitSourceControlStateRef GetStateInternal(const FString& AbsoluteFile);
 	void RebuildState(FGitSourceControlState& State, const GitCore::FSessionSnapshot& Snapshot) const;
 	void RefreshCachedStates();

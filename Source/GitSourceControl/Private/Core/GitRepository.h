@@ -1,6 +1,7 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #pragma once
 
+#include "GitPatch.h"
 #include "GitTypes.h"
 #include "Process/GitProcess.h"
 
@@ -131,7 +132,17 @@ namespace GitCore
 		FOpResult CommitPaths(const TArray<FString>& Paths, const TArray<FString>& NewPaths, const FString& Message, FString& OutCommit) const;
 		/** Restores Paths in the index and working tree to HEAD. Paths absent from HEAD are unstaged and deleted. */
 		FOpResult RestorePaths(const TArray<FString>& Paths) const;
+		/** One file's diff, the same whatever the user's diff settings, so its lines can be picked for ApplyLines. */
 		FOpResult Diff(const FString& Path, bool bStaged, FString& OutText) const;
+		/** Applies a patch to the index (bIndex) or the working tree; bReverse undoes it instead. */
+		FOpResult ApplyPatch(const FString& Patch, bool bIndex, bool bReverse) const;
+		/**
+		 * Stages, unstages or discards some lines of a file: Lines were picked in ShownDiff, its staged diff for
+		 * Unstage and its unstaged one otherwise (from Diff, or NewFileDiff for a file Git does not track). Nothing
+		 * changes when the file's diff is no longer ShownDiff. BeforeDiscard runs just before the working tree changes.
+		 */
+		FOpResult ApplyLines(const FString& Path, ELineAction Action, const FString& ShownDiff, const FLineSelection& Lines,
+			const TFunction<void()>& BeforeDiscard = nullptr) const;
 
 		// LFS locks (GitRepositoryLocks.cpp)
 		bool ResolveLockEndpoint(const FString& Remote, FString& OutEndpoint, FString& OutError) const;
