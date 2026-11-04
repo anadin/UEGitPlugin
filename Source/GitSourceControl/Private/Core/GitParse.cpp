@@ -9,7 +9,7 @@
 
 namespace GitCore
 {
-	const TCHAR* const LogFormat = TEXT("--format=%H%x00%P%x00%an%x00%aI%x00%s");
+	const TCHAR* const LogFormat = TEXT("--format=%H%x00%P%x00%an%x00%aI%x00%B");
 	const TCHAR* const FileLogFormat = TEXT("--format=%x01%H%x00%an%x00%aI%x00%s");
 
 	bool SplitNulRecords(const TArray<uint8>& Bytes, TArray<FString>& OutRecords)
@@ -383,7 +383,12 @@ namespace GitCore
 			Commit.Oid = Fields[Index];
 			Commit.Author = Fields[Index + 2];
 			Commit.Date = Fields[Index + 3];
-			Commit.Subject = Fields[Index + 4];
+			// The summary is the message's first line. Git's own (%s) would join the whole first paragraph,
+			// which runs into the description of a message written without a blank line after its first line.
+			TArray<FString> Lines;
+			Fields[Index + 4].ParseIntoArrayLines(Lines);
+			const FString* Summary = Lines.FindByPredicate([](const FString& Line) { return !Line.TrimStartAndEnd().IsEmpty(); });
+			Commit.Subject = Summary ? Summary->TrimEnd() : FString();
 			if (!Fields[Index + 1].IsEmpty())
 			{
 				Fields[Index + 1].ParseIntoArray(Commit.Parents, TEXT(" "));

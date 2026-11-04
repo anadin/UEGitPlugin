@@ -166,6 +166,7 @@ namespace GitCore
 		FString Oid;
 		FString Author;
 		FString Date;
+		/** The first line of the message. */
 		FString Subject;
 		TArray<FString> Parents;
 	};

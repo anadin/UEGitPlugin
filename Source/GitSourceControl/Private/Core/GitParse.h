@@ -27,7 +27,7 @@ namespace GitCore
 	/** Parses the response of `git lfs lock --json` (a single lock or an array of locks). */
 	bool ParseLockResponse(const FString& Json, TArray<FLockInfo>& OutLocks, FString& OutError);
 
-	/** Format used with ParseLog: `--format=%H%x00%P%x00%an%x00%aI%x00%s` with `-z`. */
+	/** Format used with ParseLog: `--format=%H%x00%P%x00%an%x00%aI%x00%B` with `-z`. A commit's subject is its message's first line. */
 	extern const TCHAR* const LogFormat;
 	bool ParseLog(const TArray<uint8>& Bytes, TArray<FHistoryCommit>& OutCommits, FString& OutError);
 

@@ -153,6 +153,23 @@ namespace GitCore
 		}
 	}
 
+	FString TidyCommitMessage(const FString& Message)
+	{
+		TArray<FString> Lines;
+		Message.Replace(TEXT("\r\n"), TEXT("\n")).ParseIntoArray(Lines, TEXT("\n"), false);
+		int32 Leading = 0;
+		while (Leading < Lines.Num() && Lines[Leading].TrimStartAndEnd().IsEmpty())
+		{
+			++Leading;
+		}
+		Lines.RemoveAt(0, Leading);
+		if (Lines.Num() > 1 && !Lines[1].TrimStartAndEnd().IsEmpty())
+		{
+			Lines.Insert(FString(), 1);
+		}
+		return FString::Join(Lines, TEXT("\n"));
+	}
+
 	FOpResult FGitRepository::Stage(const TArray<FString>& Paths) const
 	{
 		if (Paths.IsEmpty())
@@ -211,10 +228,11 @@ namespace GitCore
 		}
 
 		// No pathspec and no implicit add: the commit is exactly the reviewed index. Hooks run.
+		// Whitespace cleanup, as git does for messages it does not open in an editor: lines starting with # stay.
 		FGitCall Commit;
 		Commit.Kind = ECallKind::Hooked;
-		Commit.Args = {TEXT("-c"), TEXT("core.editor=false"), TEXT("commit"), TEXT("--cleanup=strip"), TEXT("-F"), TEXT("-")};
-		AppendUtf8(Commit.Stdin, Message);
+		Commit.Args = {TEXT("-c"), TEXT("core.editor=false"), TEXT("commit"), TEXT("--cleanup=whitespace"), TEXT("-F"), TEXT("-")};
+		AppendUtf8(Commit.Stdin, TidyCommitMessage(Message));
 		const FProcessResult Result = Run(Commit);
 		if (!Result.Succeeded())
 		{
@@ -254,15 +272,15 @@ namespace GitCore
 		}
 
 		FScopedTempFile MessageFile;
-		if (!FFileHelper::SaveStringToFile(Message, *MessageFile.Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		if (!FFileHelper::SaveStringToFile(TidyCommitMessage(Message), *MessageFile.Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 		{
 			return FOpResult::Failure(TEXT("Could not write the commit message to a temporary file."));
 		}
 		// --only commits the working-tree content of exactly these paths and leaves any
-		// other staged entries staged. Hooks run.
+		// other staged entries staged. Hooks run. Lines starting with # stay, as in CommitIndex.
 		FGitCall Commit;
 		Commit.Kind = ECallKind::Hooked;
-		Commit.Args = {TEXT("-c"), TEXT("core.editor=false"), TEXT("commit"), TEXT("--only"), TEXT("--cleanup=strip"),
+		Commit.Args = {TEXT("-c"), TEXT("core.editor=false"), TEXT("commit"), TEXT("--only"), TEXT("--cleanup=whitespace"),
 			TEXT("-F"), MessageFile.Path, TEXT("--pathspec-from-file=-"), TEXT("--pathspec-file-nul")};
 		for (const FString& Path : Paths)
 		{

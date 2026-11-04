@@ -241,4 +241,11 @@ namespace GitCore
 
 	/** Finds a git executable: the configured path, common install locations, then PATH. */
 	FString FindGitExecutable(const FString& ConfiguredPath = FString());
+
+	/**
+	 * A commit message as typed, made ready for Git, which takes the whole first paragraph as the summary: when more
+	 * text follows the first line directly, a blank line goes between them, so the first line alone is the summary.
+	 * Blank lines before it go, and line ends become \n.
+	 */
+	FString TidyCommitMessage(const FString& Message);
 }

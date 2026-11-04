@@ -117,6 +117,8 @@ bool FGitParseHistoryTest::RunTest(const FString&)
 	TestTrue(TEXT("No partial history leaks"), Commits.IsEmpty());
 	TestFalse(TEXT("Invalid commit ids are rejected"), GitCore::ParseLog(NulRecords({TEXT("HEAD"), TEXT(""), TEXT("A"), TEXT("2026-10-06T00:00:00Z"), TEXT("s")}), Commits, Error));
 	TestFalse(TEXT("Invalid dates are rejected"), GitCore::ParseLog(NulRecords({Hash, TEXT(""), TEXT("A"), TEXT("unknown"), TEXT("s")}), Commits, Error));
+	TestTrue(TEXT("A message of several lines parses"), GitCore::ParseLog(NulRecords({Hash, TEXT(""), TEXT("A"), TEXT("2026-10-06T00:00:00Z"), TEXT("Fix the hero\nAlso the lights\n")}), Commits, Error));
+	TestEqualSensitive(TEXT("The subject is the first line"), Commits.IsEmpty() ? FString() : Commits[0].Subject, FString(TEXT("Fix the hero")));
 
 	// File history: 0x01 starts each commit; renames carry two paths.
 	TArray<uint8> FileLog;

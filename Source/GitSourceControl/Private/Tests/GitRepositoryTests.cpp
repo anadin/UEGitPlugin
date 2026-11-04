@@ -81,6 +81,55 @@ bool FGitRepositoryStagedSnapshotTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRepositoryCommitMessagesTest, "GitWorkspace.Repository.CommitMessages", RepositoryTestFlags)
+bool FGitRepositoryCommitMessagesTest::RunTest(const FString&)
+{
+	using GitCore::TidyCommitMessage;
+	TestEqualSensitive(TEXT("Text right below the first line gets a blank line above it"), TidyCommitMessage(TEXT("Fix the hero\nAlso the lights")),
+		FString(TEXT("Fix the hero\n\nAlso the lights")));
+	TestEqualSensitive(TEXT("A blank line already there stays the only one"), TidyCommitMessage(TEXT("Fix the hero\n\nAlso the lights")),
+		FString(TEXT("Fix the hero\n\nAlso the lights")));
+	TestEqualSensitive(TEXT("Windows line ends become \\n"), TidyCommitMessage(TEXT("Fix the hero\r\nAlso the lights\r\n")), FString(TEXT("Fix the hero\n\nAlso the lights\n")));
+	TestEqualSensitive(TEXT("Blank lines above the summary go"), TidyCommitMessage(TEXT("\n  \nFix the hero\nAlso")), FString(TEXT("Fix the hero\n\nAlso")));
+	TestEqualSensitive(TEXT("One line stays as it is"), TidyCommitMessage(TEXT("Fix the hero")), FString(TEXT("Fix the hero")));
+
+	// What Git records, for the Git panel's commit and for Check in.
+	GitTest::FFixture Fixture;
+	const FString Repo = Fixture.InitRepo();
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::CommitAll(Repo, TEXT("base"));
+	const GitCore::FGitRepositoryPtr Repository = GitTest::OpenRepository(*this, Repo);
+	if (!Repository.IsValid())
+	{
+		return false;
+	}
+	auto Logged = [&Repo](const TCHAR* Format) { return GitTest::Output(GitTest::Git(Repo, {TEXT("log"), TEXT("-1"), FString(TEXT("--format=")) + Format})); };
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a2\n"));
+	TestTrue(TEXT("Stage a.txt"), Repository->Stage({TEXT("a.txt")}).bOk);
+	const GitCore::FStatusSnapshot Reviewed = Status(*this, *Repository);
+	FString Commit;
+	const GitCore::FOpResult Committed = Repository->CommitIndex(TEXT("Fix the hero\nAlso the lights\n#42 is the ticket"), Reviewed.Head, Reviewed.StagedToken, Commit);
+	TestTrue(TEXT("The commit succeeds: ") + Committed.Message, Committed.bOk);
+	TestEqualSensitive(TEXT("Git's summary is the first line"), Logged(TEXT("%s")), FString(TEXT("Fix the hero")));
+	TestEqualSensitive(TEXT("The rest is the description, its # line kept"), Logged(TEXT("%b")), FString(TEXT("Also the lights\n#42 is the ticket")));
+
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a3\n"));
+	const GitCore::FOpResult Submitted = Repository->CommitPaths({TEXT("a.txt")}, {}, TEXT("#7 Fix the map\nLighting too"), Commit);
+	TestTrue(TEXT("Check in's commit succeeds: ") + Submitted.Message, Submitted.bOk);
+	TestEqualSensitive(TEXT("A summary starting with # is kept"), Logged(TEXT("%s")), FString(TEXT("#7 Fix the map")));
+	TestEqualSensitive(TEXT("Its description follows"), Logged(TEXT("%b")), FString(TEXT("Lighting too")));
+
+	// History shows the first line even for a commit made without the blank line.
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a4\n"));
+	GitTest::Git(Repo, {TEXT("commit"), TEXT("-q"), TEXT("--no-verify"), TEXT("-am"), TEXT("Old summary\nthat ran on")});
+	TArray<GitCore::FHistoryCommit> History;
+	bool bHasMore = false;
+	FString Error;
+	TestTrue(TEXT("History is read"), Repository->ReadHistory(10, History, bHasMore, Error));
+	TestEqualSensitive(TEXT("Its summary is the first line only"), History.IsEmpty() ? FString() : History[0].Subject, FString(TEXT("Old summary")));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRepositoryPathsTest, "GitWorkspace.Repository.UnbornAndLiteralPaths", RepositoryTestFlags)
 bool FGitRepositoryPathsTest::RunTest(const FString&)
 {
