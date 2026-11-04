@@ -598,8 +598,8 @@ TSharedRef<SWidget> SGitPanel::MakeMoreMenu()
 	Menu.AddMenuEntry(LOCTEXT("SubmitContent", "Check in (Submit Content)…"), LOCTEXT("SubmitContentTooltip", "Unreal's submit dialog: commit, push and release locks in one step."),
 		FSlateIcon(Style, "RevisionControl.Actions.Submit"),
 		FUIAction(FExecuteAction::CreateLambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->CheckIn(); } })));
-	Menu.AddMenuEntry(LOCTEXT("RefreshMenu", "Refresh"), LOCTEXT("RefreshMenuTooltip", "Read the working tree again. (F5)"), FSlateIcon(Style, "RevisionControl.Actions.Refresh"),
-		FUIAction(FExecuteAction::CreateSP(this, &SGitPanel::Refresh)));
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("RefreshMenu", "Refresh"), LOCTEXT("RefreshMenuTooltip", "Read the working tree again. (F5)"), FSlateIcon(Style, "RevisionControl.Actions.Refresh"),
+		FUIAction(FExecuteAction::CreateSP(this, &SGitPanel::Refresh)), GitWorkspaceText::Shortcut(EModifierKey::None, EKeys::F5));
 	Menu.AddMenuEntry(LOCTEXT("CheckLocksMenu", "Check locks"), LOCTEXT("CheckLocksMenuTooltip", "Ask the server who holds which locks."), FSlateIcon(Style, "RevisionControl.Locked"),
 		FUIAction(FExecuteAction::CreateLambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->CheckLocks(); } })));
 	Menu.AddMenuSeparator();

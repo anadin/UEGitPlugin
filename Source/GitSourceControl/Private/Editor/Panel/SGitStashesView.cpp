@@ -114,6 +114,7 @@ void SGitStashesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 					.OnGenerateRow(this, &SGitStashesView::OnGenerateRow)
 					.OnSelectionChanged(this, &SGitStashesView::OnSelected)
 					.OnContextMenuOpening(this, &SGitStashesView::OnContextMenu)
+					.OnKeyDownHandler(this, &SGitStashesView::OnStashKeyDown)
 				]
 				+ SVerticalBox::Slot()
 				.AutoHeight()
@@ -188,6 +189,7 @@ void SGitStashesView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 							.OnSetExpansionRecursive(this, &SGitStashesView::OnSetFileExpansionRecursive)
 							.OnMouseButtonDoubleClick(this, &SGitStashesView::OnFileDoubleClick)
 							.OnContextMenuOpening(this, &SGitStashesView::OnFileMenu)
+							.OnKeyDownHandler(this, &SGitStashesView::OnFileKeyDown)
 						]
 					]
 				]
@@ -450,9 +452,19 @@ TSharedPtr<SWidget> SGitStashesView::OnContextMenu()
 	Menu.AddMenuEntry(LOCTEXT("PopMenu", "Restore and delete"), LOCTEXT("PopMenuTooltip", "Bring these changes back and delete the stash."), FSlateIcon(),
 		FUIAction(FExecuteAction::CreateSP(this, &SGitStashesView::Apply, true)));
 	Menu.AddMenuSeparator();
-	Menu.AddMenuEntry(LOCTEXT("DropMenu", "Delete…"), LOCTEXT("DropMenuTooltip", "Throw these changes away."), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Delete"),
-		FUIAction(FExecuteAction::CreateSP(this, &SGitStashesView::Drop)));
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("DropMenu", "Delete…"), LOCTEXT("DropMenuTooltip", "Throw these changes away."), FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Delete"),
+		FUIAction(FExecuteAction::CreateSP(this, &SGitStashesView::Drop)), GitWorkspaceText::DeleteKey());
 	return Menu.MakeWidget();
+}
+
+TArray<FString> SGitStashesView::SelectedFilePaths() const
+{
+	TArray<FString> Paths;
+	for (const FPathItemPtr& Item : FileTree->GetSelectedItems())
+	{
+		Paths.Add(Item->Path);
+	}
+	return Paths;
 }
 
 TSharedPtr<SWidget> SGitStashesView::OnFileMenu()
@@ -462,36 +474,41 @@ TSharedPtr<SWidget> SGitStashesView::OnFileMenu()
 	{
 		return nullptr;
 	}
-	TArray<FString> ItemPaths;
-	TArray<FPathItemPtr> Folders;
-	for (const FPathItemPtr& Item : Picked)
-	{
-		ItemPaths.Add(Item->Path);
-		if (Item->bFolder)
-		{
-			Folders.Add(Item);
-		}
-	}
+	const TArray<FString> ItemPaths = SelectedFilePaths();
+	TArray<FPathItemPtr> Folders = Picked.FilterByPredicate([](const FPathItemPtr& Item) { return Item->bFolder; });
 	FMenuBuilder Menu(true, nullptr);
 	if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin())
 	{
 		GitFileTree::AddShowEntries(Menu, M.ToSharedRef(), ItemPaths);
 	}
-	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
-		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
+	GitFileTree::AddCopyPathEntry(Menu, ItemPaths);
 	if (!Folders.IsEmpty())
 	{
 		Menu.AddMenuSeparator();
-		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"),
-			FText::Format(LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FPathItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, true); } })));
-		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"),
-			FText::Format(LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FPathItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, false); } })));
+		GitFileTree::AddFolderEntries(Menu, [this, Folders](bool bExpand) { for (const FPathItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, bExpand); } });
 	}
 	return Menu.MakeWidget();
+}
+
+FReply SGitStashesView::OnStashKeyDown(const FGeometry&, const FKeyEvent& InKeyEvent)
+{
+	const bool bPlain = !InKeyEvent.IsShiftDown() && !InKeyEvent.IsAltDown() && !InKeyEvent.IsControlDown() && !InKeyEvent.IsCommandDown();
+	if (bPlain && (InKeyEvent.GetKey() == EKeys::Delete || InKeyEvent.GetKey() == EKeys::BackSpace) && Selection().IsValid())
+	{
+		Drop();
+		return FReply::Handled();
+	}
+	return FReply::Unhandled();
+}
+
+FReply SGitStashesView::OnFileKeyDown(const FGeometry&, const FKeyEvent& InKeyEvent)
+{
+	if (GitFileTree::IsCopyKey(InKeyEvent) && FileTree->GetNumItemsSelected() > 0)
+	{
+		GitFileTree::CopyPaths(SelectedFilePaths());
+		return FReply::Handled();
+	}
+	return FReply::Unhandled();
 }
 
 void SGitStashesView::StashChanges()

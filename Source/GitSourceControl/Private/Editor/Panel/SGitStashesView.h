@@ -43,6 +43,11 @@ private:
 	void OnFileDoubleClick(FPathItemPtr Item);
 	TSharedPtr<SWidget> OnContextMenu();
 	TSharedPtr<SWidget> OnFileMenu();
+	/** Delete deletes the selected stash, after asking. */
+	FReply OnStashKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent);
+	/** Ctrl+C copies the selected paths. */
+	FReply OnFileKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent);
+	TArray<FString> SelectedFilePaths() const;
 	FStashPtr Selection() const;
 	void StashChanges();
 	void Apply(bool bDrop);

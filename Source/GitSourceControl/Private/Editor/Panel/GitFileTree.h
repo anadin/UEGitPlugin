@@ -31,6 +31,14 @@ namespace GitFileTree
 	 * as folders), each only when it has something to show.
 	 */
 	void AddShowEntries(FMenuBuilder& Menu, const TSharedRef<FGitWorkspaceModel>& Model, const TArray<FString>& Paths);
+	/** Copies repository paths to the clipboard, one per line. */
+	void CopyPaths(const TArray<FString>& Paths);
+	/** Ctrl+C, or Cmd+C on macOS: every list copies what it shows with it. */
+	bool IsCopyKey(const FKeyEvent& Event);
+	/** Copy path, with its shortcut (Ctrl+C). */
+	void AddCopyPathEntry(FMenuBuilder& Menu, const TArray<FString>& Paths);
+	/** Open all inside and Close all inside for the selected folders, with their shortcuts (Shift+Right and Shift+Left). */
+	void AddFolderEntries(FMenuBuilder& Menu, TFunction<void(bool bExpand)> SetExpansionRecursive);
 
 	/**
 	 * The name cell of a row: the expander, an icon (a folder's opens with it), the name and a

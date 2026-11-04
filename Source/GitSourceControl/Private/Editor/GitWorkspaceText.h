@@ -6,7 +6,10 @@
 #include "GenericPlatform/GenericApplication.h"
 #include "InputCoreTypes.h"
 
+class FMenuBuilder;
 struct FSlateBrush;
+struct FSlateIcon;
+struct FUIAction;
 
 /** Short, localizable strings and file presentation shared by the status bar and the Git panel. */
 namespace GitWorkspaceText
@@ -29,6 +32,12 @@ namespace GitWorkspaceText
 	FText AltKey();
 	/** "Alt+click", or "Option+click" on macOS. */
 	FText AltClick();
+	/** "Space", the key that stages and unstages, as the panel's tooltips call it. */
+	FText SpaceKey();
+	/** "Delete": the Delete key, and Backspace (the key labelled delete on a Mac keyboard). */
+	FText DeleteKey();
+	/** A menu entry with its keyboard shortcut on the right, as in Unreal's own menus. */
+	void AddMenuEntry(FMenuBuilder& Menu, const FText& Label, const FText& Tooltip, const FSlateIcon& Icon, const FUIAction& Action, const FText& Keys);
 	/**
 	 * The folder a file is listed under in the Git panel: its own, without the two hash folders
 	 * World Partition puts between a level's external actors (or objects) folder and the file.

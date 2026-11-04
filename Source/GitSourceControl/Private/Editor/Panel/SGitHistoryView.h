@@ -62,6 +62,10 @@ private:
 	void UpdateFileDiff();
 	TSharedPtr<SWidget> OnCommitMenu();
 	TSharedPtr<SWidget> OnFileMenu();
+	/** Ctrl+C copies the commit id. */
+	FReply OnCommitKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent);
+	/** Ctrl+C copies the selected paths, Ctrl+D compares a file and Enter does what a double-click does. */
+	FReply OnFileKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent);
 	void CompareChange(const TSharedPtr<GitCore::FHistoryChange>& Change);
 	bool IsUnpushed(const FCommitPtr& Commit) const;
 

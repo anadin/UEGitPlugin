@@ -16,10 +16,12 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Curves/CurveFloat.h"
 #include "Framework/Application/SlateApplication.h"
+#include "HAL/PlatformApplicationMisc.h"
 #include "HAL/PlatformFileManager.h"
 #include "ImageCore.h"
 #include "ImageUtils.h"
 #include "Misc/App.h"
+#include "Misc/ScopeExit.h"
 #include "Types/ISlateMetaData.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
@@ -115,6 +117,22 @@ namespace
 			}
 		}
 		return FString();
+	}
+
+	/** Every text shown below Root, such as a menu's labels and the shortcuts beside them. */
+	TArray<FString> AllTexts(const TSharedRef<SWidget>& Root)
+	{
+		TArray<FString> Texts;
+		if (Root->GetType() == TEXT("STextBlock"))
+		{
+			Texts.Add(StaticCastSharedRef<STextBlock>(Root)->GetText().ToString());
+		}
+		FChildren* Children = Root->GetAllChildren();
+		for (int32 Index = 0; Children && Index < Children->Num(); ++Index)
+		{
+			Texts.Append(AllTexts(Children->GetChildAt(Index)));
+		}
+		return Texts;
 	}
 
 	/** What a button says, its bound label brought up to date as painting would. */
@@ -650,6 +668,97 @@ bool FGitPanelLockProgressTest::RunTest(const FString&)
 	Panel.Model->Cancel();
 	TestTrue(TEXT("The cancelled release finishes"), Panel.WaitIdle());
 	TestTrue(FString::Printf(TEXT("It stopped early (%d still locked)"), Mine()), Mine() >= 1 && Mine() < 4);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelMenuShortcutsTest, "GitWorkspace.Panel.MenuShortcuts", PanelTestFlags)
+bool FGitPanelMenuShortcutsTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Repo = Fixture.InitRepo();
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::WriteFile(Repo, TEXT("Docs/b.txt"), TEXT("b\n"));
+	GitTest::CommitAll(Repo, TEXT("base"));
+	GitTest::WriteFile(Repo, TEXT("Docs/b.txt"), TEXT("b put aside\n"));
+	GitTest::Git(Repo, {TEXT("stash"), TEXT("push"), TEXT("-q"), TEXT("-m"), TEXT("Put aside")});
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a changed\n"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	Panel.Refresh();
+	// The clipboard is the user's: put it back afterwards.
+	FString ClipboardWas;
+	FPlatformApplicationMisc::ClipboardPaste(ClipboardWas);
+	ON_SCOPE_EXIT
+	{
+		FPlatformApplicationMisc::ClipboardCopy(*ClipboardWas);
+	};
+	auto Copied = []()
+	{
+		FString Text;
+		FPlatformApplicationMisc::ClipboardPaste(Text);
+		return Text;
+	};
+	auto Press = [](const TSharedRef<SWidget>& Widget, FKey Key, bool bControl = false)
+	{
+		const FModifierKeysState Keys(false, false, bControl, false, false, false, false, false, false);
+		return Widget->OnKeyDown(FGeometry(), FKeyEvent(Key, Keys, 0, false, 0, 0)).IsEventHandled();
+	};
+	auto Texts = [](const TSharedPtr<SWidget>& Menu) { return Menu.IsValid() ? AllTexts(Menu.ToSharedRef()) : TArray<FString>(); };
+	// Unreal's menus show shortcuts in capitals.
+	auto Shown = [](const FText& Keys) { return Keys.ToString().ToUpper(); };
+	const FString Space = Shown(GitWorkspaceText::SpaceKey());
+	const FString Delete = Shown(GitWorkspaceText::DeleteKey());
+	const FString CopyKeys = Shown(GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::C));
+
+	// Menus show each entry's shortcut beside it, as Unreal's own menus do.
+	const TSharedRef<SGitChangesView> Changes = SNew(SGitChangesView, Panel.Model);
+	Changes->SelectPaths({TEXT("a.txt")});
+	const TArray<FString> ChangesMenu = Texts(Changes->OnContextMenu());
+	TestTrue(TEXT("Stage shows Space: ") + GitTest::Joined(ChangesMenu), GitTest::HasExactly(ChangesMenu, Space));
+	TestTrue(TEXT("Discard shows Delete"), GitTest::HasExactly(ChangesMenu, Delete));
+	TestTrue(TEXT("Compare shows its shortcut"), GitTest::HasExactly(ChangesMenu, Shown(GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::D))));
+	TestTrue(TEXT("Copy path shows its shortcut"), GitTest::HasExactly(ChangesMenu, CopyKeys));
+	TestTrue(TEXT("Ctrl+C is taken in the Changes tab"), Press(Changes, EKeys::C, true));
+	TestEqualSensitive(TEXT("It copies the selected path"), Copied(), FString(TEXT("a.txt")));
+
+	const TSharedRef<SGitDiffView> Diff = SNew(SGitDiffView).OnLineAction_Lambda([](GitCore::ELineAction, const GitCore::FLineSelection&) { return true; });
+	Diff->SetLineActions({GitCore::ELineAction::Stage, GitCore::ELineAction::Discard});
+	Diff->SetDiff(TEXT("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+a changed\n"));
+	const TArray<FString> DiffMenu = Texts(Diff->OnContextMenu());
+	TestTrue(TEXT("Stage lines shows Space: ") + GitTest::Joined(DiffMenu), GitTest::HasExactly(DiffMenu, Space));
+	TestTrue(TEXT("Discard lines shows Delete"), GitTest::HasExactly(DiffMenu, Delete));
+	TestTrue(TEXT("Copy shows its shortcut"), GitTest::HasExactly(DiffMenu, CopyKeys));
+	TestTrue(TEXT("Select all shows its shortcut"), GitTest::HasExactly(DiffMenu, Shown(GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::A))));
+
+	// History: Ctrl+C copies the selected commit's id.
+	const TSharedRef<SGitHistoryView> History = SNew(SGitHistoryView, Panel.Model);
+	History->RefreshIfNeeded();
+	const TSharedPtr<SListView<SGitHistoryView::FCommitPtr>> Commits = StaticCastSharedPtr<SListView<SGitHistoryView::FCommitPtr>>(FindTagged(History, TEXT("GitPanel.History.Commits")));
+	if (!TestTrue(TEXT("History lists the commit"), Commits.IsValid() && GitTest::WaitFor([&Commits]() { return !Commits->GetItems().IsEmpty(); })))
+	{
+		return false;
+	}
+	Commits->SetSelection(Commits->GetItems()[0], ESelectInfo::OnMouseClick);
+	TestTrue(TEXT("Ctrl+C is taken in the commit list"), Press(Commits.ToSharedRef(), EKeys::C, true));
+	TestEqualSensitive(TEXT("It copies the commit id"), Copied(), PanelHead(Repo));
+
+	// Stashes: Delete deletes the selected stash, after asking.
+	Panel.Provider->GetSession()->RequestStashesAndBranches();
+	TestTrue(TEXT("The stash is read"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Stashes.Num() == 1; }));
+	const TSharedRef<SGitStashesView> Stashes = SNew(SGitStashesView, Panel.Model);
+	const TSharedPtr<SListView<SGitStashesView::FStashPtr>> StashList = StaticCastSharedPtr<SListView<SGitStashesView::FStashPtr>>(FindTagged(Stashes, TEXT("GitPanel.Stashes.List")));
+	if (!TestTrue(TEXT("The stash is listed"), StashList.IsValid() && StashList->GetItems().Num() == 1))
+	{
+		return false;
+	}
+	StashList->SetSelection(StashList->GetItems()[0], ESelectInfo::OnMouseClick);
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer No(false);
+		TestTrue(TEXT("Delete is taken in the stash list"), Press(StashList.ToSharedRef(), EKeys::Delete));
+		TestEqual(TEXT("Delete asks first"), No.Questions.Num(), 1);
+	}
+	Panel.WaitIdle();
+	TestEqualSensitive(TEXT("No keeps the stash"), GitTest::Output(GitTest::Git(Repo, {TEXT("stash"), TEXT("list"), TEXT("--format=%s")})), FString(TEXT("On main: Put aside")));
 	return true;
 }
 

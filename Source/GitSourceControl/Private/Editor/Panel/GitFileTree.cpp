@@ -6,6 +6,7 @@
 #include "Provider/GitSourceControlUserSettings.h"
 
 #include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "HAL/PlatformApplicationMisc.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SCheckBox.h"
@@ -73,6 +74,39 @@ void GitFileTree::AddShowEntries(FMenuBuilder& Menu, const TSharedRef<FGitWorksp
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "ContentBrowser.ShowInExplorer"),
 			FUIAction(FExecuteAction::CreateLambda([Weak, Paths]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->Reveal(Paths); } })));
 	}
+}
+
+void GitFileTree::CopyPaths(const TArray<FString>& Paths)
+{
+	if (!Paths.IsEmpty())
+	{
+		FPlatformApplicationMisc::ClipboardCopy(*FString::Join(Paths, LINE_TERMINATOR));
+	}
+}
+
+bool GitFileTree::IsCopyKey(const FKeyEvent& Event)
+{
+	return Event.GetKey() == EKeys::C && (Event.IsControlDown() || Event.IsCommandDown()) && !Event.IsShiftDown() && !Event.IsAltDown();
+}
+
+void GitFileTree::AddCopyPathEntry(FMenuBuilder& Menu, const TArray<FString>& Paths)
+{
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("CopyPathMenu", "Copy path"), LOCTEXT("CopyPathMenuTooltip", "Copy the selected rows' repository paths, one per line."),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"), FUIAction(FExecuteAction::CreateLambda([Paths]() { CopyPaths(Paths); })),
+		GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::C));
+}
+
+void GitFileTree::AddFolderEntries(FMenuBuilder& Menu, TFunction<void(bool bExpand)> SetExpansionRecursive)
+{
+	// Shift with Right or Left does the same for the focused folder (Unreal's tree views), as Alt+click does.
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("ExpandAllMenu", "Open all inside"),
+		FText::Format(LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"), FUIAction(FExecuteAction::CreateLambda([SetExpansionRecursive]() { SetExpansionRecursive(true); })),
+		GitWorkspaceText::Shortcut(EModifierKey::Shift, EKeys::Right));
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("CollapseAllMenu", "Close all inside"),
+		FText::Format(LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"), FUIAction(FExecuteAction::CreateLambda([SetExpansionRecursive]() { SetExpansionRecursive(false); })),
+		GitWorkspaceText::Shortcut(EModifierKey::Shift, EKeys::Left));
 }
 
 TSharedRef<SWidget> GitFileTree::MakeNameCell(const TSharedRef<ITableRow>& Row, bool bFolder, const FText& Name, const FText& Note, const FSlateBrush* Icon,

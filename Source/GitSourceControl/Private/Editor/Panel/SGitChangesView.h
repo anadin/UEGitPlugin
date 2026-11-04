@@ -76,6 +76,8 @@ public:
 	FText GetFilterText() const { return FText::FromString(Filter); }
 	/** Stages or unstages a file, or every file in a folder. */
 	void ToggleStaged(const FItemPtr& Item);
+	/** The right-click menu for the selection, each entry with its shortcut; null with nothing selected. */
+	TSharedPtr<SWidget> OnContextMenu();
 
 private:
 	void OnModelChanged();
@@ -94,7 +96,6 @@ private:
 	bool OnDiffLineAction(GitCore::ELineAction Action, const GitCore::FLineSelection& Lines);
 	/** What Compare does for the selected asset, which has no text diff. */
 	FText GetAssetDiffHint() const;
-	TSharedPtr<SWidget> OnContextMenu();
 	/** One list of the Changes tab: its group (the files and their counts) and its tree. */
 	struct FPane
 	{
@@ -136,6 +137,8 @@ private:
 	TArray<FItemPtr> SelectedFilesIn(FGitChangeItem::EGroup Group) const;
 	TArray<FString> SelectedPaths(bool bStagedSide) const;
 	TArray<FString> SelectedPaths() const;
+	/** The selected rows' own paths, a folder's being the folder: what Copy path copies and the Show entries show. */
+	TArray<FString> SelectedRowPaths() const;
 	/** The single selected file; null when a folder or several items are selected. */
 	FItemPtr SingleSelection() const;
 	TArray<FItemPtr> SelectedFolders() const;

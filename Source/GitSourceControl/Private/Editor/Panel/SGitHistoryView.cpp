@@ -174,6 +174,7 @@ void SGitHistoryView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 				.OnGenerateRow(this, &SGitHistoryView::OnGenerateCommitRow)
 				.OnSelectionChanged(this, &SGitHistoryView::OnCommitSelected)
 				.OnContextMenuOpening(this, &SGitHistoryView::OnCommitMenu)
+				.OnKeyDownHandler(this, &SGitHistoryView::OnCommitKeyDown)
 				.HeaderRow
 				(
 					SNew(SHeaderRow)
@@ -352,6 +353,7 @@ void SGitHistoryView::Construct(const FArguments& InArgs, const TSharedRef<FGitW
 						.OnSelectionChanged(this, &SGitHistoryView::OnFileSelected)
 						.OnMouseButtonDoubleClick(this, &SGitHistoryView::OnFileDoubleClick)
 						.OnContextMenuOpening(this, &SGitHistoryView::OnFileMenu)
+						.OnKeyDownHandler(this, &SGitHistoryView::OnFileKeyDown)
 					]
 					+ SSplitter::Slot()
 					.Value(0.6f)
@@ -722,8 +724,8 @@ TSharedPtr<SWidget> SGitHistoryView::OnCommitMenu()
 	const FString Oid = Selected->Oid;
 	const FString Subject = Selected->Subject;
 	FMenuBuilder Menu(true, nullptr);
-	Menu.AddMenuEntry(LOCTEXT("CopyId", "Copy commit id"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
-		FUIAction(FExecuteAction::CreateLambda([Oid]() { FPlatformApplicationMisc::ClipboardCopy(*Oid); })));
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("CopyId", "Copy commit id"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
+		FUIAction(FExecuteAction::CreateLambda([Oid]() { FPlatformApplicationMisc::ClipboardCopy(*Oid); })), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::C));
 	Menu.AddMenuEntry(LOCTEXT("CopySummary", "Copy summary"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
 		FUIAction(FExecuteAction::CreateLambda([Subject]() { FPlatformApplicationMisc::ClipboardCopy(*Subject); })));
 	return Menu.MakeWidget();
@@ -749,29 +751,54 @@ TSharedPtr<SWidget> SGitHistoryView::OnFileMenu()
 	FMenuBuilder Menu(true, nullptr);
 	if (Picked.Num() == 1 && !Picked[0]->bFolder)
 	{
-		Menu.AddMenuEntry(LOCTEXT("CompareChange", "Compare with previous version"), FText::GetEmpty(),
+		GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("CompareChange", "Compare with previous version"), FText::GetEmpty(),
 			FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Actions.Diff"),
-			FUIAction(FExecuteAction::CreateLambda([this, Change = Picked[0]->Change]() { CompareChange(Change); })));
+			FUIAction(FExecuteAction::CreateLambda([this, Change = Picked[0]->Change]() { CompareChange(Change); })), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::D));
 	}
 	if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin())
 	{
 		GitFileTree::AddShowEntries(Menu, M.ToSharedRef(), ItemPaths);
 	}
-	Menu.AddMenuEntry(LOCTEXT("CopyChangePath", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
-		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
+	GitFileTree::AddCopyPathEntry(Menu, ItemPaths);
 	if (!Folders.IsEmpty())
 	{
 		Menu.AddMenuSeparator();
-		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"),
-			FText::Format(LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FFileItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, true); } })));
-		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"),
-			FText::Format(LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FFileItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, false); } })));
+		GitFileTree::AddFolderEntries(Menu, [this, Folders](bool bExpand) { for (const FFileItemPtr& Folder : Folders) { OnSetFileExpansionRecursive(Folder, bExpand); } });
 	}
 	return Menu.MakeWidget();
+}
+
+FReply SGitHistoryView::OnCommitKeyDown(const FGeometry&, const FKeyEvent& InKeyEvent)
+{
+	if (GitFileTree::IsCopyKey(InKeyEvent) && Selected.IsValid())
+	{
+		FPlatformApplicationMisc::ClipboardCopy(*Selected->Oid);
+		return FReply::Handled();
+	}
+	return FReply::Unhandled();
+}
+
+FReply SGitHistoryView::OnFileKeyDown(const FGeometry&, const FKeyEvent& InKeyEvent)
+{
+	const TArray<FFileItemPtr> Picked = FileTree->GetSelectedItems();
+	if (GitFileTree::IsCopyKey(InKeyEvent) && !Picked.IsEmpty())
+	{
+		TArray<FString> Paths;
+		for (const FFileItemPtr& Item : Picked)
+		{
+			Paths.Add(Item->Path);
+		}
+		GitFileTree::CopyPaths(Paths);
+		return FReply::Handled();
+	}
+	// As in the Changes tab: Ctrl+D compares a file, and Enter does what a double-click does.
+	const bool bCompareKey = InKeyEvent.GetKey() == EKeys::D && (InKeyEvent.IsControlDown() || InKeyEvent.IsCommandDown()) && !InKeyEvent.IsShiftDown() && !InKeyEvent.IsAltDown();
+	if (Picked.Num() == 1 && ((bCompareKey && !Picked[0]->bFolder) || InKeyEvent.GetKey() == EKeys::Enter))
+	{
+		OnFileDoubleClick(Picked[0]);
+		return FReply::Handled();
+	}
+	return FReply::Unhandled();
 }
 
 #undef LOCTEXT_NAMESPACE

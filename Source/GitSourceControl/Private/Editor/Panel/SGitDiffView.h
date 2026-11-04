@@ -97,10 +97,11 @@ public:
 	bool RunLineAction(GitCore::ELineAction Action);
 	/** Lines shown, for tests. */
 	const TArray<FLinePtr>& GetLines() const { return Lines; }
+	/** The right-click menu, each entry with its shortcut; null while no diff shows. */
+	TSharedPtr<SWidget> OnContextMenu();
 
 private:
 	TSharedRef<ITableRow> OnGenerateRow(FLinePtr Line, const TSharedRef<STableViewBase>& Owner);
-	TSharedPtr<SWidget> OnContextMenu();
 	void OnSelectionChanged(FLinePtr Line, ESelectInfo::Type SelectInfo);
 	void CopySelection() const;
 	/** Unwrapped: wide enough for the longest line. Wrapped: the visible width. */

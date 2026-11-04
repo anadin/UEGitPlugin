@@ -241,6 +241,7 @@ void SGitLocksView::Construct(const FArguments& InArgs, const TSharedRef<FGitWor
 			.OnSetExpansionRecursive(this, &SGitLocksView::OnSetExpansionRecursive)
 			.OnMouseButtonDoubleClick(this, &SGitLocksView::OnDoubleClick)
 			.OnContextMenuOpening(this, &SGitLocksView::OnContextMenu)
+			.OnKeyDownHandler(this, &SGitLocksView::OnKeyDownInList)
 			.HeaderRow
 			(
 				SNew(SHeaderRow)
@@ -467,16 +468,8 @@ TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 	}
 	const bool bAnyMine = Selected.ContainsByPredicate([](const TSharedPtr<GitCore::FLockInfo>& Lock) { return Lock->bOurs; });
 	const bool bAnyTheirs = Selected.ContainsByPredicate([](const TSharedPtr<GitCore::FLockInfo>& Lock) { return !Lock->bOurs; });
-	TArray<FString> ItemPaths;
-	TArray<FItemPtr> Folders;
-	for (const FItemPtr& Item : Tree->GetSelectedItems())
-	{
-		ItemPaths.Add(Item->Path);
-		if (Item->bFolder)
-		{
-			Folders.Add(Item);
-		}
-	}
+	const TArray<FString> ItemPaths = SelectedRowPaths();
+	const TArray<FItemPtr> Folders = Tree->GetSelectedItems().FilterByPredicate([](const FItemPtr& Item) { return Item->bFolder; });
 	FMenuBuilder Menu(true, nullptr);
 	if (Selected.ContainsByPredicate([this](const TSharedPtr<GitCore::FLockInfo>& Lock) { return IsElsewhere(*Lock); }))
 	{
@@ -498,21 +491,33 @@ TSharedPtr<SWidget> SGitLocksView::OnContextMenu()
 	{
 		GitFileTree::AddShowEntries(Menu, Model.ToSharedRef(), ItemPaths);
 	}
-	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
-		FUIAction(FExecuteAction::CreateLambda([ItemPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(ItemPaths, LINE_TERMINATOR)); })));
+	GitFileTree::AddCopyPathEntry(Menu, ItemPaths);
 	if (!Folders.IsEmpty())
 	{
 		Menu.AddMenuSeparator();
-		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"),
-			FText::Format(LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, true); } })));
-		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"),
-			FText::Format(LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, false); } })));
+		GitFileTree::AddFolderEntries(Menu, [this, Folders](bool bExpand) { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, bExpand); } });
 	}
 	return Menu.MakeWidget();
+}
+
+TArray<FString> SGitLocksView::SelectedRowPaths() const
+{
+	TArray<FString> Paths;
+	for (const FItemPtr& Item : Tree->GetSelectedItems())
+	{
+		Paths.Add(Item->Path);
+	}
+	return Paths;
+}
+
+FReply SGitLocksView::OnKeyDownInList(const FGeometry&, const FKeyEvent& InKeyEvent)
+{
+	if (GitFileTree::IsCopyKey(InKeyEvent) && Tree->GetNumItemsSelected() > 0)
+	{
+		GitFileTree::CopyPaths(SelectedRowPaths());
+		return FReply::Handled();
+	}
+	return FReply::Unhandled();
 }
 
 void SGitLocksView::Release(bool bForce)

@@ -4,6 +4,7 @@
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Framework/Commands/InputChord.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "RevisionControlStyle/RevisionControlStyle.h"
@@ -128,6 +129,21 @@ namespace GitWorkspaceText
 	FText AltClick()
 	{
 		return FText::Format(LOCTEXT("AltClick", "{0}+click"), AltKey());
+	}
+
+	FText SpaceKey()
+	{
+		return LOCTEXT("SpaceKey", "Space");
+	}
+
+	FText DeleteKey()
+	{
+		return LOCTEXT("DeleteKey", "Delete");
+	}
+
+	void AddMenuEntry(FMenuBuilder& Menu, const FText& Label, const FText& Tooltip, const FSlateIcon& Icon, const FUIAction& Action, const FText& Keys)
+	{
+		Menu.AddMenuEntry(Label, Tooltip, Icon, Action, NAME_None, EUserInterfaceActionType::Button, NAME_None, Keys);
 	}
 }
 

@@ -93,16 +93,16 @@ Switching branches and restoring stashes refuse to overwrite local edits, downlo
 | --- | --- |
 | Ctrl+F | Search the current tab |
 | Space or Ctrl+S | Stage or unstage the selected files, or the selected lines of a diff |
-| Enter / double-click | Compare an edited file, or open a new one; open or close a folder |
+| Enter / double-click | Compare an edited file (in History, a commit's file), or open a new one; open or close a folder |
 | Left / Right | Close or open a folder (with Shift: everything in it) |
-| Ctrl+D | Compare with the last commit, in its own window |
-| Ctrl+C | Copy the selected lines of a diff |
-| Delete | Discard changes to the selected files, or to the selected lines of a diff |
+| Ctrl+D | Compare with the last commit (in History, with the version before the commit), in its own window |
+| Ctrl+C | Copy the selected lines of a diff, the selected files' paths, or the selected commit's id |
+| Delete | Discard changes to the selected files, or to the selected lines of a diff; delete the selected stash (both ask first) |
 | Ctrl+Enter | Commit (Ctrl+Shift+Enter: commit and push) |
 | F5 | Refresh |
 | Ctrl+1 … Ctrl+4 | Changes, History, Stashes, Locks |
 
-On macOS, use Cmd instead of Ctrl.
+On macOS, use Cmd instead of Ctrl. Right-click menus show each entry's shortcut beside it.
 
 ## Settings
 

@@ -51,6 +51,9 @@ private:
 	void OnSetExpansionRecursive(FItemPtr Item, bool bExpand);
 	void OnDoubleClick(FItemPtr Item);
 	TSharedPtr<SWidget> OnContextMenu();
+	/** Ctrl+C copies the selected paths. */
+	FReply OnKeyDownInList(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent);
+	TArray<FString> SelectedRowPaths() const;
 	/** Selected locks, and the locks in selected folders. */
 	TArray<TSharedPtr<GitCore::FLockInfo>> SelectedLocks() const;
 	void Release(bool bForce);

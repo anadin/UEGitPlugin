@@ -910,18 +910,20 @@ TSharedPtr<SWidget> SGitDiffView::OnContextMenu()
 	{
 		for (const GitCore::ELineAction Action : LineActions)
 		{
-			Menu.AddMenuEntry(LineActionLabel(Action), LineActionTooltip(Action), LineActionIcon(Action),
+			GitWorkspaceText::AddMenuEntry(Menu, LineActionLabel(Action), LineActionTooltip(Action), LineActionIcon(Action),
 				FUIAction(FExecuteAction::CreateLambda([this, Action]() { RunLineAction(Action); }),
-					FCanExecuteAction::CreateSP(this, &SGitDiffView::CanRunLineAction, Action)));
+					FCanExecuteAction::CreateSP(this, &SGitDiffView::CanRunLineAction, Action)),
+				Action == GitCore::ELineAction::Discard ? GitWorkspaceText::DeleteKey() : GitWorkspaceText::SpaceKey());
 		}
 		Menu.AddMenuSeparator();
 	}
-	Menu.AddMenuEntry(LOCTEXT("CopyLines", "Copy"),
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("CopyLines", "Copy"),
 		FText::Format(LOCTEXT("CopyLinesTooltip", "Copy the selected lines without their + and - markers. ({0})"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::C)),
 		FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
-		FUIAction(FExecuteAction::CreateSP(this, &SGitDiffView::CopySelection), FCanExecuteAction::CreateLambda([this]() { return List->GetNumItemsSelected() > 0; })));
-	Menu.AddMenuEntry(LOCTEXT("SelectAllLines", "Select all"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.SelectAll"),
-		FUIAction(FExecuteAction::CreateLambda([this]() { List->SetItemSelection(Lines, true); })));
+		FUIAction(FExecuteAction::CreateSP(this, &SGitDiffView::CopySelection), FCanExecuteAction::CreateLambda([this]() { return List->GetNumItemsSelected() > 0; })),
+		GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::C));
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("SelectAllLines", "Select all"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.SelectAll"),
+		FUIAction(FExecuteAction::CreateLambda([this]() { List->SetItemSelection(Lines, true); })), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::A));
 	Menu.AddMenuSeparator();
 	Menu.AddMenuEntry(LOCTEXT("WrapLinesMenu", "Wrap lines"), LOCTEXT("WrapLinesMenuTooltip", "Wrap long lines instead of scrolling sideways."), FSlateIcon(),
 		FUIAction(FExecuteAction::CreateLambda([]() { GitDiff::SetWrapLines(!GitDiff::WrapLines()); }), FCanExecuteAction(),

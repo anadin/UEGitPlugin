@@ -901,6 +901,16 @@ TArray<FString> SGitChangesView::SelectedPaths() const
 	return Paths;
 }
 
+TArray<FString> SGitChangesView::SelectedRowPaths() const
+{
+	TArray<FString> Paths;
+	for (const FItemPtr& Item : SelectedItems())
+	{
+		Paths.AddUnique(Item->Path);
+	}
+	return Paths;
+}
+
 SGitChangesView::FItemPtr SGitChangesView::SingleSelection() const
 {
 	const TArray<FItemPtr> Picked = SelectedItems();
@@ -1112,25 +1122,26 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	Menu.BeginSection("Stage", LOCTEXT("StageSection", "Commit"));
 	if (bAnyUnstaged)
 	{
-		Menu.AddMenuEntry(LOCTEXT("StageMenu", "Stage"), FText::Format(LOCTEXT("StageMenuTooltip", "Include these changes in the next commit. (Space or {0})"), StageShortcut()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::StageSelection)));
+		GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("StageMenu", "Stage"), FText::Format(LOCTEXT("StageMenuTooltip", "Include these changes in the next commit. (Space or {0})"), StageShortcut()),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::StageSelection)), GitWorkspaceText::SpaceKey());
 	}
 	if (bAnyStaged)
 	{
-		Menu.AddMenuEntry(LOCTEXT("UnstageMenu", "Unstage"), FText::Format(LOCTEXT("UnstageMenuTooltip", "Leave these changes out of the next commit. (Space or {0})"), StageShortcut()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Minus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::UnstageSelection)));
+		GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("UnstageMenu", "Unstage"), FText::Format(LOCTEXT("UnstageMenuTooltip", "Leave these changes out of the next commit. (Space or {0})"), StageShortcut()),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Minus"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::UnstageSelection)), GitWorkspaceText::SpaceKey());
 	}
-	Menu.AddMenuEntry(LOCTEXT("DiscardMenu", "Discard changes…"), LOCTEXT("DiscardMenuTooltip", "Go back to the last committed version. (Delete)"),
-		FSlateIcon(StyleName, "RevisionControl.Actions.Revert"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::DiscardSelection)));
+	GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("DiscardMenu", "Discard changes…"), LOCTEXT("DiscardMenuTooltip", "Go back to the last committed version. (Delete)"),
+		FSlateIcon(StyleName, "RevisionControl.Actions.Revert"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::DiscardSelection)), GitWorkspaceText::DeleteKey());
 	Menu.EndSection();
 
 	Menu.BeginSection("Inspect", LOCTEXT("InspectSection", "Inspect"));
 	if (Single.IsValid())
 	{
 		const FString Path = Single->Entry.Path;
-		Menu.AddMenuEntry(LOCTEXT("DiffMenu", "Compare with last commit"),
+		GitWorkspaceText::AddMenuEntry(Menu, LOCTEXT("DiffMenu", "Compare with last commit"),
 			FText::Format(LOCTEXT("DiffMenuTooltip", "Show what changed. ({0})"), GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::D)),
-			FSlateIcon(StyleName, "RevisionControl.Actions.Diff"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::DiffSelection)));
+			FSlateIcon(StyleName, "RevisionControl.Actions.Diff"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::DiffSelection)),
+			GitWorkspaceText::Shortcut(EModifierKey::Control, EKeys::D));
 		Menu.AddMenuEntry(LOCTEXT("HistoryMenu", "Show history"), LOCTEXT("HistoryMenuTooltip", "Earlier versions of this asset."),
 			FSlateIcon(StyleName, "RevisionControl.Actions.History"),
 			FUIAction(FExecuteAction::CreateLambda([Weak = WeakModel, Path]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->ShowHistory(Path); } }),
@@ -1139,28 +1150,15 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.OpenInExternalEditor"),
 			FUIAction(FExecuteAction::CreateLambda([Weak = WeakModel, Path]() { if (const TSharedPtr<FGitWorkspaceModel> M = Weak.Pin()) { M->OpenFile(Path); } })));
 	}
-	// Selected folders stand for themselves here, not for the files in them.
-	TArray<FString> RowPaths;
-	for (const FItemPtr& Item : SelectedItems())
-	{
-		RowPaths.AddUnique(Item->Path);
-	}
+	const TArray<FString> RowPaths = SelectedRowPaths();
 	GitFileTree::AddShowEntries(Menu, Model.ToSharedRef(), RowPaths);
-	Menu.AddMenuEntry(LOCTEXT("CopyPathMenu", "Copy path"), FText::GetEmpty(), FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
-		FUIAction(FExecuteAction::CreateLambda([RowPaths]() { FPlatformApplicationMisc::ClipboardCopy(*FString::Join(RowPaths, LINE_TERMINATOR)); })));
+	GitFileTree::AddCopyPathEntry(Menu, RowPaths);
 	Menu.EndSection();
 
 	if (!Folders.IsEmpty())
 	{
 		Menu.BeginSection("Folders", LOCTEXT("FoldersSection", "Folders"));
-		Menu.AddMenuEntry(LOCTEXT("ExpandAllMenu", "Open all inside"),
-			FText::Format(LOCTEXT("ExpandAllMenuTooltip", "Open these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderOpen"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, true); } })));
-		Menu.AddMenuEntry(LOCTEXT("CollapseAllMenu", "Close all inside"),
-			FText::Format(LOCTEXT("CollapseAllMenuTooltip", "Close these folders and every folder in them. ({0})"), GitWorkspaceText::AltClick()),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.FolderClosed"),
-			FUIAction(FExecuteAction::CreateLambda([this, Folders]() { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, false); } })));
+		GitFileTree::AddFolderEntries(Menu, [this, Folders](bool bExpand) { for (const FItemPtr& Folder : Folders) { OnSetExpansionRecursive(Folder, bExpand); } });
 		Menu.EndSection();
 	}
 
@@ -1209,6 +1207,11 @@ FReply SGitChangesView::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& 
 	if ((Key == EKeys::Delete || Key == EKeys::BackSpace) && !SelectedFiles().IsEmpty())
 	{
 		DiscardSelection();
+		return FReply::Handled();
+	}
+	if (GitFileTree::IsCopyKey(InKeyEvent) && !bTyping && !SelectedItems().IsEmpty())
+	{
+		GitFileTree::CopyPaths(SelectedRowPaths());
 		return FReply::Handled();
 	}
 	if (Key == EKeys::Enter)
