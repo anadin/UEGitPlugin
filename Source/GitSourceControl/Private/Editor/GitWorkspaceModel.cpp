@@ -346,6 +346,10 @@ FGitWorkspaceModel::~FGitWorkspaceModel()
 	{
 		BoundProvider->OnRepositoryChanged().Remove(RepositoryChangedHandle);
 	}
+	if (ProgressTicker.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ProgressTicker);
+	}
 }
 
 FGitSourceControlProvider& FGitWorkspaceModel::GetProvider() const
@@ -400,11 +404,25 @@ bool FGitWorkspaceModel::IsBusy() const
 	return !Activity.IsEmpty() && ActivitySession.IsValid();
 }
 
+FText FGitWorkspaceModel::GetActivity() const
+{
+	GitCore::FLockProgressPtr Progress = ActivityProgress;
+	if (!Progress.IsValid() && ActivityOperation.IsValid())
+	{
+		Progress = GetProvider().FindProgress(ActivityOperation.ToSharedRef());
+	}
+	return Progress.IsValid() && Progress->Total > 1 ? FGitProgressBar::Describe(*Progress) : Activity;
+}
+
 void FGitWorkspaceModel::Cancel()
 {
 	if (ActivityCancel.IsValid())
 	{
 		ActivityCancel->Cancel();
+	}
+	if (ActivityOperation.IsValid())
+	{
+		GetProvider().CancelOperation(ActivityOperation.ToSharedRef());
 	}
 }
 
@@ -419,7 +437,7 @@ void FGitWorkspaceModel::OnRepositoryChanged()
 	Changed.Broadcast();
 }
 
-bool FGitWorkspaceModel::Run(const FText& InActivity, ELane Lane, FWork Work, FDone Done, bool bQuietSuccess)
+bool FGitWorkspaceModel::Run(const FText& InActivity, ELane Lane, FWork Work, FDone Done, bool bQuietSuccess, GitCore::FLockProgressPtr Progress)
 {
 	const GitCore::FGitSessionPtr Session = GetSession();
 	if (!Session.IsValid() || IsBusy())
@@ -429,6 +447,20 @@ bool FGitWorkspaceModel::Run(const FText& InActivity, ELane Lane, FWork Work, FD
 	Activity = InActivity;
 	ActivitySession = Session;
 	ActivityCancel = MakeShared<GitCore::FCancelToken, ESPMode::ThreadSafe>();
+	ActivityProgress = Progress;
+	if (Progress.IsValid())
+	{
+		ProgressTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak = AsWeak()](float)
+		{
+			const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin();
+			if (Self.IsValid() && Self->ActivityProgress.IsValid())
+			{
+				Self->ProgressBar.Update(*Self->ActivityProgress);
+				return true;
+			}
+			return false;
+		}), 0.1f);
+	}
 	LastFailure.Reset();
 	Changed.Broadcast();
 	auto Task = [Weak = AsWeak(), Session, Cancel = ActivityCancel, Work = MoveTemp(Work), Done = MoveTemp(Done), bQuietSuccess]() mutable
@@ -482,11 +514,40 @@ void FGitWorkspaceModel::RunQuick(FWork Work)
 	});
 }
 
-void FGitWorkspaceModel::Finish(const FGitActionResult& Result, bool bQuietSuccess)
+void FGitWorkspaceModel::EndActivity()
 {
 	Activity = FText::GetEmpty();
 	ActivitySession.Reset();
 	ActivityCancel.Reset();
+	ActivityOperation.Reset();
+	ActivityProgress.Reset();
+	ProgressBar.Close();
+	if (ProgressTicker.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ProgressTicker);
+		ProgressTicker.Reset();
+	}
+}
+
+void FGitWorkspaceModel::OnOperationComplete(const FSourceControlOperationRef& Operation, ECommandResult::Type Result)
+{
+	if (ActivityOperation.Get() != &Operation.Get())
+	{
+		return;
+	}
+	EndActivity();
+	// The provider has shown the outcome; the panel's banner keeps a failure.
+	const TArray<FText>& Errors = Operation->GetResultInfo().ErrorMessages;
+	if (Result == ECommandResult::Failed && !Errors.IsEmpty())
+	{
+		LastFailure = FGitActionResult::Failure(Errors[0]);
+	}
+	Changed.Broadcast();
+}
+
+void FGitWorkspaceModel::Finish(const FGitActionResult& Result, bool bQuietSuccess)
+{
+	EndActivity();
 	if (!Result.bOk)
 	{
 		LastFailure = Result;
@@ -869,46 +930,75 @@ void FGitWorkspaceModel::Lock(const TArray<FString>& Paths)
 	{
 		Files.Add(ToAbsolute(Path));
 	}
-	if (IsActive() && !Files.IsEmpty())
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid() || Files.IsEmpty())
 	{
-		GetProvider().Execute(ISourceControlOperation::Create<FCheckOut>(), Files, EConcurrency::Asynchronous);
+		return;
 	}
+	const FSourceControlOperationRef Operation = ISourceControlOperation::Create<FCheckOut>();
+	if (IsBusy())
+	{
+		// It queues behind the running action; the status bar still shows its progress.
+		GetProvider().Execute(Operation, Files, EConcurrency::Asynchronous);
+		return;
+	}
+	Activity = LOCTEXT("Locking", "Locking…");
+	ActivitySession = Session;
+	ActivityOperation = Operation;
+	LastFailure.Reset();
+	Changed.Broadcast();
+	GetProvider().Execute(Operation, Files, EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateSP(this, &FGitWorkspaceModel::OnOperationComplete));
 }
 
 void FGitWorkspaceModel::Unlock(const TArray<FString>& Paths, bool bForce)
 {
-	Run(LOCTEXT("Unlocking", "Releasing locks…"), ELane::Mutation, [Paths, bForce](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	const GitCore::FLockProgressRef Progress = MakeShared<GitCore::FLockProgress, ESPMode::ThreadSafe>();
+	Run(LOCTEXT("Unlocking", "Releasing locks…"), ELane::Mutation, [Paths, bForce, Progress](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
 	{
 		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
 		const FString Remote = Session.ResolveLockRemote();
-		TArray<FString> Released;
-		TArray<FString> Failed;
-		FString Details;
+		TArray<GitCore::FLockInfo> Locks;
 		for (const FString& Path : Paths)
 		{
 			const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Path);
-			if (!Lock || (!Lock->bOurs && !bForce))
+			if (Lock && (Lock->bOurs || bForce))
 			{
-				continue;
+				Locks.Add(*Lock);
 			}
-			const GitCore::FOpResult Result = Session.GetRepository().Unlock(Remote, Lock->Id, !Lock->bOurs);
+		}
+		Progress->Start(Locks.Num(), true);
+		TArray<FString> Released;
+		TArray<FString> Failed;
+		FString Details;
+		for (const GitCore::FLockInfo& Lock : Locks)
+		{
+			if (Cancel.IsValid() && Cancel->IsCancelled())
+			{
+				break;
+			}
+			const GitCore::FOpResult Result = Session.GetRepository().Unlock(Remote, Lock.Id, !Lock.bOurs);
 			if (Result.bOk)
 			{
-				Session.RecordLockReleased(Path);
-				Released.Add(Path);
+				Session.RecordLockReleased(Lock.Path);
+				Released.Add(Lock.Path);
 			}
 			else
 			{
-				Failed.Add(Path);
+				Failed.Add(Lock.Path);
 				Details += Result.Message + TEXT("\n") + Result.Details + TEXT("\n");
 			}
+			++Progress->Done;
 		}
 		if (!Failed.IsEmpty())
 		{
 			return FGitActionResult::Failure(FText::Format(LOCTEXT("UnlockFailed", "Could not release the lock on {0}."), GitWorkspaceText::FileList(Failed)), Details);
 		}
+		if (Progress->Done < Locks.Num())
+		{
+			return FGitActionResult::Success(FText::Format(LOCTEXT("UnlockStopped", "Stopped after releasing {0} of {1} locks."), Released.Num(), Locks.Num()));
+		}
 		return FGitActionResult::Success(FText::Format(LOCTEXT("Unlocked", "Released {0} {0}|plural(one=lock,other=locks)."), Released.Num()));
-	});
+	}, nullptr, false, Progress);
 }
 
 void FGitWorkspaceModel::ClaimLocks(const TArray<FString>& Paths)

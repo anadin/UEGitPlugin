@@ -7,11 +7,35 @@
 
 #include "CoreMinimal.h"
 #include "Core/GitSession.h"
+#include "Framework/Notifications/NotificationManager.h"
 #include "HAL/ThreadSafeBool.h"
 #include "ISourceControlProvider.h"
 
 class FGitSourceControlProvider;
 class IGitSourceControlWorker;
+
+/**
+ * The progress bar Unreal's status bar shows for locking or releasing two or more files. It appears
+ * after a few seconds, so quick work never shows one. Game thread only.
+ */
+class FGitProgressBar
+{
+public:
+	FGitProgressBar() = default;
+	FGitProgressBar(const FGitProgressBar&) = delete;
+	FGitProgressBar& operator=(const FGitProgressBar&) = delete;
+	~FGitProgressBar() { Close(); }
+
+	/** "Locking files: 3 of 12", or "Releasing locks: 3 of 12". */
+	static FText Describe(const GitCore::FLockProgress& Progress);
+	/** Starts the bar once Progress counts two or more files, then keeps it up to date. */
+	void Update(const GitCore::FLockProgress& Progress);
+	void Close();
+
+private:
+	FProgressNotificationHandle Handle;
+	int32 Shown = -1;
+};
 
 /** Settings captured on the game thread when a command is created. */
 struct FGitCommandSettings
@@ -53,6 +77,10 @@ public:
 	/** The editor passed directories or no files: the operation covers the whole repository. */
 	bool bWholeRepository = false;
 	GitCore::FCancelTokenPtr Cancel;
+	/** Counted by workers that take or release the locks of several files. */
+	GitCore::FLockProgressRef Progress;
+	/** Shows Progress in the status bar; the provider updates it on the game thread. */
+	FGitProgressBar ProgressBar;
 
 	bool bSucceeded = false;
 	TArray<FText> InfoMessages;

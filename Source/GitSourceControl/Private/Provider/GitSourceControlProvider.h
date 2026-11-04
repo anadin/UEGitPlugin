@@ -82,6 +82,8 @@ public:
 	void SetPullOptions(const TOptional<GitCore::FPullOptions>& Options) { PullOverride = Options; }
 	/** The settings a command runs with, read now (game thread). */
 	FGitCommandSettings MakeCommandSettings() const;
+	/** How far the asynchronous command running Operation has got with locks, while it is queued or running; null otherwise. */
+	GitCore::FLockProgressPtr FindProgress(const FSourceControlOperationRef& InOperation) const;
 
 	/** Fired on the game thread after the repository state changed (status bar, panel). */
 	DECLARE_MULTICAST_DELEGATE(FOnRepositoryChanged);

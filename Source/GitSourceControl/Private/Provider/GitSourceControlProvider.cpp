@@ -185,6 +185,7 @@ void FGitSourceControlProvider::Close()
 	const TArray<FGitSourceControlCommandRef> Unfinished = MoveTemp(PendingCommands);
 	for (const FGitSourceControlCommandRef& Command : Unfinished)
 	{
+		Command->ProgressBar.Close();
 		Command->CompleteDelegate.ExecuteIfBound(Command->Operation, Command->bDone && Command->bSucceeded ? ECommandResult::Succeeded : ECommandResult::Cancelled);
 	}
 	if (PackageSavedHandle.IsValid())
@@ -573,6 +574,7 @@ ECommandResult::Type FGitSourceControlProvider::WaitForCommand(const FGitSourceC
 		FScopedSourceControlProgress Progress(Command->Operation->GetInProgressString(), FSimpleDelegate::CreateLambda([Cancel]() { Cancel->Cancel(); }));
 		while (!Command->bDone)
 		{
+			Command->ProgressBar.Update(*Command->Progress);
 			Progress.Tick();
 			FPlatformProcess::Sleep(0.01f);
 		}
@@ -587,6 +589,7 @@ ECommandResult::Type FGitSourceControlProvider::WaitForCommand(const FGitSourceC
 
 void FGitSourceControlProvider::FinishCommand(FGitSourceControlCommand& Command)
 {
+	Command.ProgressBar.Close();
 	Command.Worker->UpdateStates(Command, *this);
 	RefreshCachedStates();
 
@@ -652,8 +655,22 @@ void FGitSourceControlProvider::CancelOperation(const FSourceControlOperationRef
 	}
 }
 
+GitCore::FLockProgressPtr FGitSourceControlProvider::FindProgress(const FSourceControlOperationRef& InOperation) const
+{
+	const FGitSourceControlCommandRef* Command = PendingCommands.FindByPredicate([&InOperation](const FGitSourceControlCommandRef& Each) { return Each->Operation == InOperation; });
+	if (Command)
+	{
+		return (*Command)->Progress;
+	}
+	return nullptr;
+}
+
 void FGitSourceControlProvider::Tick()
 {
+	for (const FGitSourceControlCommandRef& Command : PendingCommands)
+	{
+		Command->ProgressBar.Update(*Command->Progress);
+	}
 	for (int32 Index = 0; Index < PendingCommands.Num(); ++Index)
 	{
 		if (PendingCommands[Index]->bDone)

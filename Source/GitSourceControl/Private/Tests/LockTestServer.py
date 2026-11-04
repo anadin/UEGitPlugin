@@ -74,7 +74,6 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, {})
 
     def do_POST(self):
-        global serial
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
         mode = (root / 'mode').read_text().strip() if (root / 'mode').exists() else ''
         principal = self.principal()
@@ -136,7 +135,18 @@ class Handler(BaseHTTPRequestHandler):
                 with gate:
                     self.reply(200, {'ours': [item for path, item in locks.items() if owners[path] == principal],
                                      'theirs': [item for path, item in locks.items() if owners[path] != principal]})
-        elif self.path.endswith('/locks'):
+        elif self.path.endswith('/locks') or self.path.endswith('/unlock'):
+            # Like a distant server, each lock taken or released can take a moment.
+            delay = root / 'lock-delay'
+            if delay.exists():
+                time.sleep(min(30, max(0, float(delay.read_text()))))
+            self.lock_or_unlock(body, mode, principal)
+        else:
+            self.reply(404, {'message': 'fixture endpoint not found'})
+
+    def lock_or_unlock(self, body, mode, principal):
+        global serial
+        if self.path.endswith('/locks'):
             path = body['path']
             refused = (root / 'fail-lock-path').read_text().strip() if (root / 'fail-lock-path').exists() else ''
             with gate:
@@ -149,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
                     if mode == 'postfail':
                         (root / 'mode').write_text('auth')
                     self.reply(201, {'lock': locks[path]})
-        elif self.path.endswith('/unlock'):
+        else:
             identity = self.path.split('/')[-2]
             refused = (root / 'fail-unlock-path').read_text().strip() if (root / 'fail-unlock-path').exists() else ''
             with gate:
@@ -161,8 +171,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200, {'lock': locks.pop(found)})
                 else:
                     self.reply(403, {'message': 'not owned'})
-        else:
-            self.reply(404, {'message': 'fixture endpoint not found'})
 
 server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
 (root / 'port').write_text(str(server.server_port))

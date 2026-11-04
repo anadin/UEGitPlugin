@@ -3,6 +3,8 @@
 
 #include "CoreMinimal.h"
 
+#include <atomic>
+
 namespace GitCore
 {
 	/** One path reported by `git status --porcelain=v2`. Paths are repository-relative with forward slashes. */
@@ -72,6 +74,24 @@ namespace GitCore
 		FDateTime LockedAt;
 		bool bOurs = false;
 	};
+
+	/** How far taking or releasing the locks of many files has got: counted on a session lane, read on the game thread. */
+	struct FLockProgress
+	{
+		std::atomic<int32> Done{0};
+		/** The files to go through; zero until counting starts. */
+		std::atomic<int32> Total{0};
+		std::atomic<bool> bReleasing{false};
+
+		void Start(int32 InTotal, bool bInReleasing)
+		{
+			bReleasing = bInReleasing;
+			Done = 0;
+			Total = InTotal;
+		}
+	};
+	using FLockProgressRef = TSharedRef<FLockProgress, ESPMode::ThreadSafe>;
+	using FLockProgressPtr = TSharedPtr<FLockProgress, ESPMode::ThreadSafe>;
 
 	/** Server lock state for one remote, as last verified. Never discarded on failure; Error explains why it is old. */
 	struct FLockSnapshot

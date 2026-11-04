@@ -3,7 +3,9 @@
 
 #include "CoreMinimal.h"
 #include "AssetRegistry/AssetData.h"
+#include "Containers/Ticker.h"
 #include "Core/GitSession.h"
+#include "Provider/GitSourceControlCommand.h"
 
 class FGitSourceControlProvider;
 
@@ -50,7 +52,9 @@ public:
 	FOnChanged& OnChanged() { return Changed; }
 
 	bool IsBusy() const;
-	const FText& GetActivity() const { return Activity; }
+	/** What the running action is doing; locking or releasing several files says how many are done ("Locking files: 3 of 12"). */
+	FText GetActivity() const;
+	/** Stops the running action: at once, or after the file being locked or released. */
 	void Cancel();
 	/** The last failure, until dismissed or until the next action starts. */
 	const TOptional<FGitActionResult>& GetLastFailure() const { return LastFailure; }
@@ -83,9 +87,9 @@ public:
 	 * nothing changes if the file's diff is no longer the same. Discarding keeps a copy of the file, as Revert does.
 	 */
 	void ApplyLines(const FString& RelativePath, GitCore::ELineAction Action, const FString& ShownDiff, const GitCore::FLineSelection& Lines);
-	/** Unreal's Check Out: takes the LFS locks. */
+	/** Unreal's Check Out: takes the LFS locks. While nothing else runs, it is the running action, with progress and Cancel. */
 	void Lock(const TArray<FString>& Paths);
-	/** Releases locks held on Paths; bForce also releases other people's locks. */
+	/** Releases locks held on Paths, counting them as it goes; bForce also releases other people's locks. */
 	void Unlock(const TArray<FString>& Paths, bool bForce);
 	/**
 	 * Takes over your locks on Paths that were taken in another clone, worktree or computer, so the
@@ -155,11 +159,17 @@ private:
 	/** Runs Task from the main loop, outside Slate input handling and task callbacks: package reloads need that. */
 	void RunAtSafePoint(TFunction<void()> Task) const;
 	void OnRepositoryChanged();
-	/** Runs Work on a session lane and reports its result. False when nothing could start. */
-	bool Run(const FText& InActivity, ELane Lane, FWork Work, FDone Done = nullptr, bool bQuietSuccess = false);
+	/**
+	 * Runs Work on a session lane and reports its result. False when nothing could start. Work that counts files
+	 * in Progress has it shown in the panel and, from a few seconds on, in the status bar.
+	 */
+	bool Run(const FText& InActivity, ELane Lane, FWork Work, FDone Done = nullptr, bool bQuietSuccess = false, GitCore::FLockProgressPtr Progress = nullptr);
 	/** Quick local work (staging) that queues behind a running action instead of waiting for it; only failures are reported. */
 	void RunQuick(FWork Work);
 	void Finish(const FGitActionResult& Result, bool bQuietSuccess);
+	void EndActivity();
+	/** The end of a provider operation that was the running action; the provider has reported its outcome. */
+	void OnOperationComplete(const FSourceControlOperationRef& Operation, ECommandResult::Type Result);
 	void Present(const FGitActionResult& Result);
 	/** Unreal's Sync with Options (for a model bound to a test provider, that provider's Sync of the whole repository). */
 	void SyncWith(const GitCore::FPullOptions& Options);
@@ -176,5 +186,12 @@ private:
 	FText Activity;
 	TWeakPtr<GitCore::FGitSession, ESPMode::ThreadSafe> ActivitySession;
 	GitCore::FCancelTokenPtr ActivityCancel;
+	/** The provider operation the running action waits for (Lock); its progress and Cancel apply. */
+	TSharedPtr<ISourceControlOperation, ESPMode::ThreadSafe> ActivityOperation;
+	/** Files the running action has done, when it counts them itself (Unlock). */
+	GitCore::FLockProgressPtr ActivityProgress;
+	/** Shows ActivityProgress in the status bar (the provider shows its own operations'). */
+	FGitProgressBar ProgressBar;
+	FTSTicker::FDelegateHandle ProgressTicker;
 	TOptional<FGitActionResult> LastFailure;
 };

@@ -516,6 +516,7 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 	TestTrue(TEXT("Locks are read after connecting"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Locks.bVerified; }));
 
 	Panel.Model->Lock({TEXT("Content/Hero.uasset")});
+	TestTrue(TEXT("Locking finishes"), Panel.WaitIdle());
 	TestTrue(TEXT("Locking goes through Check Out"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot)
 	{
 		const GitCore::FLockInfo* Lock = Snapshot.Locks.Find(TEXT("Content/Hero.uasset"));
@@ -571,6 +572,84 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 	TestTrue(TEXT("Discarding finishes"), Panel.WaitIdle());
 	TestEqualSensitive(TEXT("The edit is gone"), GitTest::ReadFile(Team.Alice, TEXT("readme.txt")), FString(TEXT("text\n")));
 	TestFalse(TEXT("The new file is deleted"), GitTest::FileExists(Team.Alice, TEXT("scratch.txt")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelLockProgressTest, "GitWorkspace.Panel.LockProgress", PanelTestFlags)
+bool FGitPanelLockProgressTest::RunTest(const FString&)
+{
+	GitTest::FLockedTeam Team(*this);
+	if (!Team.IsReady())
+	{
+		return false;
+	}
+	TArray<FString> Props;
+	for (int32 Index = 1; Index <= 4; ++Index)
+	{
+		Props.Add(FString::Printf(TEXT("Content/Props/Prop%d.uasset"), Index));
+		GitTest::WriteFile(Team.Alice, Props.Last(), Props.Last() + TEXT("\n"));
+	}
+	GitTest::CommitAll(Team.Alice, TEXT("Props"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Team.Alice);
+	Panel.Refresh();
+	TestTrue(TEXT("Locks are read after connecting"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Locks.bVerified; }));
+	// Each lock taken or released takes a moment, as with a distant server.
+	FFileHelper::SaveStringToFile(TEXT("0.25"), *(Team.Server->Root / TEXT("lock-delay")));
+	auto Mine = [&Panel]()
+	{
+		int32 Count = 0;
+		for (const TPair<FString, GitCore::FLockInfo>& Pair : Panel.Provider.Snapshot()->Locks.ByPath)
+		{
+			Count += Pair.Value.bOurs ? 1 : 0;
+		}
+		return Count;
+	};
+	// What the toolbar says while the action runs.
+	auto Watch = [&Panel](TArray<FString>& OutSeen, TFunction<bool()> Until)
+	{
+		return GitTest::WaitFor([&Panel, &OutSeen, &Until]()
+		{
+			Panel.Provider->Tick();
+			if (Panel.Model->IsBusy())
+			{
+				OutSeen.AddUnique(Panel.Model->GetActivity().ToString());
+			}
+			return Until();
+		});
+	};
+
+	TArray<FString> Seen;
+	Panel.Model->Lock(Props);
+	TestTrue(TEXT("Locking is the running action"), Panel.Model->IsBusy());
+	TestTrue(TEXT("Locking finishes"), Watch(Seen, [&Panel]() { return !Panel.Model->IsBusy(); }));
+	TestTrue(TEXT("The toolbar counts the files: ") + GitTest::Joined(Seen), GitTest::HasExactly(Seen, TEXT("Locking files: 2 of 4")));
+	TestEqual(TEXT("All four are locked"), Mine(), 4);
+
+	Seen.Reset();
+	Panel.Model->Unlock(Props, false);
+	TestTrue(TEXT("Releasing finishes"), Watch(Seen, [&Panel]() { return !Panel.Model->IsBusy(); }));
+	TestTrue(TEXT("The toolbar counts the locks: ") + GitTest::Joined(Seen), GitTest::HasExactly(Seen, TEXT("Releasing locks: 2 of 4")));
+	TestEqual(TEXT("All four are released"), Mine(), 0);
+
+	// Cancel stops locking after the file being locked.
+	Seen.Reset();
+	Panel.Model->Lock(Props);
+	TestTrue(TEXT("The first file is locked"), Watch(Seen, [&Panel]() { return Panel.Model->GetActivity().ToString().Contains(TEXT("1 of 4"), ESearchCase::CaseSensitive); }));
+	Panel.Model->Cancel();
+	TestTrue(TEXT("The cancelled locking finishes"), Panel.WaitIdle());
+	TestTrue(FString::Printf(TEXT("It stopped early (%d locked)"), Mine()), Mine() >= 1 && Mine() < 4);
+	TestFalse(TEXT("Stopping is not a failure"), Panel.Model->GetLastFailure().IsSet());
+
+	// And releasing.
+	Panel.Model->Lock(Props);
+	Panel.WaitIdle();
+	Seen.Reset();
+	Panel.Model->Unlock(Props, false);
+	TestTrue(TEXT("The first lock is released"), Watch(Seen, [&Panel]() { return Panel.Model->GetActivity().ToString().Contains(TEXT("1 of 4"), ESearchCase::CaseSensitive); }));
+	Panel.Model->Cancel();
+	TestTrue(TEXT("The cancelled release finishes"), Panel.WaitIdle());
+	TestTrue(FString::Printf(TEXT("It stopped early (%d still locked)"), Mine()), Mine() >= 1 && Mine() < 4);
 	return true;
 }
 
@@ -1210,6 +1289,7 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 	Panel.Model->Fetch();
 	Panel.WaitIdle();
 	Panel.Model->Lock({TEXT("Content/Hero.uasset")});
+	Panel.WaitIdle();
 	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { const GitCore::FLockInfo* Lock = Snapshot.Locks.Find(TEXT("Content/Hero.uasset")); return Lock && Lock->bOurs; });
 	Panel.Provider->GetSession()->RequestStashesAndBranches();
 	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Stashes.Num() == 1 && Snapshot.Locks.Find(TEXT("Content/Map.umap")); });

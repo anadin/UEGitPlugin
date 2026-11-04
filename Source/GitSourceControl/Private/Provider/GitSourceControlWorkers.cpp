@@ -9,6 +9,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 #include "SourceControlOperations.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl.Workers"
@@ -167,16 +168,33 @@ namespace
 		return true;
 	}
 
+	bool IsLockedHere(const FSessionSnapshot& Snapshot, const FString& Path)
+	{
+		const FLockInfo* Lock = Snapshot.Locks.Find(Path);
+		return Lock && Lock->bOurs && Snapshot.LocksTakenHere.Contains(Lock->Id);
+	}
+
+	/** Counts, for the progress bar, the locks this worktree holds on Paths: the ones ReleaseLockIfEligible looks at. */
+	void StartReleaseProgress(FGitSourceControlCommand& Command, const TArray<FString>& Paths)
+	{
+		const FSessionSnapshotRef Snapshot = Command.Session->GetSnapshot();
+		Command.Progress->Start(Paths.FilterByPredicate([&Snapshot](const FString& Path) { return IsLockedHere(*Snapshot, Path); }).Num(), true);
+	}
+
 	/** Releases our lock on Path unless a local change or an unpushed commit still needs it. */
 	void ReleaseLockIfEligible(FGitSourceControlCommand& Command, const FString& Path, TArray<FString>& OutReleased)
 	{
 		FGitSession& Session = *Command.Session;
 		const FSessionSnapshotRef Snapshot = Session.GetSnapshot();
 		const FLockInfo* Lock = Snapshot->Locks.Find(Path);
-		if (!Lock || !Lock->bOurs || !Snapshot->LocksTakenHere.Contains(Lock->Id))
+		if (!IsLockedHere(*Snapshot, Path))
 		{
 			return;
 		}
+		ON_SCOPE_EXIT
+		{
+			++Command.Progress->Done;
+		};
 		if (Snapshot->Status.Find(Path))
 		{
 			return;
@@ -427,23 +445,31 @@ bool FGitCheckOutWorker::Execute(FGitSourceControlCommand& Command)
 	{
 		Command.Session->RefreshLocks(ECallKind::UserNetwork);
 	}
-	bool bAllLocked = true;
-	for (const FString& Path : Command.RelativeFiles)
+	TArray<FString> ToLock;
 	{
 		const FSessionSnapshotRef Snapshot = Command.Session->GetSnapshot();
-		const FStatusEntry* Entry = Snapshot->Status.Find(Path);
-		const bool bNew = (Entry && (Entry->bUntracked || Entry->Index == TEXT('A'))) || (!Entry && !Snapshot->IsTracked(Path));
-		if (!IsLockable(*Snapshot, Command, Path) || bNew)
+		for (const FString& Path : Command.RelativeFiles)
 		{
+			const FStatusEntry* Entry = Snapshot->Status.Find(Path);
+			const bool bNew = (Entry && (Entry->bUntracked || Entry->Index == TEXT('A'))) || (!Entry && !Snapshot->IsTracked(Path));
 			// Files that cannot be locked (or that only exist locally) are always editable.
-			continue;
+			if (IsLockable(*Snapshot, Command, Path) && !bNew && !IsLockedHere(*Snapshot, Path))
+			{
+				ToLock.Add(Path);
+			}
 		}
-		const FLockInfo* Lock = Snapshot->Locks.Find(Path);
-		if (Lock && Lock->bOurs && Snapshot->LocksTakenHere.Contains(Lock->Id))
+	}
+	Command.Progress->Start(ToLock.Num(), false);
+	bool bAllLocked = true;
+	for (const FString& Path : ToLock)
+	{
+		if (Command.Cancel->IsCancelled())
 		{
-			continue;
+			Command.AddInfo(FText::Format(LOCTEXT("LockingStopped", "Stopped after locking {0} of {1} files."), Command.Progress->Done.load(), ToLock.Num()));
+			return false;
 		}
 		bAllLocked &= AcquireLock(Command, Path);
+		++Command.Progress->Done;
 	}
 	return bAllLocked;
 }
@@ -596,6 +622,7 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& Command)
 	if (!bKeepCheckedOut)
 	{
 		// Each lock is only released when no local change or unpushed commit still needs it.
+		StartReleaseProgress(Command, Command.RelativeFiles);
 		for (const FString& Path : Command.RelativeFiles)
 		{
 			ReleaseLockIfEligible(Command, Path, Released);
@@ -721,6 +748,7 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& Command)
 	Session.RefreshStatus();
 
 	TArray<FString> Released;
+	StartReleaseProgress(Command, Paths);
 	for (const FString& Path : Paths)
 	{
 		ReleaseLockIfEligible(Command, Path, Released);
@@ -1030,15 +1058,23 @@ bool FGitDeleteWorker::Execute(FGitSourceControlCommand& Command)
 	}
 	FGitSession& Session = *Command.Session;
 	const FGitRepository& Repository = Session.GetRepository();
+	// Lockable files are locked before they go, so nobody else edits them meanwhile.
+	auto NeedsLock = [&Command](const FSessionSnapshot& Snapshot, const FString& Path)
+	{
+		return Snapshot.IsTracked(Path) && IsLockable(Snapshot, Command, Path) && !IsLockedHere(Snapshot, Path);
+	};
+	{
+		const FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		Command.Progress->Start(Command.RelativeFiles.FilterByPredicate([&](const FString& Path) { return NeedsLock(*Snapshot, Path); }).Num(), false);
+	}
 	bool bAllDeleted = true;
 	for (const FString& Path : Command.RelativeFiles)
 	{
-		const FSessionSnapshotRef Snapshot = Session.GetSnapshot();
-		if (Snapshot->IsTracked(Path) && IsLockable(*Snapshot, Command, Path))
+		if (NeedsLock(*Session.GetSnapshot(), Path))
 		{
-			const FLockInfo* Lock = Snapshot->Locks.Find(Path);
-			const bool bLockedHere = Lock && Lock->bOurs && Snapshot->LocksTakenHere.Contains(Lock->Id);
-			if (!bLockedHere && !AcquireLock(Command, Path))
+			const bool bLocked = AcquireLock(Command, Path);
+			++Command.Progress->Done;
+			if (!bLocked)
 			{
 				bAllDeleted = false;
 				continue;
