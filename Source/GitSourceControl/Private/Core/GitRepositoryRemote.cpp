@@ -79,7 +79,6 @@ namespace GitCore
 		Out.Ahead = 0;
 		Out.Behind = 0;
 		Out.IncomingPaths.Reset();
-		Out.OutgoingPaths.Reset();
 		Out.Upstream = Status.Upstream;
 		Out.UpstreamHead.Reset();
 		Out.Remote = Status.Branch.IsEmpty() ? FString() : ConfigValue(*this, TEXT("branch.") + Status.Branch + TEXT(".remote"));
@@ -119,15 +118,6 @@ namespace GitCore
 			if (!Incoming.Succeeded() || !ParseNameList(Incoming.Stdout, Out.IncomingPaths))
 			{
 				OutError = DescribeFailure(Incoming, TEXT("Listing incoming changes"));
-				return false;
-			}
-		}
-		if (Out.Ahead > 0)
-		{
-			const FProcessResult Outgoing = Run(ECallKind::LocalScan, {TEXT("diff"), TEXT("--name-only"), TEXT("-z"), TEXT("--no-renames"), Out.UpstreamHead + TEXT("...HEAD"), TEXT("--")});
-			if (!Outgoing.Succeeded() || !ParseNameList(Outgoing.Stdout, Out.OutgoingPaths))
-			{
-				OutError = DescribeFailure(Outgoing, TEXT("Listing outgoing changes"));
 				return false;
 			}
 		}
@@ -237,6 +227,20 @@ namespace GitCore
 			return FOpResult::Failure(DescribeFailure(Result, TEXT("Pushing")), Output);
 		}
 		return FOpResult::Success(FString::Printf(TEXT("Pushed to %s/%s."), *Target.Remote, *Target.Branch));
+	}
+
+	bool FGitRepository::ReadPushedPaths(const FString& Remote, const FString& Commit, TSet<FString>& Out, FString& OutError) const
+	{
+		// -c lists only the files a merge changed from every parent: what it took from one side is already there.
+		// The settings keep a first commit's files listed and signature checks out of the output.
+		const FProcessResult Result = Run(ECallKind::LocalScan, {TEXT("-c"), TEXT("log.showRoot=true"), TEXT("-c"), TEXT("log.showSignature=false"),
+			TEXT("log"), TEXT("--format="), TEXT("--name-only"), TEXT("-z"), TEXT("--no-renames"), TEXT("-c"), Commit, TEXT("--not"), TEXT("--remotes=") + Remote, TEXT("--")});
+		if (!Result.Succeeded() || !ParseNameList(Result.Stdout, Out))
+		{
+			OutError = DescribeFailure(Result, TEXT("Listing what the push changes"));
+			return false;
+		}
+		return true;
 	}
 
 	bool FGitRepository::PredictConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const

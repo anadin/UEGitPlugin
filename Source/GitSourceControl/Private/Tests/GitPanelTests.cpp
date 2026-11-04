@@ -574,6 +574,57 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelPushAfterMergeTest, "GitWorkspace.Panel.PushAfterMergingLockedWork", PanelTestFlags)
+bool FGitPanelPushAfterMergeTest::RunTest(const FString&)
+{
+	GitTest::FLockedTeam Team(*this);
+	if (!Team.IsReady())
+	{
+		return false;
+	}
+	AddExpectedErrorPlain(TEXT("is locked by someone else"), EAutomationExpectedErrorFlags::Contains, 1);
+	GitTest::Git(Team.Bob, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature")});
+	GitTest::WriteFile(Team.Bob, TEXT("readme.txt"), TEXT("bob's readme\n"));
+	GitTest::CommitAll(Team.Bob, TEXT("Bob's readme"));
+	GitTest::Git(Team.Bob, {TEXT("push"), TEXT("-q"), TEXT("-u"), TEXT("origin"), TEXT("feature")});
+
+	// Alice changes the hero on main and keeps it locked.
+	const GitCore::FGitRepositoryPtr Alice = GitTest::OpenRepository(*this, Team.Alice);
+	GitCore::FLockInfo Lock;
+	if (!Alice.IsValid() || !TestTrue(TEXT("Alice locks the hero"), Alice->Lock(TEXT("origin"), TEXT("Content/Hero.uasset"), Lock).bOk))
+	{
+		return false;
+	}
+	GitTest::WriteFile(Team.Alice, TEXT("Content/Hero.uasset"), TEXT("hero v2\n"));
+	GitTest::CommitAll(Team.Alice, TEXT("Hero v2"));
+	GitTest::Git(Team.Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+
+	// Bob merges main into his branch, which brings Alice's locked hero along.
+	GitTest::Git(Team.Bob, {TEXT("fetch"), TEXT("-q"), TEXT("origin")});
+	GitTest::Git(Team.Bob, {TEXT("merge"), TEXT("-q"), TEXT("--no-edit"), TEXT("origin/main")});
+	TestEqualSensitive(TEXT("The merge brought the hero in"), GitTest::ReadFile(Team.Bob, TEXT("Content/Hero.uasset")), FString(TEXT("hero v2\n")));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Team.Bob);
+	Panel.Refresh();
+	Panel.Model->Push();
+	TestTrue(TEXT("The push finishes"), Panel.WaitIdle());
+	TestFalse(TEXT("Alice's lock on work already on the server does not stop it: ") + (Panel.Model->GetLastFailure().IsSet() ? Panel.Model->GetLastFailure()->Message.ToString() : FString()),
+		Panel.Model->GetLastFailure().IsSet());
+	TestEqualSensitive(TEXT("The merge reached the server"), PanelHead(Team.Origin, TEXT("feature")), PanelHead(Team.Bob));
+
+	// Changing the locked hero himself is still refused.
+	GitTest::WriteFile(Team.Bob, TEXT("Content/Hero.uasset"), TEXT("bob's hero\n"));
+	GitTest::CommitAll(Team.Bob, TEXT("Bob edits the hero"));
+	const FString ServerBefore = PanelHead(Team.Origin, TEXT("feature"));
+	Panel.Refresh();
+	Panel.Model->Push();
+	TestTrue(TEXT("The second push finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("Bob's own change to the locked hero is refused"), Panel.Model->GetLastFailure().IsSet() &&
+		Panel.Model->GetLastFailure()->Message.ToString().Contains(TEXT("Hero.uasset is locked by someone else"), ESearchCase::CaseSensitive));
+	TestEqualSensitive(TEXT("Nothing reached the server"), PanelHead(Team.Origin, TEXT("feature")), ServerBefore);
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelFileTreeTest, "GitWorkspace.Panel.FileTree", PanelTestFlags)
 bool FGitPanelFileTreeTest::RunTest(const FString&)
 {

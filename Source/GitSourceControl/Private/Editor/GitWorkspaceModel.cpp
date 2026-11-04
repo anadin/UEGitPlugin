@@ -228,17 +228,14 @@ namespace
 		}
 		if (bLocking)
 		{
-			// The server refuses pushes that change files someone else has locked; say so before trying.
+			// Changing a file someone else has locked clashes with their work, and Git LFS refuses such pushes
+			// when lfs.locksverify is on: say so before trying.
 			Session.RefreshLocks(GitCore::ECallKind::UserNetwork);
-			const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
 			TArray<FString> Blocked;
-			for (const FString& Path : Snapshot->Remote.OutgoingPaths)
+			FString Error;
+			if (!Session.FindLockedByOthers(Target.Remote, Blocked, &Error))
 			{
-				const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Path);
-				if (Lock && !Lock->bOurs)
-				{
-					Blocked.Add(Path);
-				}
+				return FGitActionResult::Failure(FText::FromString(Error));
 			}
 			if (!Blocked.IsEmpty())
 			{

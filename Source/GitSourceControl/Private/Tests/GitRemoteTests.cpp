@@ -82,7 +82,9 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	Status = ReadStatus(*this, *Repository);
 	Repository->ReadRemoteState(Status, TEXT("origin"), Remote, Error);
 	TestTrue(TEXT("Diverged history is reported"), Remote.Ahead == 1 && Remote.Behind == 1);
-	TestTrue(TEXT("Outgoing paths are listed"), GitTest::HasExactly(Remote.OutgoingPaths, TEXT("from-a.txt")));
+	TSet<FString> Pushed;
+	TestTrue(TEXT("What a push would change is read"), Repository->ReadPushedPaths(TEXT("origin"), TEXT("HEAD"), Pushed, Error));
+	TestEqualSensitive(TEXT("A push changes the local commit's file"), GitTest::Joined(Pushed.Array()), FString(TEXT("from-a.txt")));
 	bool bConflicts = true;
 	TestTrue(TEXT("Conflict prediction runs"), Repository->PredictConflicts(Remote.Upstream, bConflicts, Error));
 	TestFalse(TEXT("No conflict is predicted"), bConflicts);
@@ -104,6 +106,61 @@ bool FGitRemoteSyncTest::RunTest(const FString&)
 	TestEqualSensitive(TEXT("HEAD is unchanged"), GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("HEAD")})), Before);
 	TestFalse(TEXT("No rebase is left in progress"), Repository->IsOperationInProgress());
 	TestEqualSensitive(TEXT("The local edit is intact"), GitTest::ReadFile(Clones.A, TEXT("shared.txt")), FString(TEXT("line 1\nA's line 2\nline 3\n")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRemotePushedPathsTest, "GitWorkspace.Remote.PushedPaths", RemoteTestFlags)
+bool FGitRemotePushedPathsTest::RunTest(const FString&)
+{
+	FTwoClones Clones;
+	const GitCore::FGitRepositoryPtr Repository = GitTest::OpenRepository(*this, Clones.A);
+	if (!Repository.IsValid())
+	{
+		return false;
+	}
+	auto Pushed = [this, &Repository]()
+	{
+		TSet<FString> Paths;
+		FString Error;
+		TestTrue(TEXT("What a push would change is read: ") + Error, Repository->ReadPushedPaths(TEXT("origin"), TEXT("HEAD"), Paths, Error));
+		TArray<FString> Sorted = Paths.Array();
+		Sorted.Sort();
+		return GitTest::Joined(Sorted);
+	};
+	GitTest::WriteFile(Clones.A, TEXT("doomed.txt"), TEXT("doomed\n"));
+	GitTest::CommitAll(Clones.A, TEXT("A adds a file to delete later"));
+	GitTest::Git(Clones.A, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+	GitTest::Git(Clones.A, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature")});
+	GitTest::WriteFile(Clones.A, TEXT("feature.txt"), TEXT("feature\n"));
+	GitTest::CommitAll(Clones.A, TEXT("Feature work"));
+	GitTest::Git(Clones.A, {TEXT("push"), TEXT("-q"), TEXT("-u"), TEXT("origin"), TEXT("feature")});
+	TestEqualSensitive(TEXT("A published branch changes nothing more"), Pushed(), FString());
+
+	// Merging in a teammate's work that is already on the server adds nothing to the push.
+	GitTest::Git(Clones.B, {TEXT("pull"), TEXT("-q"), TEXT("--ff-only")});
+	Clones.PushFromB(TEXT("shared.txt"), TEXT("line 1\nB's line 2\nline 3\n"), TEXT("B edits line 2"));
+	Repository->Fetch(TEXT("origin"), GitCore::ECallKind::UserNetwork, nullptr);
+	GitTest::Git(Clones.A, {TEXT("merge"), TEXT("-q"), TEXT("--no-edit"), TEXT("origin/main")});
+	TestEqualSensitive(TEXT("The merge brings in shared.txt from main"), GitTest::ReadFile(Clones.A, TEXT("shared.txt")), FString(TEXT("line 1\nB's line 2\nline 3\n")));
+	TestEqualSensitive(TEXT("A push of the merge changes nothing on the server"), Pushed(), FString());
+
+	// Edits and deletions of A's own count.
+	GitTest::WriteFile(Clones.A, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::Git(Clones.A, {TEXT("rm"), TEXT("-q"), TEXT("doomed.txt")});
+	GitTest::CommitAll(Clones.A, TEXT("A adds and deletes"));
+	TestEqualSensitive(TEXT("Its own edit and deletion count"), Pushed(), GitTest::Joined({TEXT("a.txt"), TEXT("doomed.txt")}));
+
+	// A conflict resolved with content of A's own is A's change, though the file came from both sides.
+	Clones.PushFromB(TEXT("shared.txt"), TEXT("line 1\nB's line 2 again\nline 3\n"), TEXT("B edits line 2 again"));
+	GitTest::WriteFile(Clones.A, TEXT("shared.txt"), TEXT("line 1\nA's line 2\nline 3\n"));
+	GitTest::CommitAll(Clones.A, TEXT("A edits line 2"));
+	GitTest::Git(Clones.A, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("feature")});
+	Repository->Fetch(TEXT("origin"), GitCore::ECallKind::UserNetwork, nullptr);
+	GitTest::Git(Clones.A, {TEXT("merge"), TEXT("-q"), TEXT("--no-edit"), TEXT("origin/main")});
+	GitTest::WriteFile(Clones.A, TEXT("shared.txt"), TEXT("line 1\nA's and B's line 2\nline 3\n"));
+	GitTest::Git(Clones.A, {TEXT("add"), TEXT("shared.txt")});
+	GitTest::Git(Clones.A, {TEXT("commit"), TEXT("-q"), TEXT("--no-edit"), TEXT("--no-verify")});
+	TestEqualSensitive(TEXT("The resolution counts"), Pushed(), FString(TEXT("shared.txt")));
 	return true;
 }
 

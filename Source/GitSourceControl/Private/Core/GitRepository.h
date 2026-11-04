@@ -166,6 +166,12 @@ namespace GitCore
 		FOpResult ResolvePush(const FStatusSnapshot& Status, const FString& FallbackRemote, FPushTarget& Out) const;
 		/** Uploads LFS objects then pushes HEAD to Target (setting the upstream when Target says so). */
 		FOpResult Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel) const;
+		/**
+		 * The files a push of Commit to Remote would change there: those changed by commits none of Remote's branches
+		 * have. A merge counts only for files it changed from every parent, so merging in work that is already on the
+		 * server adds nothing, while deleting or renaming a file counts.
+		 */
+		bool ReadPushedPaths(const FString& Remote, const FString& Commit, TSet<FString>& Out, FString& OutError) const;
 		/** True when merging Upstream into HEAD would conflict. */
 		bool PredictConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const;
 		/** True when the uncommitted changes, set aside and put back after integrating Upstream, would conflict. */

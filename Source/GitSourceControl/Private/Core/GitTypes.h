@@ -129,8 +129,6 @@ namespace GitCore
 		int32 Behind = 0;
 		/** Paths changed on the upstream since the merge base (what Sync would bring in). */
 		TSet<FString> IncomingPaths;
-		/** Paths changed by local commits not yet on the upstream. */
-		TSet<FString> OutgoingPaths;
 		/** Where Push would send the branch. */
 		FPushTarget Push;
 		FDateTime FetchedAtUtc;

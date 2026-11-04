@@ -635,6 +635,32 @@ namespace GitCore
 		SaveMarkedForAdd(Marked);
 	}
 
+	bool FGitSession::FindLockedByOthers(const FString& Remote, TArray<FString>& OutPaths, FString* OutError) const
+	{
+		OutPaths.Reset();
+		TSet<FString> Pushed;
+		FString Error;
+		if (!Repository->ReadPushedPaths(Remote, TEXT("HEAD"), Pushed, Error))
+		{
+			if (OutError)
+			{
+				*OutError = Error;
+			}
+			return false;
+		}
+		const FSessionSnapshotRef Current = GetSnapshot();
+		for (const FString& Path : Pushed)
+		{
+			const FLockInfo* Lock = Current->Locks.Find(Path);
+			if (Lock && !Lock->bOurs)
+			{
+				OutPaths.Add(Path);
+			}
+		}
+		OutPaths.Sort();
+		return true;
+	}
+
 	void FGitSession::RequestStatusRefresh()
 	{
 		if (bStatusRequested.exchange(true))

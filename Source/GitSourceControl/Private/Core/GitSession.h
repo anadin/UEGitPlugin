@@ -111,6 +111,11 @@ namespace GitCore
 		bool RecordLockTaken(const FLockInfo& Lock, FString* OutError = nullptr);
 		void RecordLockReleased(const FString& Path);
 		void SetMarkedForAdd(const TArray<FString>& Paths, bool bMarked);
+		/**
+		 * Files a push of HEAD to Remote would change while someone else holds their lock (by the locks last read).
+		 * Teammates' work that a merge or rebase brought in is already on the server and never counts.
+		 */
+		bool FindLockedByOthers(const FString& Remote, TArray<FString>& OutPaths, FString* OutError = nullptr) const;
 
 		// Coalesced requests, safe to call from any thread.
 		void RequestStatusRefresh();

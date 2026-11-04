@@ -449,29 +449,6 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& Command)
 	if (Command.Settings.bPushOnSubmit)
 	{
 		Snapshot = Session.GetSnapshot();
-		if (UsesLocks(*Snapshot, Command))
-		{
-			// The server refuses pushes that change files someone else has locked; say so before trying.
-			Session.RefreshLocks(ECallKind::UserNetwork);
-			Snapshot = Session.GetSnapshot();
-			TArray<FString> Blocked;
-			for (const FString& Path : Snapshot->Remote.OutgoingPaths)
-			{
-				const FLockInfo* Lock = Snapshot->Locks.Find(Path);
-				if (Lock && !Lock->bOurs)
-				{
-					Blocked.Add(Path);
-				}
-			}
-			if (!Blocked.IsEmpty())
-			{
-				Command.AddError(Commit.IsEmpty()
-					? FText::Format(LOCTEXT("PushBlocked", "Not pushed: {0} is locked by someone else."), FText::FromString(FileList(Blocked)))
-					: FText::Format(LOCTEXT("CommittedPushBlocked", "Committed locally ({0}), but not pushed: {1} is locked by someone else."),
-						FText::FromString(ShortId(Commit)), FText::FromString(FileList(Blocked))));
-				return false;
-			}
-		}
 		Remote = Repository.DefaultRemote();
 		const bool bHasOutgoing = !Commit.IsEmpty() || Snapshot->Remote.Ahead > 0 || (Snapshot->Remote.Upstream.IsEmpty() && !Snapshot->Status.bUnborn);
 		// Without a remote there is nowhere to push, and the commit is the whole check in.
@@ -488,6 +465,28 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& Command)
 				Session.RefreshStatus();
 				Session.RefreshRemote();
 				return false;
+			}
+			if (UsesLocks(*Snapshot, Command))
+			{
+				// Changing a file someone else has locked clashes with their work, and Git LFS refuses such pushes
+				// when lfs.locksverify is on: say so before trying.
+				Session.RefreshLocks(ECallKind::UserNetwork);
+				TArray<FString> Blocked;
+				FString Error;
+				if (!Session.FindLockedByOthers(Target.Remote, Blocked, &Error))
+				{
+					Command.AddError(Commit.IsEmpty() ? FText::FromString(Error)
+						: FText::Format(LOCTEXT("CommittedNotChecked", "Committed locally ({0}), but not pushed: {1}"), FText::FromString(ShortId(Commit)), FText::FromString(Error)));
+					return false;
+				}
+				if (!Blocked.IsEmpty())
+				{
+					Command.AddError(Commit.IsEmpty()
+						? FText::Format(LOCTEXT("PushBlocked", "Not pushed: {0} is locked by someone else."), FText::FromString(FileList(Blocked)))
+						: FText::Format(LOCTEXT("CommittedPushBlocked", "Committed locally ({0}), but not pushed: {1} is locked by someone else."),
+							FText::FromString(ShortId(Commit)), FText::FromString(FileList(Blocked))));
+					return false;
+				}
 			}
 			Session.CancelBackgroundWork();
 			const FOpResult Pushed = Repository.Push(Target, Command.Cancel);
