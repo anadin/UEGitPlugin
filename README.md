@@ -83,6 +83,12 @@ Text changes are colored: added lines green, removed lines red, and in an edited
 
 Switching branches and restoring stashes refuse to overwrite local edits, download Git LFS files first, and reload any open assets that change.
 
+**Lean branching.** When your `main` (or `master`, or `develop`) follows a branch on the server, the branch menu has Fork's three shortcuts for working on a branch of your own:
+
+- **Start branch on main…** creates a branch from the newest main (your `main` or `origin/main`, whichever is ahead) and switches to it. Your uncommitted changes come along.
+- **Sync (rebase on origin/main)** fetches, then replays your branch's commits on top of `origin/main`, setting local changes aside meanwhile, as Pull does. If the branch is on the server, its copy there is moved to the rebased commits (a push with lease), and commits you had not pushed stay unpushed. Sync stops before changing anything when someone else pushed to your branch (Pull first), or when your commits are also on another branch on the server. On main itself, Sync is a Pull with rebase.
+- **Finish (merge into main)…** puts your branch's commits on main and switches to main: one commit just moves main forward, more are joined by a merge commit. Your branch must contain `origin/main` (Sync first), and main must have no unpushed commits of its own. No file changes, so nothing reloads, and nothing is pushed until you push main.
+
 | Key | Action |
 | --- | --- |
 | Ctrl+F | Search the current tab |

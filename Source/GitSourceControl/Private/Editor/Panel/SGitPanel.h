@@ -51,7 +51,11 @@ private:
 	FText GetSyncState() const;
 	FText GetSyncStateTooltip() const;
 	void SetTab(ETab InTab);
+	/** Asks for a new branch's name; false when cancelled. */
+	bool AskBranchName(const FText& Title, const FText& Prompt, FString& OutName) const;
 	void CreateBranch();
+	/** Lean branching's Start: asks for a name, then branches from the newest main. */
+	void StartBranch();
 	void Refresh();
 
 	TWeakPtr<FGitWorkspaceModel> WeakModel;

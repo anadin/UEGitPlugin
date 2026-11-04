@@ -95,6 +95,17 @@ public:
 
 	void CreateBranch(const FString& Name);
 	void SwitchBranch(const FString& Name);
+	/** Lean branching's main branch: main, master or develop, the first that follows a fetched branch on a remote. */
+	static bool FindMainBranch(const GitCore::FSessionSnapshot& Snapshot, FString& OutBranch, FString& OutUpstream);
+	/** Lean branching's Start: creates Name from the newer of the main branch and its upstream, and switches to it. Local changes come along. */
+	void StartBranch(const FString& Name);
+	/**
+	 * Lean branching's Sync, as Unreal's Sync: on the main branch it pulls with rebase; on another branch it rebases the branch
+	 * onto the main branch's upstream and moves the branch's copy on the server along. Local changes are set aside meanwhile.
+	 */
+	void SyncBranch();
+	/** Lean branching's Finish: asks, then merges the current branch into the main branch and switches to it. No file changes; nothing is pushed. */
+	void FinishBranch();
 	void StashChanges(const FString& Message, bool bIncludeUntracked);
 	void ApplyStash(const FString& Selector, bool bDrop);
 	void DropStash(const FString& Selector);
@@ -150,6 +161,8 @@ private:
 	void RunQuick(FWork Work);
 	void Finish(const FGitActionResult& Result, bool bQuietSuccess);
 	void Present(const FGitActionResult& Result);
+	/** Unreal's Sync with Options (for a model bound to a test provider, that provider's Sync of the whole repository). */
+	void SyncWith(const GitCore::FPullOptions& Options);
 	/**
 	 * Second step of branch switches and stashes: runs Op on the mutation lane while the editor
 	 * unloads, then reloads, the packages of Paths (the world too when one of its packages is affected).

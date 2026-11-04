@@ -181,7 +181,7 @@ namespace GitCore
 		return FOpResult::Success();
 	}
 
-	FOpResult FGitRepository::Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel) const
+	FOpResult FGitRepository::Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel, const FString& Commit, const FString& ExpectedOld) const
 	{
 		if (Target.Remote.IsEmpty() || Target.Branch.IsEmpty())
 		{
@@ -194,7 +194,7 @@ namespace GitCore
 		Lfs.Kind = ECallKind::UserNetwork;
 		Lfs.Cancel = Cancel;
 		Lfs.bLiteralPathspecs = false;
-		Lfs.Args = {TEXT("-c"), TEXT("lfs.allowincompletepush=false"), TEXT("lfs"), TEXT("push"), Target.Remote, TEXT("HEAD")};
+		Lfs.Args = {TEXT("-c"), TEXT("lfs.allowincompletepush=false"), TEXT("lfs"), TEXT("push"), Target.Remote, Commit};
 		const FProcessResult Uploaded = Run(Lfs);
 		if (!Uploaded.Succeeded())
 		{
@@ -215,11 +215,23 @@ namespace GitCore
 		{
 			Push.Args.Add(TEXT("--set-upstream"));
 		}
-		Push.Args.Append({Target.Remote, TEXT("HEAD:refs/heads/") + Target.Branch});
+		const FString Destination = TEXT("refs/heads/") + Target.Branch;
+		if (!ExpectedOld.IsEmpty())
+		{
+			Push.Args.Add(TEXT("--force-with-lease=") + Destination + TEXT(":") + ExpectedOld);
+		}
+		Push.Args.Append({Target.Remote, Commit + TEXT(":") + Destination});
 		const FProcessResult Result = Run(Push);
 		if (!Result.Succeeded())
 		{
 			const FString Output = Result.StdoutText() + Result.ErrorText();
+			if (!ExpectedOld.IsEmpty() && IsRejection(Output))
+			{
+				// The lease turns the push down when the branch moved on the server; the server itself may forbid rewriting it.
+				return FOpResult::Failure(Output.Contains(TEXT("stale info"))
+					? FString::Printf(TEXT("Someone pushed to %s/%s meanwhile."), *Target.Remote, *Target.Branch)
+					: FString::Printf(TEXT("The server does not allow rewriting %s/%s."), *Target.Remote, *Target.Branch), Output);
+			}
 			if (IsRejection(Output))
 			{
 				return FOpResult::Failure(TEXT("The server has newer commits. Pull, then push again."), Output);
@@ -279,18 +291,6 @@ namespace GitCore
 		}
 		OutError = DescribeFailure(Result, TEXT("Checking your local changes against the incoming ones"));
 		return false;
-	}
-
-	bool FGitRepository::CountUnpublishedCommits(int32& OutCount, FString& OutError) const
-	{
-		const FProcessResult Result = Run(ECallKind::LocalScan, {TEXT("rev-list"), TEXT("--count"), TEXT("HEAD"), TEXT("--not"), TEXT("--remotes")});
-		if (!Result.Succeeded())
-		{
-			OutError = DescribeFailure(Result, TEXT("Counting unpushed commits"));
-			return false;
-		}
-		OutCount = FCString::Atoi(*Result.StdoutText());
-		return true;
 	}
 
 	FOpResult FGitRepository::Integrate(const FString& Upstream, EIntegrate Mode, const FCancelTokenPtr& Cancel) const

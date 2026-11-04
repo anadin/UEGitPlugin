@@ -517,6 +517,36 @@ TSharedRef<SWidget> SGitPanel::MakeBranchMenu()
 	}
 	Menu.EndSection();
 
+	// Fork's lean branching: start a branch from main, keep it on top of main by rebasing, merge it back when done.
+	FString Main;
+	FString Upstream;
+	if (FGitWorkspaceModel::FindMainBranch(*Snapshot, Main, Upstream))
+	{
+		const FName Style = FRevisionControlStyleManager::GetStyleSetName();
+		const FString& Current = Snapshot->Status.Branch;
+		const bool bOnMain = Current.Equals(Main, ESearchCase::CaseSensitive);
+		const FText MainText = FText::FromString(Main);
+		const FText UpstreamText = FText::FromString(Upstream);
+		Menu.BeginSection("Lean", LOCTEXT("LeanBranching", "Lean branching"));
+		Menu.AddMenuEntry(FText::Format(LOCTEXT("StartBranch", "Start branch on {0}…"), MainText),
+			FText::Format(LOCTEXT("StartBranchTooltip", "Create a branch from the newest {0} ({0} or {1}, whichever is ahead) and switch to it. Your uncommitted changes come along."), MainText, UpstreamText),
+			FSlateIcon(Style, "RevisionControl.BranchExplorer.NewBranch"), FUIAction(FExecuteAction::CreateSP(this, &SGitPanel::StartBranch)));
+		Menu.AddMenuEntry(Current.IsEmpty() ? FText::Format(LOCTEXT("SyncDetachedLabel", "Sync (rebase on {0})"), UpstreamText)
+				: FText::Format(LOCTEXT("SyncBranch", "Sync {0} (rebase on {1})"), FText::FromString(Current), UpstreamText),
+			bOnMain ? FText::Format(LOCTEXT("SyncMainTooltip", "Get {0}'s new commits, replaying your unpushed ones on top. Unreal saves your work first and reloads the assets that change."), UpstreamText)
+				: FText::Format(LOCTEXT("SyncBranchTooltip", "Bring {0}'s new commits into this branch by replaying its commits on top of them. If the branch is on the server, its copy there moves along (a push with lease); commits you have not pushed stay unpushed. Unreal saves your work first and reloads the assets that change."), UpstreamText),
+			FSlateIcon(Style, "RevisionControl.Actions.Sync"),
+			FUIAction(FExecuteAction::CreateLambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->SyncBranch(); } }),
+				FCanExecuteAction::CreateLambda([bOnBranch = !Current.IsEmpty()]() { return bOnBranch; })));
+		Menu.AddMenuEntry(FText::Format(LOCTEXT("FinishBranch", "Finish (merge into {0})…"), MainText),
+			bOnMain ? FText::Format(LOCTEXT("FinishOnMainTooltip", "Switch to the branch you want to merge into {0}."), MainText)
+				: FText::Format(LOCTEXT("FinishBranchTooltip", "Merge this branch into {0} and switch to {0}; a single commit just moves {0} forward. Sync first when {1} has new commits. No file changes, and nothing is pushed."), MainText, UpstreamText),
+			FSlateIcon(Style, "RevisionControl.BranchExplorer.Merge"),
+			FUIAction(FExecuteAction::CreateLambda([this]() { if (const TSharedPtr<FGitWorkspaceModel> M = WeakModel.Pin()) { M->FinishBranch(); } }),
+				FCanExecuteAction::CreateLambda([bCanFinish = !Current.IsEmpty() && !bOnMain]() { return bCanFinish; })));
+		Menu.EndSection();
+	}
+
 	TSet<FString> Local;
 	Menu.BeginSection("Local", LOCTEXT("LocalBranches", "Branches"));
 	for (const GitCore::FBranchInfo& Branch : Snapshot->Branches)
@@ -580,22 +610,19 @@ TSharedRef<SWidget> SGitPanel::MakeMoreMenu()
 	return Menu.MakeWidget();
 }
 
-void SGitPanel::CreateBranch()
+bool SGitPanel::AskBranchName(const FText& Title, const FText& Prompt, FString& OutName) const
 {
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
 	if (!Model.IsValid())
 	{
-		return;
+		return false;
 	}
 	TSet<FString> Existing;
 	for (const GitCore::FBranchInfo& Branch : Model->GetSnapshot()->Branches)
 	{
 		Existing.Add(Branch.Name);
 	}
-	FString Name;
-	const bool bAccepted = GitWorkspaceDialogs::AskForText(LOCTEXT("NewBranchTitle", "New branch"),
-		LOCTEXT("NewBranchPrompt", "Name the branch. You switch to it right away; your uncommitted changes come along."),
-		LOCTEXT("NewBranchHint", "feature/my-change"), Name,
+	return GitWorkspaceDialogs::AskForText(Title, Prompt, LOCTEXT("NewBranchHint", "feature/my-change"), OutName,
 		[Existing](const FString& Value) -> FText
 		{
 			if (Value.IsEmpty())
@@ -608,9 +635,34 @@ void SGitPanel::CreateBranch()
 			}
 			return Existing.Contains(Value) ? LOCTEXT("NameTaken", "A branch with this name already exists.") : FText::GetEmpty();
 		});
-	if (bAccepted)
+}
+
+void SGitPanel::CreateBranch()
+{
+	FString Name;
+	if (AskBranchName(LOCTEXT("NewBranchTitle", "New branch"), LOCTEXT("NewBranchPrompt", "Name the branch. You switch to it right away; your uncommitted changes come along."), Name))
 	{
-		Model->CreateBranch(Name);
+		if (const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin())
+		{
+			Model->CreateBranch(Name);
+		}
+	}
+}
+
+void SGitPanel::StartBranch()
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	FString Main;
+	FString Upstream;
+	if (!Model.IsValid() || !FGitWorkspaceModel::FindMainBranch(*Model->GetSnapshot(), Main, Upstream))
+	{
+		return;
+	}
+	FString Name;
+	if (AskBranchName(FText::Format(LOCTEXT("StartBranchTitle", "Start branch on {0}"), FText::FromString(Main)),
+		FText::Format(LOCTEXT("StartBranchPrompt", "Name the branch. It starts from the newest {0}, and you switch to it right away; your uncommitted changes come along."), FText::FromString(Main)), Name))
+	{
+		Model->StartBranch(Name);
 	}
 }
 

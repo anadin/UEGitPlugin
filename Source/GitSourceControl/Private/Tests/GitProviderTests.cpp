@@ -687,6 +687,71 @@ bool FGitProviderPullMergeTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitProviderSyncBranchTest, "GitWorkspace.Provider.SyncBranch", ProviderTestFlags)
+bool FGitProviderSyncBranchTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Alice = Fixture.InitRepo(TEXT("alice"), TEXT("Alice"));
+	GitTest::WriteFile(Alice, TEXT("Source/Game.cpp"), TEXT("v1\n"));
+	GitTest::CommitAll(Alice, TEXT("base"));
+	GitTest::Git(Alice, {TEXT("remote"), TEXT("add"), TEXT("origin"), Origin});
+	GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("-u"), TEXT("origin"), TEXT("main")});
+	const FString Bob = Fixture.Clone(Origin, TEXT("bob"), TEXT("Bob"));
+	auto AlicePushes = [&Alice](const FString& Content)
+	{
+		GitTest::WriteFile(Alice, TEXT("Source/Game.cpp"), Content);
+		GitTest::CommitAll(Alice, TEXT("Game ") + Content);
+		GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+	};
+	// Bob's branch is on the server, with one more commit of his on top.
+	GitTest::Git(Bob, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature")});
+	GitTest::WriteFile(Bob, TEXT("Docs/One.txt"), TEXT("one\n"));
+	GitTest::CommitAll(Bob, TEXT("One"));
+	GitTest::Git(Bob, {TEXT("push"), TEXT("-q"), TEXT("-u"), TEXT("origin"), TEXT("feature")});
+	GitTest::WriteFile(Bob, TEXT("Docs/Two.txt"), TEXT("two\n"));
+	GitTest::CommitAll(Bob, TEXT("Two"));
+	AlicePushes(TEXT("v2\n"));
+	AddExpectedErrorPlain(TEXT("was not updated"), EAutomationExpectedErrorFlags::Contains, 1);
+	AddExpectedErrorPlain(TEXT("[remote rejected]"), EAutomationExpectedErrorFlags::Contains, 1);
+	AddExpectedErrorPlain(TEXT("also on other branches on the server"), EAutomationExpectedErrorFlags::Contains, 1);
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	GitTest::FTestProvider Provider(Bob);
+	GitCore::FPullOptions SyncBranch;
+	SyncBranch.Remote = TEXT("origin");
+	SyncBranch.Branch = TEXT("main");
+	SyncBranch.bSyncBranch = true;
+	Provider->SetPullOptions(SyncBranch);
+	const FString Everything = Bob / TEXT("Source");
+
+	// The server will not let the branch be rewritten: the rebase is kept, and Sync says what is left to do.
+	GitTest::Git(Origin, {TEXT("config"), TEXT("receive.denyNonFastForwards"), TEXT("true")});
+	const FString CopyBefore = Head(Origin, TEXT("feature"));
+	const FSourceControlOperationRef Refused = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Sync reports the refused push"), Run(Provider, Refused, {Everything}), ECommandResult::Failed);
+	TestTrue(TEXT("It says how to retry: ") + Messages(Refused), Messages(Refused).Contains(TEXT("Sync again"), ESearchCase::CaseSensitive));
+	TestEqualSensitive(TEXT("The branch was rebased"), Head(Bob, TEXT("HEAD~2")), Head(Origin, TEXT("main")));
+	TestEqualSensitive(TEXT("The copy on the server is unchanged"), Head(Origin, TEXT("feature")), CopyBefore);
+
+	// Once the server allows it, syncing again only moves the copy; the unpushed commit stays unpushed.
+	GitTest::Git(Origin, {TEXT("config"), TEXT("receive.denyNonFastForwards"), TEXT("false")});
+	const FString HeadBefore = Head(Bob);
+	const FSourceControlOperationRef Retry = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("Syncing again succeeds: ") + Messages(Retry), Run(Provider, Retry, {Everything}), ECommandResult::Succeeded);
+	TestEqualSensitive(TEXT("Nothing was rebased again"), Head(Bob), HeadBefore);
+	TestEqualSensitive(TEXT("The copy has the rebased first commit"), Head(Origin, TEXT("feature")), Head(Bob, TEXT("HEAD~1")));
+	TestTrue(TEXT("The result says the copy matches: ") + Messages(Retry), Messages(Retry).Contains(TEXT("now matches"), ESearchCase::CaseSensitive));
+
+	// Commits that are on another branch on the server too are never rewritten.
+	GitTest::Git(Bob, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("HEAD:refs/heads/shared")});
+	AlicePushes(TEXT("v3\n"));
+	const FString HeadBeforeShared = Head(Bob);
+	TestEqual(TEXT("Sync refuses to rewrite shared commits"), Run(Provider, ISourceControlOperation::Create<FSync>(), {Everything}), ECommandResult::Failed);
+	TestEqualSensitive(TEXT("HEAD did not move"), Head(Bob), HeadBeforeShared);
+	Provider->SetPullOptions({});
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitProviderPublishTest, "GitWorkspace.Provider.CheckInAsksToPublish", ProviderTestFlags)
 bool FGitProviderPublishTest::RunTest(const FString&)
 {

@@ -164,8 +164,12 @@ namespace GitCore
 		 * FallbackRemote is used when the branch has no upstream.
 		 */
 		FOpResult ResolvePush(const FStatusSnapshot& Status, const FString& FallbackRemote, FPushTarget& Out) const;
-		/** Uploads LFS objects then pushes HEAD to Target (setting the upstream when Target says so). */
-		FOpResult Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel) const;
+		/**
+		 * Uploads LFS objects then pushes Commit to Target (setting the upstream when Target says so). With ExpectedOld,
+		 * the branch on the server is replaced only while it is still at that commit (a push with lease), so pushing
+		 * rewritten commits can never drop commits someone else pushed meanwhile.
+		 */
+		FOpResult Push(const FPushTarget& Target, const FCancelTokenPtr& Cancel, const FString& Commit = TEXT("HEAD"), const FString& ExpectedOld = FString()) const;
 		/**
 		 * The files a push of Commit to Remote would change there: those changed by commits none of Remote's branches
 		 * have. A merge counts only for files it changed from every parent, so merging in work that is already on the
@@ -176,8 +180,6 @@ namespace GitCore
 		bool PredictConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const;
 		/** True when the uncommitted changes, set aside and put back after integrating Upstream, would conflict. */
 		bool PredictReapplyConflicts(const FString& Upstream, bool& bOutConflicts, FString& OutError) const;
-		/** Commits on HEAD that no remote-tracking branch has: the only ones a rebase may rewrite. */
-		bool CountUnpublishedCommits(int32& OutCount, FString& OutError) const;
 		/** Brings Upstream's commits into HEAD as Mode says. Aborts cleanly on failure. */
 		FOpResult Integrate(const FString& Upstream, EIntegrate Mode, const FCancelTokenPtr& Cancel) const;
 		bool ChangedPaths(const FString& From, const FString& To, TSet<FString>& Out, FString& OutError) const;
@@ -204,8 +206,21 @@ namespace GitCore
 
 		// Branches (GitRepositoryBranches.cpp)
 		bool ReadBranches(TArray<FBranchInfo>& Out, FString& OutError) const;
-		FOpResult CreateBranch(const FString& Name) const;
+		/** Creates Name and switches to it: at HEAD, or at StartPoint without following it (Push then publishes Name under its own name). */
+		FOpResult CreateBranch(const FString& Name, const FString& StartPoint = FString()) const;
 		FOpResult SwitchBranch(const FString& Name) const;
+		/**
+		 * Lean branching's Finish: puts the current branch's commits on Main and switches to Main without changing a file.
+		 * HEAD must contain Upstream (Main's branch on the server), which must contain Main. One commit moves Main forward to
+		 * it; more are joined to Main by a merge commit whose content is exactly HEAD's. OutCommits: the branch's commits.
+		 */
+		FOpResult FinishBranch(const FString& Main, const FString& Upstream, int32& OutCommits) const;
+		/** The commit id Revision names, or false when it names none. */
+		bool ResolveCommit(const FString& Revision, FString& OutOid) const;
+		/** Whether Ancestor is Descendant or one of its ancestors. */
+		bool IsAncestor(const FString& Ancestor, const FString& Descendant, bool& bOut, FString& OutError) const;
+		/** `git rev-list --count` over Revisions, such as {"origin/main..HEAD"}. */
+		bool CountCommits(const TArray<FString>& Revisions, int32& OutCount, FString& OutError) const;
 
 	private:
 		FGitRepository() = default;

@@ -271,6 +271,90 @@ namespace
 	{
 		return Repository.StashApply(TEXT("stash@{0}"), true, true).bOk || Repository.StashApply(TEXT("stash@{0}"), false, true).bOk;
 	}
+
+	/** The branch's own copy on the server, which lean branching's Sync keeps in step with the rebased branch. */
+	struct FBranchCopy
+	{
+		FPushTarget Target;
+		/** Such as origin/feature; empty when the branch is not on the server. */
+		FString Name;
+		FString Oid;
+	};
+
+	/**
+	 * Finds the branch's copy on the server, and makes sure Sync may replace it: each of its commits must be in the
+	 * branch already, as itself or as a rebased version. Otherwise someone pushed to it, and their commits come first.
+	 */
+	bool ReadBranchCopy(const FGitRepository& Repository, const FSessionSnapshot& Snapshot, const FRemoteState& Source, FBranchCopy& Out, FText& OutError)
+	{
+		if (!Repository.ResolvePush(Snapshot.Status, Repository.DefaultRemote(), Out.Target).bOk || !Out.Target.bExists)
+		{
+			return true;
+		}
+		// Pushing where it pulls from (push.default=upstream) has no copy of its own to keep in step.
+		const FString Name = Out.Target.Remote + TEXT("/") + Out.Target.Branch;
+		if (Name.Equals(Source.Upstream, ESearchCase::CaseSensitive) || !Repository.ResolveCommit(TEXT("refs/remotes/") + Name, Out.Oid))
+		{
+			Out.Oid.Reset();
+			return true;
+		}
+		Out.Name = Name;
+		int32 Missing = 0;
+		FString Error;
+		if (!Repository.CountCommits({TEXT("--cherry-pick"), TEXT("--right-only"), TEXT("--no-merges"), TEXT("HEAD...") + Out.Oid, TEXT("--not"), Source.UpstreamHead}, Missing, Error))
+		{
+			OutError = FText::FromString(Error);
+			return false;
+		}
+		if (Missing > 0)
+		{
+			OutError = FText::Format(LOCTEXT("SyncCopyAhead", "Nothing was changed: {0} has commits this branch does not have. Pull them first, then sync."), FText::FromString(Name));
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * After lean branching's Sync rebased the branch, moves its copy on the server to the rebased versions of the commits it
+	 * had (a push with lease), so commits never pushed stay unpushed. Nothing is pushed when the copy is still in the branch.
+	 */
+	bool UpdateBranchCopy(FGitSourceControlCommand& Command, const FBranchCopy& Copy, const FRemoteState& Source, bool& bOutUpdated)
+	{
+		bOutUpdated = false;
+		const FGitRepository& Repository = Command.Session->GetRepository();
+		bool bContained = false;
+		int32 Unpushed = 0;
+		int32 OnBranch = 0;
+		FString Error;
+		if (!Repository.IsAncestor(Copy.Oid, TEXT("HEAD"), bContained, Error) || (!bContained &&
+			(!Repository.CountCommits({TEXT("--cherry-pick"), TEXT("--left-only"), TEXT("--no-merges"), TEXT("HEAD...") + Copy.Oid, TEXT("--not"), Source.UpstreamHead}, Unpushed, Error) ||
+			!Repository.CountCommits({Source.UpstreamHead + TEXT("..HEAD")}, OnBranch, Error))))
+		{
+			Command.AddError(Error);
+			return false;
+		}
+		if (bContained)
+		{
+			return true;
+		}
+		// The unpushed commits are the newest ones: the copy goes to the commit just below them.
+		FString Commit;
+		const FString Wanted = Unpushed <= 0 ? FString(TEXT("HEAD")) : Unpushed >= OnBranch ? Source.UpstreamHead : FString::Printf(TEXT("HEAD~%d"), Unpushed);
+		FPushTarget Target = Copy.Target;
+		Target.bSetUpstream = false;
+		const FOpResult Pushed = Repository.ResolveCommit(Wanted, Commit) ? Repository.Push(Target, Command.Cancel, Commit, Copy.Oid)
+			: FOpResult::Failure(TEXT("The commit to push could not be found."));
+		Command.Session->RefreshRemote();
+		if (!Pushed.bOk)
+		{
+			Command.AddError(FText::Format(LOCTEXT("SyncCopyNotUpdated", "Rebased onto {0}, but {1} on the server was not updated: {2} Sync again to retry."),
+				FText::FromString(Source.Upstream), FText::FromString(Copy.Name), FText::FromString(Pushed.Message)));
+			Command.AddError(Pushed.Details);
+			return false;
+		}
+		bOutUpdated = true;
+		return true;
+	}
 }
 
 bool FGitConnectWorker::Execute(FGitSourceControlCommand& Command)
@@ -732,9 +816,23 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		Command.AddInfo(LOCTEXT("SyncUnpublished", "This branch has not been published yet, so there is nothing to pull."));
 		return true;
 	}
+	FBranchCopy Copy;
+	FText CopyError;
+	if (Pull.bSyncBranch && !ReadBranchCopy(Repository, *Snapshot, Source, Copy, CopyError))
+	{
+		Command.AddError(CopyError);
+		return false;
+	}
 	if (Source.Behind == 0)
 	{
-		Command.AddInfo(LOCTEXT("SyncUpToDate", "Already up to date."));
+		// The branch is on top already; its copy on the server may still be waiting from a sync whose push failed.
+		bool bCopyUpdated = false;
+		if (!Copy.Name.IsEmpty() && !UpdateBranchCopy(Command, Copy, Source, bCopyUpdated))
+		{
+			return false;
+		}
+		Command.AddInfo(bCopyUpdated ? FText::Format(LOCTEXT("SyncCopyCaughtUp", "Already up to date with {0}. {1} on the server now matches."), FText::FromString(Source.Upstream), FText::FromString(Copy.Name))
+			: LOCTEXT("SyncUpToDate", "Already up to date."));
 		return true;
 	}
 	if (Snapshot->Status.bOperationInProgress || Snapshot->Status.HasConflicts())
@@ -778,17 +876,26 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 	}
 	if (Plan.Mode == EIntegrate::Rebase)
 	{
-		// A rebase rewrites the commits it replays, so never ones the server already has.
-		int32 Unpublished = 0;
-		if (!Repository.CountUnpublishedCommits(Unpublished, Error))
+		// A rebase rewrites the commits it replays, so never ones the server already has; lean branching's Sync
+		// may rewrite those on the branch's own copy, which it moves along afterwards.
+		TArray<FString> Unpublished = {TEXT("HEAD"), TEXT("--not")};
+		if (!Copy.Name.IsEmpty())
+		{
+			Unpublished.Add(TEXT("--exclude=") + Copy.Name);
+		}
+		Unpublished.Add(TEXT("--remotes"));
+		int32 Count = 0;
+		if (!Repository.CountCommits(Unpublished, Count, Error))
 		{
 			Command.AddError(Error);
 			return false;
 		}
-		if (Unpublished < Source.Ahead)
+		if (Count < Source.Ahead)
 		{
-			Command.AddError(FText::Format(LOCTEXT("SyncRewritesPublished", "Nothing was changed: rebasing onto {0} would rewrite commits that are already on the server. Pull from the Git panel with Rebase instead of merge unticked to merge them instead."),
-				FText::FromString(Source.Upstream)));
+			Command.AddError(Pull.bSyncBranch
+				? LOCTEXT("SyncBranchShared", "Nothing was changed: some of this branch's commits are also on other branches on the server, and rebasing would leave those behind. Pull with merge instead.")
+				: FText::Format(LOCTEXT("SyncRewritesPublished", "Nothing was changed: rebasing onto {0} would rewrite commits that are already on the server. Pull from the Git panel with Rebase instead of merge unticked to merge them instead."),
+					FText::FromString(Source.Upstream)));
 			return false;
 		}
 	}
@@ -857,6 +964,8 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 	}
 	const bool bRestored = !Plan.bStash || ReapplyStash(Repository);
 	Session.RefreshStatus();
+	bool bCopyUpdated = false;
+	const bool bCopyInStep = Copy.Name.IsEmpty() || UpdateBranchCopy(Command, Copy, Source, bCopyUpdated);
 	TSet<FString> Changed;
 	if (!OldHead.IsEmpty() && Repository.ChangedPaths(OldHead, TEXT("HEAD"), Changed, Error))
 	{
@@ -878,12 +987,21 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		Command.AddError(FText::Format(LOCTEXT("SyncNotRestored", "Pulled, but your local changes could not be put back. They are kept as the stash \"{0}\" in the Git panel's Stashes tab."),
 			FText::FromString(StashName)));
 	}
-	Command.AddInfo(FText::Format(Plan.Mode == EIntegrate::Merge
-		? LOCTEXT("Merged", "Merged {0} {0}|plural(one=commit,other=commits) from {1}.")
-		: LOCTEXT("Pulled", "Pulled {0} {0}|plural(one=commit,other=commits) from {1}."), Source.Behind, FText::FromString(Source.Upstream)));
+	if (Pull.bSyncBranch)
+	{
+		Command.AddInfo(FText::Format(bCopyUpdated
+			? LOCTEXT("SyncedBranchAndCopy", "Synced with {1}: {0} new {0}|plural(one=commit,other=commits). {2} on the server now matches.")
+			: LOCTEXT("SyncedBranch", "Synced with {1}: {0} new {0}|plural(one=commit,other=commits)."), Source.Behind, FText::FromString(Source.Upstream), FText::FromString(Copy.Name)));
+	}
+	else
+	{
+		Command.AddInfo(FText::Format(Plan.Mode == EIntegrate::Merge
+			? LOCTEXT("Merged", "Merged {0} {0}|plural(one=commit,other=commits) from {1}.")
+			: LOCTEXT("Pulled", "Pulled {0} {0}|plural(one=commit,other=commits) from {1}."), Source.Behind, FText::FromString(Source.Upstream)));
+	}
 	Session.RequestLockRefresh(false);
 	Session.RequestStashesAndBranches();
-	return bRestored;
+	return bRestored && bCopyInStep;
 }
 
 bool FGitMarkForAddWorker::Execute(FGitSourceControlCommand& Command)

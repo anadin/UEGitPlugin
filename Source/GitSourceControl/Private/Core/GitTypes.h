@@ -117,6 +117,11 @@ namespace GitCore
 		bool bRebase = true;
 		/** Local changes in the way are set aside and put back afterwards; off: the pull stops instead. */
 		bool bStash = true;
+		/**
+		 * Lean branching's Sync: the branch is rebased even when its commits are already on the server, then its copy
+		 * there is moved to the rebased commits (a push with lease). Commits that were not pushed stay unpushed.
+		 */
+		bool bSyncBranch = false;
 	};
 
 	struct FRemoteState

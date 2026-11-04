@@ -625,6 +625,161 @@ bool FGitPanelPushAfterMergeTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelLeanBranchingTest, "GitWorkspace.Panel.LeanBranching", PanelTestFlags)
+bool FGitPanelLeanBranchingTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Seed = Fixture.InitRepo(TEXT("seed"));
+	GitTest::WriteFile(Seed, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::WriteFile(Seed, TEXT("notes.txt"), TEXT("notes\n"));
+	GitTest::CommitAll(Seed, TEXT("base"));
+	GitTest::Git(Seed, {TEXT("push"), TEXT("-q"), Origin, TEXT("main")});
+	const FString Alice = Fixture.Clone(Origin, TEXT("alice"), TEXT("Alice"));
+	const FString Bob = Fixture.Clone(Origin, TEXT("bob"), TEXT("Bob"));
+	const FString SeedCommit = PanelHead(Bob);
+	auto AlicePushes = [&Alice](const FString& Content)
+	{
+		GitTest::WriteFile(Alice, TEXT("alice.txt"), Content);
+		GitTest::CommitAll(Alice, TEXT("Alice: ") + Content);
+		GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+	};
+	// Bob's commits leave his local edit to notes.txt alone.
+	auto BobCommits = [&Bob](const FString& Path)
+	{
+		GitTest::WriteFile(Bob, Path, Path + TEXT("\n"));
+		GitTest::Git(Bob, {TEXT("add"), TEXT("--"), Path});
+		GitTest::Git(Bob, {TEXT("commit"), TEXT("-q"), TEXT("--no-verify"), TEXT("-m"), Path, TEXT("--"), Path});
+	};
+	auto Count = [&Bob](const FString& Range) { return GitTest::Output(GitTest::Git(Bob, {TEXT("rev-list"), TEXT("--count"), Range})); };
+	auto Current = [&Bob]() { return GitTest::Output(GitTest::Git(Bob, {TEXT("branch"), TEXT("--show-current")})); };
+	AddExpectedErrorPlain(TEXT("Pull them first, then sync"), EAutomationExpectedErrorFlags::Contains, 1);
+	AddExpectedErrorPlain(TEXT("Sync, then finish"), EAutomationExpectedErrorFlags::Contains, 1);
+	AddExpectedErrorPlain(TEXT("that are not on origin/main"), EAutomationExpectedErrorFlags::Contains, 1);
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Bob);
+	Panel.Refresh();
+	TestTrue(TEXT("Branches are read after connecting"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot)
+	{
+		return Snapshot.Branches.ContainsByPredicate([](const GitCore::FBranchInfo& Branch) { return Branch.bRemote && Branch.Name.Equals(TEXT("origin/main"), ESearchCase::CaseSensitive); });
+	}));
+	FString Main;
+	FString Upstream;
+	TestTrue(TEXT("main is the main branch"), FGitWorkspaceModel::FindMainBranch(*Panel.Provider.Snapshot(), Main, Upstream) &&
+		Main.Equals(TEXT("main"), ESearchCase::CaseSensitive) && Upstream.Equals(TEXT("origin/main"), ESearchCase::CaseSensitive));
+
+	// Start: from origin/main, which is ahead of Bob's main. A local edit comes along.
+	AlicePushes(TEXT("alice 1\n"));
+	GitTest::Git(Bob, {TEXT("fetch"), TEXT("-q"), TEXT("origin")});
+	GitTest::WriteFile(Bob, TEXT("notes.txt"), TEXT("bob's notes\n"));
+	Panel.Refresh();
+	Panel.Model->StartBranch(TEXT("feature"));
+	TestTrue(TEXT("Starting finishes"), Panel.WaitIdle());
+	TestEqualSensitive(TEXT("Bob is on the new branch"), Current(), FString(TEXT("feature")));
+	TestEqualSensitive(TEXT("It starts from origin/main, the newer of the two"), PanelHead(Bob), PanelHead(Bob, TEXT("origin/main")));
+	TestEqualSensitive(TEXT("Bob's main is left where it was"), PanelHead(Bob, TEXT("main")), SeedCommit);
+	TestEqualSensitive(TEXT("The local edit came along"), GitTest::ReadFile(Bob, TEXT("notes.txt")), FString(TEXT("bob's notes\n")));
+	TestTrue(TEXT("The branch follows nothing until it is published"), Panel.Provider.Snapshot()->Status.Upstream.IsEmpty());
+
+	// Sync: the branch is rebased onto the new main, and its copy on the server moves to the rebased commit it had.
+	BobCommits(TEXT("b1.txt"));
+	Panel.Model->Push(true);
+	TestTrue(TEXT("Publishing finishes"), Panel.WaitIdle());
+	BobCommits(TEXT("b2.txt"));
+	AlicePushes(TEXT("alice 2\n"));
+	Panel.Refresh();
+	Panel.Model->SyncBranch();
+	TestEqualSensitive(TEXT("Bob's commits sit on the newest main"), PanelHead(Bob, TEXT("HEAD~2")), PanelHead(Origin, TEXT("main")));
+	TestEqualSensitive(TEXT("The copy on the server has the rebased first commit"), PanelHead(Origin, TEXT("feature")), PanelHead(Bob, TEXT("HEAD~1")));
+	TestEqualSensitive(TEXT("The unpushed commit stays unpushed"), Count(TEXT("origin/feature..HEAD")), FString(TEXT("1")));
+	TestEqualSensitive(TEXT("The local edit is back"), GitTest::ReadFile(Bob, TEXT("notes.txt")), FString(TEXT("bob's notes\n")));
+	TestTrue(TEXT("No stash is left behind"), GitTest::Output(GitTest::Git(Bob, {TEXT("stash"), TEXT("list")})).IsEmpty());
+
+	// Someone else pushed to Bob's branch: Sync changes nothing until Bob has their commit.
+	GitTest::Git(Alice, {TEXT("fetch"), TEXT("-q"), TEXT("origin")});
+	GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), TEXT("-c"), TEXT("feature"), TEXT("origin/feature")});
+	GitTest::WriteFile(Alice, TEXT("from-alice.txt"), TEXT("from alice\n"));
+	GitTest::CommitAll(Alice, TEXT("Alice helps"));
+	GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("feature")});
+	GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), TEXT("main")});
+	AlicePushes(TEXT("alice 3\n"));
+	const FString HeadBefore = PanelHead(Bob);
+	Panel.Model->SyncBranch();
+	TestEqualSensitive(TEXT("Sync refuses: HEAD did not move"), PanelHead(Bob), HeadBefore);
+	TestEqualSensitive(TEXT("Alice's commit on the branch is still on the server"), PanelHead(Origin, TEXT("feature")), PanelHead(Alice, TEXT("feature")));
+	GitTest::Git(Bob, {TEXT("pull"), TEXT("-q"), TEXT("--rebase"), TEXT("--autostash")});
+	Panel.Refresh();
+	Panel.Model->SyncBranch();
+	TestEqualSensitive(TEXT("With her commit in, Sync rebases all three"), PanelHead(Bob, TEXT("HEAD~3")), PanelHead(Origin, TEXT("main")));
+	TestTrue(TEXT("Alice's file is kept"), GitTest::FileExists(Bob, TEXT("from-alice.txt")));
+	TestEqualSensitive(TEXT("The copy has the two pushed commits, rebased"), PanelHead(Origin, TEXT("feature")), PanelHead(Bob, TEXT("HEAD~1")));
+
+	// Finish refuses while main on the server has commits the branch lacks.
+	AlicePushes(TEXT("alice 4\n"));
+	GitTest::Git(Bob, {TEXT("fetch"), TEXT("-q"), TEXT("origin")});
+	Panel.Refresh();
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		Panel.Model->FinishBranch();
+		TestTrue(TEXT("The refused finish finishes"), Panel.WaitIdle());
+		TestEqual(TEXT("Finish asks first"), Yes.Questions.Num(), 1);
+	}
+	TestEqualSensitive(TEXT("Still on feature"), Current(), FString(TEXT("feature")));
+
+	// After a sync, Finish merges the branch into main without touching a file; Push publishes it.
+	Panel.Model->SyncBranch();
+	const FString FeatureHead = PanelHead(Bob);
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		Panel.Model->FinishBranch();
+		TestTrue(TEXT("Finishing finishes"), Panel.WaitIdle());
+	}
+	TestFalse(TEXT("Finish succeeded"), Panel.Model->GetLastFailure().IsSet());
+	TestEqualSensitive(TEXT("Bob is on main"), Current(), FString(TEXT("main")));
+	TestEqualSensitive(TEXT("A merge commit follows origin/main"), PanelHead(Bob, TEXT("HEAD^1")), PanelHead(Bob, TEXT("origin/main")));
+	TestEqualSensitive(TEXT("and joins the branch"), PanelHead(Bob, TEXT("HEAD^2")), FeatureHead);
+	TestEqualSensitive(TEXT("main has exactly the branch's content"), PanelHead(Bob, TEXT("HEAD^{tree}")), PanelHead(Bob, TEXT("feature^{tree}")));
+	TestEqualSensitive(TEXT("Only the local edit differs from main"), GitTest::Output(GitTest::Git(Bob, {TEXT("status"), TEXT("--porcelain")})), FString(TEXT("M notes.txt")));
+	Panel.Model->Push();
+	TestTrue(TEXT("Pushing main finishes"), Panel.WaitIdle());
+	TestEqualSensitive(TEXT("main on the server has the merge"), PanelHead(Origin, TEXT("main")), PanelHead(Bob));
+
+	// A branch of one commit moves main forward to it.
+	Panel.Model->StartBranch(TEXT("fix"));
+	TestTrue(TEXT("Starting fix finishes"), Panel.WaitIdle());
+	BobCommits(TEXT("fix.txt"));
+	Panel.Refresh();
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		Panel.Model->FinishBranch();
+		TestTrue(TEXT("Finishing fix finishes"), Panel.WaitIdle());
+	}
+	TestEqualSensitive(TEXT("main moved forward to the fix"), PanelHead(Bob, TEXT("main")), PanelHead(Bob, TEXT("fix")));
+	TestEqualSensitive(TEXT("Bob is on main again"), Current(), FString(TEXT("main")));
+
+	// Finish refuses while main has commits that are not on the server.
+	Panel.Model->StartBranch(TEXT("other"));
+	TestTrue(TEXT("Starting other finishes"), Panel.WaitIdle());
+	TestEqualSensitive(TEXT("It starts from main, which is ahead of origin/main"), PanelHead(Bob), PanelHead(Bob, TEXT("main")));
+	BobCommits(TEXT("other.txt"));
+	Panel.Refresh();
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		Panel.Model->FinishBranch();
+		TestTrue(TEXT("The second refused finish finishes"), Panel.WaitIdle());
+	}
+	TestEqualSensitive(TEXT("Still on other"), Current(), FString(TEXT("other")));
+
+	// Sync on main pulls with rebase: main's unpushed commit goes on top of the server's.
+	GitTest::Git(Bob, {TEXT("switch"), TEXT("-q"), TEXT("main")});
+	AlicePushes(TEXT("alice 5\n"));
+	Panel.Refresh();
+	Panel.Model->SyncBranch();
+	TestEqualSensitive(TEXT("main's own commit sits on the server's newest"), PanelHead(Bob, TEXT("HEAD~1")), PanelHead(Origin, TEXT("main")));
+	TestTrue(TEXT("The fix is kept"), GitTest::FileExists(Bob, TEXT("fix.txt")));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelFileTreeTest, "GitWorkspace.Panel.FileTree", PanelTestFlags)
 bool FGitPanelFileTreeTest::RunTest(const FString&)
 {

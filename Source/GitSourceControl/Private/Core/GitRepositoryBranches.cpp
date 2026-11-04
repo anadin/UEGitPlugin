@@ -1,5 +1,6 @@
 // Copyright UEGitPlugin contributors. Distributed under the MIT license.
 #include "GitRepository.h"
+#include "GitParse.h"
 
 namespace GitCore
 {
@@ -53,15 +54,30 @@ namespace GitCore
 		return true;
 	}
 
-	FOpResult FGitRepository::CreateBranch(const FString& Name) const
+	FOpResult FGitRepository::CreateBranch(const FString& Name, const FString& StartPoint) const
 	{
 		const FProcessResult Valid = Run(ECallKind::LocalQuick, {TEXT("check-ref-format"), TEXT("--branch"), Name});
 		if (Name.IsEmpty() || Name.StartsWith(TEXT("-")) || !Valid.Succeeded())
 		{
 			return FOpResult::Failure(FString::Printf(TEXT("\"%s\" is not a valid branch name."), *Name));
 		}
-		const FProcessResult Result = Run(ECallKind::LocalMutate, {TEXT("switch"), TEXT("-c"), Name});
-		return Result.Succeeded() ? FOpResult::Success() : FOpResult::Failure(DescribeFailure(Result, TEXT("Creating the branch")), Result.ErrorText());
+		if (StartPoint.IsEmpty())
+		{
+			const FProcessResult Result = Run(ECallKind::LocalMutate, {TEXT("switch"), TEXT("-c"), Name});
+			return Result.Succeeded() ? FOpResult::Success() : FOpResult::Failure(DescribeFailure(Result, TEXT("Creating the branch")), Result.ErrorText());
+		}
+		// Files change to StartPoint's, which can download LFS content, so no timeout applies.
+		const FProcessResult Result = Run(ECallKind::Integrate, {TEXT("switch"), TEXT("--no-track"), TEXT("-c"), Name, StartPoint});
+		if (!Result.Succeeded())
+		{
+			const FString Output = Result.ErrorText();
+			if (Output.Contains(TEXT("would be overwritten")))
+			{
+				return FOpResult::Failure(TEXT("Your local changes would be overwritten. Commit, stash or revert them first."), Output);
+			}
+			return FOpResult::Failure(DescribeFailure(Result, TEXT("Creating the branch")), Output);
+		}
+		return FOpResult::Success();
 	}
 
 	FOpResult FGitRepository::SwitchBranch(const FString& Name) const
@@ -82,5 +98,106 @@ namespace GitCore
 			return FOpResult::Failure(DescribeFailure(Result, TEXT("Switching branch")), Output);
 		}
 		return FOpResult::Success();
+	}
+
+	FOpResult FGitRepository::FinishBranch(const FString& Main, const FString& Upstream, int32& OutCommits) const
+	{
+		OutCommits = 0;
+		const FProcessResult Current = Run(ECallKind::LocalQuick, {TEXT("symbolic-ref"), TEXT("--quiet"), TEXT("--short"), TEXT("HEAD")});
+		const FString Branch = Current.Succeeded() ? Current.StdoutText().TrimStartAndEnd() : FString();
+		if (Branch.IsEmpty() || Branch.Equals(Main, ESearchCase::CaseSensitive))
+		{
+			return FOpResult::Failure(FString::Printf(TEXT("Switch to the branch you want to merge into %s first."), *Main));
+		}
+		FString Head;
+		FString MainOid;
+		FString UpstreamOid;
+		if (!ResolveCommit(TEXT("HEAD"), Head) || !ResolveCommit(TEXT("refs/heads/") + Main, MainOid) || !ResolveCommit(Upstream, UpstreamOid))
+		{
+			return FOpResult::Failure(FString::Printf(TEXT("%s or %s could not be found. Fetch, then try again."), *Main, *Upstream));
+		}
+		bool bMainPushed = false;
+		bool bSynced = false;
+		FString Error;
+		if (!IsAncestor(MainOid, UpstreamOid, bMainPushed, Error) || !IsAncestor(UpstreamOid, Head, bSynced, Error))
+		{
+			return FOpResult::Failure(Error);
+		}
+		if (!bMainPushed)
+		{
+			return FOpResult::Failure(FString::Printf(TEXT("Nothing was changed: %s has commits that are not on %s. Switch to %s and push or pull it first."), *Main, *Upstream, *Main));
+		}
+		if (!bSynced)
+		{
+			return FOpResult::Failure(FString::Printf(TEXT("Nothing was changed: %s has commits this branch does not have. Sync, then finish."), *Upstream));
+		}
+		if (!CountCommits({UpstreamOid + TEXT("..") + Head}, OutCommits, Error))
+		{
+			return FOpResult::Failure(Error);
+		}
+		if (OutCommits == 0)
+		{
+			return FOpResult::Failure(FString::Printf(TEXT("Nothing was changed: %s already has every commit of %s."), *Main, *Branch));
+		}
+
+		// Both ways the new main has exactly HEAD's content, so switching to it changes no file.
+		FString NewMain = Head;
+		if (OutCommits > 1)
+		{
+			const FProcessResult Merge = Run(ECallKind::LocalMutate, {TEXT("commit-tree"), Head + TEXT("^{tree}"), TEXT("-p"), UpstreamOid, TEXT("-p"), Head,
+				TEXT("-m"), FString::Printf(TEXT("Merge branch '%s'"), *Branch)});
+			NewMain = Merge.StdoutText().TrimStartAndEnd();
+			if (!Merge.Succeeded() || !IsObjectId(NewMain))
+			{
+				return FOpResult::Failure(DescribeFailure(Merge, TEXT("Creating the merge commit")), Merge.ErrorText());
+			}
+		}
+		// The old value makes the update fail if main moved meanwhile.
+		const FProcessResult Moved = Run(ECallKind::LocalMutate, {TEXT("update-ref"), TEXT("-m"), TEXT("finish: ") + Branch, TEXT("refs/heads/") + Main, NewMain, MainOid});
+		if (!Moved.Succeeded())
+		{
+			return FOpResult::Failure(DescribeFailure(Moved, TEXT("Moving ") + Main), Moved.ErrorText());
+		}
+		const FProcessResult Switched = Run(ECallKind::LocalMutate, {TEXT("switch"), Main});
+		if (!Switched.Succeeded())
+		{
+			Run(ECallKind::LocalMutate, {TEXT("update-ref"), TEXT("-m"), TEXT("finish: undo"), TEXT("refs/heads/") + Main, MainOid, NewMain});
+			return FOpResult::Failure(DescribeFailure(Switched, TEXT("Switching to ") + Main), Switched.ErrorText());
+		}
+		return FOpResult::Success();
+	}
+
+	bool FGitRepository::ResolveCommit(const FString& Revision, FString& OutOid) const
+	{
+		const FProcessResult Result = Run(ECallKind::LocalQuick, {TEXT("rev-parse"), TEXT("--verify"), TEXT("--quiet"), TEXT("--end-of-options"), Revision + TEXT("^{commit}")});
+		OutOid = Result.Succeeded() ? Result.StdoutText().TrimStartAndEnd() : FString();
+		return !OutOid.IsEmpty();
+	}
+
+	bool FGitRepository::IsAncestor(const FString& Ancestor, const FString& Descendant, bool& bOut, FString& OutError) const
+	{
+		const FProcessResult Result = Run(ECallKind::LocalScan, {TEXT("merge-base"), TEXT("--is-ancestor"), Ancestor, Descendant});
+		if (Result.Exited() && (Result.ExitCode == 0 || Result.ExitCode == 1))
+		{
+			bOut = Result.ExitCode == 0;
+			return true;
+		}
+		OutError = DescribeFailure(Result, TEXT("Comparing branches"));
+		return false;
+	}
+
+	bool FGitRepository::CountCommits(const TArray<FString>& Revisions, int32& OutCount, FString& OutError) const
+	{
+		TArray<FString> Args = {TEXT("rev-list"), TEXT("--count")};
+		Args.Append(Revisions);
+		Args.Add(TEXT("--"));
+		const FProcessResult Result = Run(ECallKind::LocalScan, MoveTemp(Args));
+		if (!Result.Succeeded())
+		{
+			OutError = DescribeFailure(Result, TEXT("Counting commits"));
+			return false;
+		}
+		OutCount = FCString::Atoi(*Result.StdoutText());
+		return true;
 	}
 }

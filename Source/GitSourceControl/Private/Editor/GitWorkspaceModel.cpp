@@ -249,6 +249,22 @@ namespace
 		return FGitActionResult::FromOp(Pushed);
 	}
 
+	/** Splits a remote branch's name, such as origin/main, into remote and branch. Remote names may hold slashes, so the longest match wins. */
+	bool SplitRemoteBranch(const GitCore::FSessionSnapshot& Snapshot, const FString& Name, FString& OutRemote, FString& OutBranch)
+	{
+		OutRemote.Reset();
+		OutBranch.Reset();
+		for (const FString& Remote : Snapshot.Remotes)
+		{
+			if (Name.StartsWith(Remote + TEXT("/"), ESearchCase::CaseSensitive) && Remote.Len() > OutRemote.Len())
+			{
+				OutRemote = Remote;
+				OutBranch = Name.Mid(Remote.Len() + 1);
+			}
+		}
+		return !OutRemote.IsEmpty();
+	}
+
 	/** Waits on the game thread for Op to run on the mutation lane, with a progress dialog. */
 	FGitActionResult RunAndWait(const GitCore::FGitSessionRef& Session, const FText& Activity, TFunctionRef<FGitActionResult(GitCore::FGitSession&)> Op)
 	{
@@ -584,6 +600,11 @@ void FGitWorkspaceModel::PullWithOptions()
 		Options.Remote.Reset();
 		Options.Branch.Reset();
 	}
+	SyncWith(Options);
+}
+
+void FGitWorkspaceModel::SyncWith(const GitCore::FPullOptions& Options)
+{
 	// Unreal's Sync runs its preview and the pull before returning, so both see these options.
 	FGitSourceControlProvider& Provider = GetProvider();
 	Provider.SetPullOptions(Options);
@@ -591,6 +612,12 @@ void FGitWorkspaceModel::PullWithOptions()
 	{
 		Provider.SetPullOptions({});
 	};
+	if (BoundProvider)
+	{
+		// Nothing is loaded from a test repository: its provider syncs it directly.
+		Provider.Execute(ISourceControlOperation::Create<FSync>(), {GetSession()->GetRepository().GetRoot()}, EConcurrency::Synchronous);
+		return;
+	}
 	FSourceControlWindows::SyncLatest();
 }
 
@@ -605,29 +632,16 @@ GitCore::FPullOptions FGitWorkspaceModel::PullChoices(const GitCore::FSessionSna
 	{
 		OutBranches.Add(Remote);
 	}
-	// A remote branch's name starts with its remote's; remote names may hold slashes, so the longest match wins.
-	auto Split = [&Snapshot](const FString& Name, FString& OutRemote, FString& OutBranch)
-	{
-		for (const FString& Remote : Snapshot.Remotes)
-		{
-			if (Name.StartsWith(Remote + TEXT("/")) && Remote.Len() > OutRemote.Len())
-			{
-				OutRemote = Remote;
-				OutBranch = Name.Mid(Remote.Len() + 1);
-			}
-		}
-		return !OutRemote.IsEmpty();
-	};
 	for (const GitCore::FBranchInfo& Branch : Snapshot.Branches)
 	{
 		FString Remote;
 		FString Name;
-		if (Branch.bRemote && Split(Branch.Name, Remote, Name))
+		if (Branch.bRemote && SplitRemoteBranch(Snapshot, Branch.Name, Remote, Name))
 		{
 			OutBranches.FindOrAdd(Remote).Add(Name);
 		}
 	}
-	if (!Snapshot.Status.Upstream.IsEmpty() && Split(Snapshot.Status.Upstream, Options.Remote, Options.Branch))
+	if (!Snapshot.Status.Upstream.IsEmpty() && SplitRemoteBranch(Snapshot, Snapshot.Status.Upstream, Options.Remote, Options.Branch))
 	{
 		OutBranches.FindOrAdd(Options.Remote).AddUnique(Options.Branch);
 		return Options;
@@ -1007,6 +1021,179 @@ void FGitWorkspaceModel::SwitchBranch(const FString& Name)
 			return Switched.bOk ? FGitActionResult::Success(FText::Format(LOCTEXT("Switched", "Switched to {0}."), FText::FromString(Name))) : FGitActionResult::FromOp(Switched);
 		});
 	}, true);
+}
+
+bool FGitWorkspaceModel::FindMainBranch(const GitCore::FSessionSnapshot& Snapshot, FString& OutBranch, FString& OutUpstream)
+{
+	for (const TCHAR* Candidate : {TEXT("main"), TEXT("master"), TEXT("develop")})
+	{
+		const GitCore::FBranchInfo* Local = Snapshot.Branches.FindByPredicate([Candidate](const GitCore::FBranchInfo& Branch)
+		{
+			return !Branch.bRemote && Branch.Name.Equals(Candidate, ESearchCase::CaseSensitive);
+		});
+		// Sync and Finish work against its branch on the server, so that must have been fetched.
+		if (Local && Snapshot.Branches.ContainsByPredicate([Local](const GitCore::FBranchInfo& Branch)
+			{
+				return Branch.bRemote && !Local->Upstream.IsEmpty() && Branch.Name.Equals(Local->Upstream, ESearchCase::CaseSensitive);
+			}))
+		{
+			OutBranch = Local->Name;
+			OutUpstream = Local->Upstream;
+			return true;
+		}
+	}
+	return false;
+}
+
+void FGitWorkspaceModel::StartBranch(const FString& Name)
+{
+	FString Main;
+	FString Upstream;
+	if (!FindMainBranch(*GetSnapshot(), Main, Upstream))
+	{
+		return;
+	}
+	struct FStart
+	{
+		FString From;
+		FString Oid;
+	};
+	const TSharedRef<FStart> Start = MakeShared<FStart>();
+	const FText Doing = FText::Format(LOCTEXT("StartingBranch", "Starting {0}…"), FText::FromString(Name));
+	// First, without changing anything: pick where to start, refuse when local changes are in the way, and download LFS files.
+	Run(Doing, ELane::Mutation, [Main, Upstream, Start](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		const GitCore::FGitRepository& Repository = Session.GetRepository();
+		Session.RefreshStatus();
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		if (Snapshot->Status.bOperationInProgress)
+		{
+			return FGitActionResult::Failure(LOCTEXT("StartMidOperation", "Finish the merge or rebase in progress before starting a branch."));
+		}
+		// The newer of the two, so the branch has everything known of main: its upstream, unless main has commits of its own.
+		bool bMainBehind = false;
+		FString Error;
+		if (!Repository.IsAncestor(Main, Upstream, bMainBehind, Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error));
+		}
+		Start->From = bMainBehind ? Upstream : Main;
+		if (!Repository.ResolveCommit(Start->From, Start->Oid))
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("StartNotFound", "{0} could not be found. Fetch, then try again."), FText::FromString(Start->From)));
+		}
+		TSet<FString> Switched;
+		if (!Snapshot->Status.bUnborn && !Repository.ChangedPaths(TEXT("HEAD"), Start->Oid, Switched, Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error));
+		}
+		TArray<FString> Overlap;
+		for (const GitCore::FStatusEntry& Entry : Snapshot->Status.Entries)
+		{
+			if (Switched.Contains(Entry.Path))
+			{
+				Overlap.Add(Entry.Path);
+			}
+		}
+		if (!Overlap.IsEmpty())
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("StartOverlap", "Nothing was changed: {0} also differs on {1}. Commit, stash or discard those changes first."),
+				GitWorkspaceText::FileList(Overlap), FText::FromString(Start->From)));
+		}
+		const FString Remote = Repository.DefaultRemote();
+		if (!Remote.IsEmpty() && !Switched.IsEmpty())
+		{
+			const GitCore::FOpResult Downloaded = Repository.FetchLfsObjects(Remote, Start->Oid, Cancel);
+			if (!Downloaded.bOk)
+			{
+				return FGitActionResult::FromOp(Downloaded);
+			}
+		}
+		FGitActionResult Prepared = FGitActionResult::Success();
+		Prepared.Paths = Switched.Array();
+		return Prepared;
+	},
+	[this, Name, Doing, Start](const FGitActionResult& Prepared)
+	{
+		if (!Prepared.bOk)
+		{
+			return;
+		}
+		ApplyAndReload(Doing, Prepared.Paths, [Name, Start](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+		{
+			const GitCore::FOpResult Created = Session.GetRepository().CreateBranch(Name, Start->Oid);
+			Session.RefreshStatus();
+			Session.RefreshBranches();
+			return Created.bOk ? FGitActionResult::Success(FText::Format(LOCTEXT("BranchStarted", "Started {0} on {1}. Push to publish it."), FText::FromString(Name), FText::FromString(Start->From)))
+				: FGitActionResult::FromOp(Created);
+		});
+	}, true);
+}
+
+void FGitWorkspaceModel::SyncBranch()
+{
+	if (!IsActive() || IsBusy())
+	{
+		return;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	FString Main;
+	FString Upstream;
+	GitCore::FPullOptions Options;
+	if (Snapshot->Status.Branch.IsEmpty() || !FindMainBranch(*Snapshot, Main, Upstream) || !SplitRemoteBranch(*Snapshot, Upstream, Options.Remote, Options.Branch))
+	{
+		return;
+	}
+	Options.bRebase = true;
+	Options.bStash = true;
+	Options.bSyncBranch = !Snapshot->Status.Branch.Equals(Main, ESearchCase::CaseSensitive);
+	SyncWith(Options);
+}
+
+void FGitWorkspaceModel::FinishBranch()
+{
+	if (!IsActive() || IsBusy())
+	{
+		return;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	const FString Branch = Snapshot->Status.Branch;
+	FString Main;
+	FString Upstream;
+	if (Branch.IsEmpty() || !FindMainBranch(*Snapshot, Main, Upstream) || Branch.Equals(Main, ESearchCase::CaseSensitive))
+	{
+		return;
+	}
+	if (!GitWorkspaceDialogs::Confirm(LOCTEXT("FinishTitle", "Finish branch"),
+		FText::Format(LOCTEXT("FinishPrompt", "Merge {0} into {1} and switch to {1}? Your files stay as they are, and nothing is pushed until you push {1}."), FText::FromString(Branch), FText::FromString(Main)),
+		{}, LOCTEXT("FinishButton", "Finish")))
+	{
+		return;
+	}
+	Run(FText::Format(LOCTEXT("Finishing", "Finishing {0}…"), FText::FromString(Branch)), ELane::Mutation, [Branch, Main, Upstream](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		Session.RefreshStatus();
+		const GitCore::FSessionSnapshotRef Current = Session.GetSnapshot();
+		if (Current->Status.bOperationInProgress || Current->Status.HasConflicts())
+		{
+			return FGitActionResult::Failure(LOCTEXT("FinishMidOperation", "Finish the merge or rebase in progress (or resolve its conflicts) first."));
+		}
+		if (!Current->Status.Branch.Equals(Branch, ESearchCase::CaseSensitive))
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("FinishMoved", "Nothing was changed: you are no longer on {0}."), FText::FromString(Branch)));
+		}
+		int32 Commits = 0;
+		const GitCore::FOpResult Finished = Session.GetRepository().FinishBranch(Main, Upstream, Commits);
+		Session.RefreshStatus();
+		Session.RefreshBranches();
+		if (!Finished.bOk)
+		{
+			return FGitActionResult::FromOp(Finished);
+		}
+		return FGitActionResult::Success(Commits == 1
+			? FText::Format(LOCTEXT("FinishedOne", "Finished {0}: {1} now has its commit. Push {1} to publish it."), FText::FromString(Branch), FText::FromString(Main))
+			: FText::Format(LOCTEXT("FinishedMerge", "Finished {0}: its {2} commits are merged into {1}. Push {1} to publish them."), FText::FromString(Branch), FText::FromString(Main), Commits));
+	});
 }
 
 void FGitWorkspaceModel::StashChanges(const FString& Message, bool bIncludeUntracked)
