@@ -37,6 +37,7 @@
 - Git panel: committing with Ctrl+Enter (Cmd+Enter on macOS), or Ctrl+Shift+Enter to push as well, now empties the message box as clicking Commit does; the message stayed in the box while it had the keyboard. A message typed while the commit runs is kept for the next one.
 - Git panel: History draws the branch graph, as other Git clients do: a line per line of history and a dot per commit, curves where branches split off and merge, your branch's line in blue and its server copy's in purple like their labels, and the uncommitted changes as a ring on your branch's line. Commits are listed with each above its parents (git log --date-order), even when the clocks of the computers that made them disagree. A search hides the graph.
 - Git panel: typing a space in a new branch's name (New branch, Start branch) types a dash, as other Git clients do: "Fishing panel" becomes "Fishing-panel" as you type. Spaces in pasted text become dashes too; the dialog shows the name it will use.
+- A short manual, [Docs/Manual.md](Docs/Manual.md), walks through everyday use: Pull, check out, check in, undo, locks, the Git panel and branches. The README links to it, and says how far Windows has got.
 
 ## 4.0.0-alpha
 
