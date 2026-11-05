@@ -27,6 +27,7 @@
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SSearchBox.h"
 #include "Widgets/SWindow.h"
@@ -394,6 +395,51 @@ bool FGitPanelCommitKeyTest::RunTest(const FString&)
 	CommitWithKeys(TEXT("Committed and pushed with the keyboard"), true);
 	TestEqualSensitive(TEXT("Shift pushes as well"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
 	CommitWithKeys(TEXT("Committed while typing on"), false, TEXT("The next message"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelBranchNameSpacesTest, "GitWorkspace.Panel.BranchNameSpaces", PanelTestFlags)
+bool FGitPanelBranchNameSpacesTest::RunTest(const FString&)
+{
+	TestEqualSensitive(TEXT("Pasted spaces become dashes, and blanks at the ends go"), GitWorkspaceDialogs::SpacesAsDashes(TEXT("  feature/Fishing panel\tpolish ")),
+		FString(TEXT("feature/Fishing-panel-polish")));
+
+	// Typing goes through a text box that has the keyboard, which takes a window.
+#if PLATFORM_MAC
+	if (!FApp::CanEverRender())
+	{
+		// Without rendering a window has no native window, and macOS's input methods say so when a text box takes the keyboard.
+		AddExpectedErrorPlain(TEXT("a context failed when its window couldn't be found"), EAutomationExpectedErrorFlags::Contains, 0);
+	}
+#endif
+	const TSharedRef<SEditableTextBox> Box = SNew(SEditableTextBox).OnKeyCharHandler_Static(&GitWorkspaceDialogs::TypeDashForSpace);
+	const TSharedRef<SWindow> Window = SNew(SWindow).Title(FText::FromString(TEXT("Branch name"))).ClientSize(FVector2D(420.0f, 80.0f));
+	Window->SetContent(Box);
+	FSlateApplication::Get().AddWindow(Window);
+	ON_SCOPE_EXIT
+	{
+		Window->RequestDestroyWindow();
+	};
+	FSlateApplication::Get().SetKeyboardFocus(Box, EFocusCause::SetDirectly);
+	if (!TestTrue(TEXT("The box has the keyboard"), Box->HasKeyboardFocus()))
+	{
+		return false;
+	}
+	auto Type = [](const FString& Text)
+	{
+		for (const TCHAR Char : Text)
+		{
+			FSlateApplication::Get().ProcessKeyCharEvent(FCharacterEvent(Char, FModifierKeysState(), FSlateApplication::Get().GetUserIndexForKeyboard(), false));
+		}
+	};
+	Type(TEXT("feature/Fishing panel pol"));
+	TestEqualSensitive(TEXT("A space typed is a dash"), Box->GetText().ToString(), FString(TEXT("feature/Fishing-panel-pol")));
+	Box->GoTo(FTextLocation(0, 8));
+	Type(TEXT(" "));
+	TestEqualSensitive(TEXT("It goes where the cursor is"), Box->GetText().ToString(), FString(TEXT("feature/-Fishing-panel-pol")));
+	Box->SelectAllText();
+	Type(TEXT(" "));
+	TestEqualSensitive(TEXT("And replaces what is selected"), Box->GetText().ToString(), FString(TEXT("-")));
 	return true;
 }
 

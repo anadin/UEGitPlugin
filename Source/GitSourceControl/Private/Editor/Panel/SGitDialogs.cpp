@@ -369,7 +369,31 @@ namespace GitWorkspaceDialogs
 		return bAccepted;
 	}
 
-	bool AskForText(const FText& Title, const FText& Prompt, const FText& Hint, FString& InOutValue, TFunction<FText(const FString&)> Validate)
+	FReply TypeDashForSpace(const FGeometry&, const FCharacterEvent& Event)
+	{
+		if (Event.GetCharacter() != TEXT(' '))
+		{
+			return FReply::Unhandled();
+		}
+		// The text box types the dash itself, at the cursor and over any selection, as it would have typed the space.
+		FSlateApplication::Get().ProcessKeyCharEvent(FCharacterEvent(TEXT('-'), Event.GetModifierKeys(), Event.GetUserIndex(), Event.IsRepeat()));
+		return FReply::Handled();
+	}
+
+	FString SpacesAsDashes(const FString& Text)
+	{
+		FString Name = Text.TrimStartAndEnd();
+		for (int32 Index = 0; Index < Name.Len(); ++Index)
+		{
+			if (FChar::IsWhitespace(Name[Index]))
+			{
+				Name[Index] = TEXT('-');
+			}
+		}
+		return Name;
+	}
+
+	bool AskForText(const FText& Title, const FText& Prompt, const FText& Hint, FString& InOutValue, TFunction<FText(const FString&)> Validate, bool bSpacesAsDashes)
 	{
 		if (FApp::IsUnattended())
 		{
@@ -379,7 +403,9 @@ namespace GitWorkspaceDialogs
 		FString Value = InOutValue;
 		const TSharedRef<SWindow> Window = MakeWindow(Title);
 		TWeakPtr<SWindow> WeakWindow = Window;
-		auto Error = [&Value, Validate]() { return Validate ? Validate(Value.TrimStartAndEnd()) : FText::GetEmpty(); };
+		// What OK takes: the text trimmed, and with bSpacesAsDashes the spaces of pasted text as dashes (typed ones already are).
+		auto Taken = [&Value, bSpacesAsDashes]() { return bSpacesAsDashes ? SpacesAsDashes(Value) : Value.TrimStartAndEnd(); };
+		auto Error = [Taken, Validate]() { return Validate ? Validate(Taken()) : FText::GetEmpty(); };
 		auto Accept = [&bAccepted, WeakWindow, Error]()
 		{
 			if (Error().IsEmpty())
@@ -416,6 +442,10 @@ namespace GitWorkspaceDialogs
 						.Text(FText::FromString(Value))
 						.HintText(Hint)
 						.SelectAllTextWhenFocused(true)
+						.OnKeyCharHandler_Lambda([bSpacesAsDashes](const FGeometry& Geometry, const FCharacterEvent& Event)
+						{
+							return bSpacesAsDashes ? TypeDashForSpace(Geometry, Event) : FReply::Unhandled();
+						})
 						.OnTextChanged_Lambda([&Value](const FText& Text) { Value = Text.ToString(); })
 						.OnTextCommitted_Lambda([&Value, Accept](const FText& Text, ETextCommit::Type Commit)
 						{
@@ -430,9 +460,18 @@ namespace GitWorkspaceDialogs
 					.AutoHeight()
 					.Padding(0.0f, 4.0f, 0.0f, 0.0f)
 					[
+						// What is wrong with the text, or else what pasted spaces become.
 						SNew(STextBlock)
-						.Text_Lambda(Error)
-						.ColorAndOpacity(FStyleColors::Error)
+						.Text_Lambda([Error, Taken, &Value]()
+						{
+							const FText Problem = Error();
+							if (!Problem.IsEmpty() || Taken().Equals(Value.TrimStartAndEnd(), ESearchCase::CaseSensitive))
+							{
+								return Problem;
+							}
+							return FText::Format(LOCTEXT("SpacesBecomeDashes", "Spaces become dashes: {0}"), FText::FromString(Taken()));
+						})
+						.ColorAndOpacity_Lambda([Error]() { return Error().IsEmpty() ? FSlateColor::UseSubduedForeground() : FStyleColors::Error; })
 						.AutoWrapText(true)
 					]
 					+ SVerticalBox::Slot()
@@ -449,7 +488,7 @@ namespace GitWorkspaceDialogs
 		FSlateApplication::Get().AddModalWindow(Window, FSlateApplication::Get().GetActiveTopLevelWindow());
 		if (bAccepted)
 		{
-			InOutValue = Value.TrimStartAndEnd();
+			InOutValue = Taken();
 		}
 		return bAccepted;
 	}

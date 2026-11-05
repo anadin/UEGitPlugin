@@ -19,8 +19,16 @@ namespace GitWorkspaceDialogs
 	 * remote's branches; InOutOptions comes in with the ones to show picked. False when cancelled.
 	 */
 	bool AskPull(const FString& Into, const TMap<FString, TArray<FString>>& RemoteBranches, GitCore::FPullOptions& InOutOptions);
-	/** Asks for one line of text. Validate returns an error to show, or empty text when the value is fine. */
-	bool AskForText(const FText& Title, const FText& Prompt, const FText& Hint, FString& InOutValue, TFunction<FText(const FString&)> Validate = nullptr);
+	/**
+	 * Asks for one line of text. Validate returns an error to show, or empty text when the value is fine. With
+	 * bSpacesAsDashes (branch names), typing a space types a dash, and spaces that come with pasted text become dashes.
+	 */
+	bool AskForText(const FText& Title, const FText& Prompt, const FText& Hint, FString& InOutValue, TFunction<FText(const FString&)> Validate = nullptr,
+		bool bSpacesAsDashes = false);
+	/** For a text box's OnKeyCharHandler: a space typed into it types a dash instead, as Git clients do in branch names. */
+	FReply TypeDashForSpace(const FGeometry& Geometry, const FCharacterEvent& Event);
+	/** Text as a branch name takes it: trimmed, with its spaces (and other blanks) as dashes. */
+	FString SpacesAsDashes(const FString& Text);
 
 	/** While one is alive, Confirm shows nothing: it keeps each question and gives the answer (tests). */
 	struct FScopedConfirmAnswer

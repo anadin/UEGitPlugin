@@ -632,10 +632,10 @@ bool SGitPanel::AskBranchName(const FText& Title, const FText& Prompt, FString& 
 			}
 			if (Value.Contains(TEXT(" ")) || Value.StartsWith(TEXT("-")) || Value.Contains(TEXT("..")) || Value.EndsWith(TEXT("/")) || Value.EndsWith(TEXT(".lock")))
 			{
-				return LOCTEXT("NameInvalid", "Use letters, numbers, - _ . and / (no spaces).");
+				return LOCTEXT("NameInvalid", "Use letters, numbers, - _ . and /.");
 			}
 			return Existing.Contains(Value) ? LOCTEXT("NameTaken", "A branch with this name already exists.") : FText::GetEmpty();
-		});
+		}, true);
 }
 
 void SGitPanel::CreateBranch()
