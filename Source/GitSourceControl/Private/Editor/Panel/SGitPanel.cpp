@@ -102,6 +102,7 @@ void SGitPanel::Construct(const FArguments& InArgs, const TSharedRef<FGitWorkspa
 				+ SWidgetSwitcher::Slot()
 				[
 					SAssignNew(HistoryView, SGitHistoryView, InModel)
+					.OnShowChanges_Lambda([this]() { SetTab(ETab::Changes); })
 				]
 				+ SWidgetSwitcher::Slot()
 				[

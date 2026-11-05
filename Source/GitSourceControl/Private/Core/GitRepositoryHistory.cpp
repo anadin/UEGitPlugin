@@ -9,18 +9,31 @@
 
 namespace GitCore
 {
-	bool FGitRepository::ReadHistory(int32 Limit, TArray<FHistoryCommit>& Out, bool& bOutHasMore, FString& OutError) const
+	bool FGitRepository::ReadHistory(int32 Limit, const FString& Upstream, TArray<FHistoryCommit>& Out, bool& bOutHasMore, FString& OutError) const
 	{
 		Out.Reset();
 		bOutHasMore = false;
-		const FProcessResult Head = Run(ECallKind::LocalQuick, {TEXT("rev-parse"), TEXT("--verify"), TEXT("--quiet"), TEXT("HEAD")});
-		if (!Head.Succeeded())
+		FString Head;
+		if (!ResolveCommit(TEXT("HEAD"), Head))
 		{
 			// No commits yet.
 			return true;
 		}
-		const FProcessResult Log = Run(ECallKind::LocalScan, {TEXT("log"), TEXT("-z"), TEXT("--no-notes"), TEXT("--encoding=UTF-8"),
-			FString::Printf(TEXT("--max-count=%d"), Limit + 1), LogFormat, Head.StdoutText().TrimStartAndEnd(), TEXT("--")});
+		FString UpstreamHead;
+		const bool bHasUpstream = !Upstream.IsEmpty() && ResolveCommit(Upstream, UpstreamHead);
+		if (UpstreamHead.Equals(Head, ESearchCase::CaseSensitive))
+		{
+			// Nothing to push or pull: only HEAD's history, unmarked.
+			UpstreamHead.Reset();
+		}
+		const FString MaxCount = FString::Printf(TEXT("--max-count=%d"), Limit + 1);
+		TArray<FString> Args = {TEXT("log"), TEXT("-z"), TEXT("--no-notes"), TEXT("--encoding=UTF-8"), MaxCount, LogFormat, Head};
+		if (!UpstreamHead.IsEmpty())
+		{
+			Args.Add(UpstreamHead);
+		}
+		Args.Add(TEXT("--"));
+		const FProcessResult Log = Run(ECallKind::LocalScan, MoveTemp(Args));
 		if (!Log.Succeeded() || !ParseLog(Log.Stdout, Out, OutError))
 		{
 			if (!Log.Succeeded())
@@ -33,6 +46,48 @@ namespace GitCore
 		if (bOutHasMore)
 		{
 			Out.SetNum(Limit);
+		}
+
+		// Which side each commit is on. Listed in the same order as the log, the first Limit + 1 cover every commit shown.
+		TArray<FString> Sides;
+		if (!UpstreamHead.IsEmpty())
+		{
+			Sides = {TEXT("rev-list"), TEXT("--left-right"), MaxCount, Head + TEXT("...") + UpstreamHead, TEXT("--")};
+		}
+		else if (!bHasUpstream && Run(ECallKind::LocalQuick, {TEXT("for-each-ref"), TEXT("--count=1"), TEXT("refs/remotes")}).StdoutText().TrimStartAndEnd().Len() > 0)
+		{
+			Sides = {TEXT("rev-list"), MaxCount, Head, TEXT("--not"), TEXT("--remotes"), TEXT("--")};
+		}
+		if (Sides.IsEmpty())
+		{
+			return true;
+		}
+		const FProcessResult Marked = Run(ECallKind::LocalScan, MoveTemp(Sides));
+		if (!Marked.Succeeded())
+		{
+			OutError = DescribeFailure(Marked, TEXT("Comparing with the upstream"));
+			return false;
+		}
+		TArray<FString> Lines;
+		Marked.StdoutText().ParseIntoArrayLines(Lines);
+		TSet<FString> Unpushed;
+		TSet<FString> Incoming;
+		for (const FString& Line : Lines)
+		{
+			// "<oid" is only on HEAD, ">oid" only on the upstream; plain ids (no upstream) are unpushed.
+			if (Line.StartsWith(TEXT(">")))
+			{
+				Incoming.Add(Line.Mid(1));
+			}
+			else
+			{
+				Unpushed.Add(Line.StartsWith(TEXT("<")) ? Line.Mid(1) : Line);
+			}
+		}
+		for (FHistoryCommit& Commit : Out)
+		{
+			Commit.bUnpushed = Unpushed.Contains(Commit.Oid);
+			Commit.bIncoming = Incoming.Contains(Commit.Oid);
 		}
 		return true;
 	}

@@ -1439,7 +1439,7 @@ void FGitWorkspaceModel::ApplyAndReload(const FText& InActivity, const TArray<FS
 	});
 }
 
-void FGitWorkspaceModel::LoadHistory(int32 Limit, TFunction<void(TArray<GitCore::FHistoryCommit>&&, bool, const FString&)> OnLoaded)
+void FGitWorkspaceModel::LoadHistory(int32 Limit, const FString& Upstream, TFunction<void(TArray<GitCore::FHistoryCommit>&&, bool, const FString&)> OnLoaded)
 {
 	const GitCore::FGitSessionPtr Session = GetSession();
 	if (!Session.IsValid())
@@ -1447,12 +1447,12 @@ void FGitWorkspaceModel::LoadHistory(int32 Limit, TFunction<void(TArray<GitCore:
 		OnLoaded({}, false, FString());
 		return;
 	}
-	Session->EnqueueRead([Session, Limit, OnLoaded]()
+	Session->EnqueueRead([Session, Limit, Upstream, OnLoaded]()
 	{
 		TArray<GitCore::FHistoryCommit> Commits;
 		bool bHasMore = false;
 		FString Error;
-		Session->GetRepository().ReadHistory(Limit, Commits, bHasMore, Error);
+		Session->GetRepository().ReadHistory(Limit, Upstream, Commits, bHasMore, Error);
 		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Commits = MoveTemp(Commits), bHasMore, Error]() mutable
 		{
 			OnLoaded(MoveTemp(Commits), bHasMore, Error);

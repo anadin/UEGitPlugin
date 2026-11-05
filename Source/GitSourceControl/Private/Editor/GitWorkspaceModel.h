@@ -114,8 +114,8 @@ public:
 	void ApplyStash(const FString& Selector, bool bDrop);
 	void DropStash(const FString& Selector);
 
-	/** Reads history on the session's read lane; OnLoaded runs on the game thread. */
-	void LoadHistory(int32 Limit, TFunction<void(TArray<GitCore::FHistoryCommit>&& Commits, bool bHasMore, const FString& Error)> OnLoaded);
+	/** Reads the history of HEAD and of Upstream (empty for none) on the session's read lane; OnLoaded runs on the game thread. */
+	void LoadHistory(int32 Limit, const FString& Upstream, TFunction<void(TArray<GitCore::FHistoryCommit>&& Commits, bool bHasMore, const FString& Error)> OnLoaded);
 	void LoadCommit(const FString& Oid, TFunction<void(GitCore::FCommitDetails&& Details, const FString& Error)> OnLoaded);
 	void LoadStashPaths(const FString& Selector, TFunction<void(TArray<FString>&& Paths, const FString& Error)> OnLoaded);
 	/** A changed file's text diff, staged or unstaged side; a new file shows its whole content. OnLoaded runs on the game thread. */

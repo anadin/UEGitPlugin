@@ -189,7 +189,12 @@ namespace GitCore
 		bool HasUnpublishedChanges(const FString& Path, bool& bOutUnpublished, FString& OutError) const;
 
 		// History (GitRepositoryHistory.cpp)
-		bool ReadHistory(int32 Limit, TArray<FHistoryCommit>& Out, bool& bOutHasMore, FString& OutError) const;
+		/**
+		 * The newest Limit commits of HEAD and of Upstream (HEAD's remote-tracking branch or its commit, or empty), newest first.
+		 * Commits only HEAD has are unpushed and commits only Upstream has incoming; without an upstream (or one that is gone),
+		 * the commits no remote-tracking branch has are unpushed.
+		 */
+		bool ReadHistory(int32 Limit, const FString& Upstream, TArray<FHistoryCommit>& Out, bool& bOutHasMore, FString& OutError) const;
 		bool ReadCommit(const FString& Oid, FCommitDetails& Out, FString& OutError) const;
 		bool ReadFileHistory(const FString& Path, int32 Limit, TArray<FFileRevision>& Out, FString& OutError) const;
 		/** Writes the filtered (LFS-smudged) bytes of Path at Revision to Destination. */

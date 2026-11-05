@@ -164,6 +164,54 @@ bool FGitRemotePushedPathsTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRemoteHistorySidesTest, "GitWorkspace.Remote.HistorySides", RemoteTestFlags)
+bool FGitRemoteHistorySidesTest::RunTest(const FString&)
+{
+	FTwoClones Clones;
+	const GitCore::FGitRepositoryPtr Repository = GitTest::OpenRepository(*this, Clones.A);
+	if (!Repository.IsValid())
+	{
+		return false;
+	}
+	Clones.PushFromB(TEXT("b.txt"), TEXT("b\n"), TEXT("B's work"));
+	Repository->Fetch(TEXT("origin"), GitCore::ECallKind::UserNetwork, nullptr);
+	GitTest::WriteFile(Clones.A, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::CommitAll(Clones.A, TEXT("A's work"));
+
+	// The commits listed, each with "up" when only HEAD has it and "down" when only the upstream has it. Sorted:
+	// commits made in the same second may be listed either way round.
+	auto Read = [this, &Repository](int32 Limit, const FString& Upstream, bool* bOutHasMore = nullptr)
+	{
+		TArray<GitCore::FHistoryCommit> Commits;
+		bool bHasMore = false;
+		FString Error;
+		TestTrue(TEXT("History is read: ") + Error, Repository->ReadHistory(Limit, Upstream, Commits, bHasMore, Error));
+		if (bOutHasMore)
+		{
+			*bOutHasMore = bHasMore;
+		}
+		TArray<FString> Marked;
+		for (const GitCore::FHistoryCommit& Commit : Commits)
+		{
+			Marked.Add(Commit.Subject + (Commit.bUnpushed ? TEXT(" up") : TEXT("")) + (Commit.bIncoming ? TEXT(" down") : TEXT("")));
+		}
+		Marked.Sort([](const FString& X, const FString& Y) { return X.Compare(Y, ESearchCase::CaseSensitive) < 0; });
+		return GitTest::Joined(Marked);
+	};
+	const FString BothSides = GitTest::Joined({TEXT("A's work up"), TEXT("B's work down"), TEXT("initial")});
+	TestEqualSensitive(TEXT("With the upstream, both sides are listed and marked"), Read(10, TEXT("origin/main")), BothSides);
+	const FString UpstreamHead = GitTest::Output(GitTest::Git(Clones.A, {TEXT("rev-parse"), TEXT("origin/main")}));
+	TestEqualSensitive(TEXT("The upstream can be given by its commit"), Read(10, UpstreamHead), BothSides);
+	TestEqualSensitive(TEXT("Without one, what no remote has is unpushed"), Read(10, FString()), GitTest::Joined({TEXT("A's work up"), TEXT("initial")}));
+	TestEqualSensitive(TEXT("An upstream that is gone counts as none"), Read(10, TEXT("origin/gone")), GitTest::Joined({TEXT("A's work up"), TEXT("initial")}));
+	TestEqualSensitive(TEXT("An upstream at HEAD marks nothing"), Read(10, TEXT("HEAD")), GitTest::Joined({TEXT("A's work"), TEXT("initial")}));
+	bool bHasMore = false;
+	const FString Newest = Read(1, TEXT("origin/main"), &bHasMore);
+	TestTrue(TEXT("A short read keeps the newest commit, marked: ") + Newest, Newest.Equals(TEXT("A's work up"), ESearchCase::CaseSensitive) || Newest.Equals(TEXT("B's work down"), ESearchCase::CaseSensitive));
+	TestTrue(TEXT("And says there is more"), bHasMore);
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRemotePushTest, "GitWorkspace.Remote.PushUpstreamAndRejection", RemoteTestFlags)
 bool FGitRemotePushTest::RunTest(const FString&)
 {

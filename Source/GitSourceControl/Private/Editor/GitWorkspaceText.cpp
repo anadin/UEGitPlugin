@@ -11,6 +11,8 @@
 #include "Styling/SlateIconFinder.h"
 #include "UObject/PrimaryAssetId.h"
 
+#include <time.h>
+
 #define LOCTEXT_NAMESPACE "GitWorkspaceText"
 
 namespace GitWorkspaceText
@@ -31,6 +33,54 @@ namespace GitWorkspaceText
 			return FText::Format(LOCTEXT("HoursAgo", "{0} h ago"), FText::AsNumber(FMath::FloorToInt(Seconds / 3600.0)));
 		}
 		return FText::Format(LOCTEXT("DaysAgo", "{0} days ago"), FText::AsNumber(FMath::FloorToInt(Seconds / 86400.0)));
+	}
+
+	namespace
+	{
+		/** The wall-clock time a UTC moment had here, daylight saving included. */
+		FDateTime ToLocalTime(const FDateTime& Utc)
+		{
+			const time_t Seconds = static_cast<time_t>(Utc.ToUnixTimestamp());
+			tm Local;
+#if PLATFORM_WINDOWS
+			const bool bConverted = localtime_s(&Local, &Seconds) == 0;
+#else
+			const bool bConverted = localtime_r(&Seconds, &Local) != nullptr;
+#endif
+			return bConverted ? FDateTime(Local.tm_year + 1900, Local.tm_mon + 1, Local.tm_mday, Local.tm_hour, Local.tm_min, FMath::Min(Local.tm_sec, 59)) : Utc;
+		}
+	}
+
+	FText DayAndTime(const FDateTime& Utc)
+	{
+		return DayAndTimeLocal(ToLocalTime(Utc), ToLocalTime(FDateTime::UtcNow()));
+	}
+
+	FText DayAndTimeLocal(const FDateTime& Local, const FDateTime& Today)
+	{
+		FNumberFormattingOptions TwoDigits = FNumberFormattingOptions::DefaultNoGrouping();
+		TwoDigits.MinimumIntegralDigits = 2;
+		const FText Clock = FText::Format(LOCTEXT("ClockTime", "{0}:{1} {2}"), FText::AsNumber(Local.GetHour12()), FText::AsNumber(Local.GetMinute(), &TwoDigits),
+			Local.IsMorning() ? LOCTEXT("ClockAm", "am") : LOCTEXT("ClockPm", "pm"));
+		const FDateTime Day = Local.GetDate();
+		if (Day == Today.GetDate())
+		{
+			return FText::Format(LOCTEXT("TodayAt", "Today at {0}"), Clock);
+		}
+		if (Day == Today.GetDate() - FTimespan::FromDays(1.0))
+		{
+			return FText::Format(LOCTEXT("YesterdayAt", "Yesterday at {0}"), Clock);
+		}
+		const FText Months[] = {LOCTEXT("MonthJan", "Jan"), LOCTEXT("MonthFeb", "Feb"), LOCTEXT("MonthMar", "Mar"), LOCTEXT("MonthApr", "Apr"),
+			LOCTEXT("MonthMay", "May"), LOCTEXT("MonthJun", "Jun"), LOCTEXT("MonthJul", "Jul"), LOCTEXT("MonthAug", "Aug"), LOCTEXT("MonthSep", "Sep"),
+			LOCTEXT("MonthOct", "Oct"), LOCTEXT("MonthNov", "Nov"), LOCTEXT("MonthDec", "Dec")};
+		const FText Month = Months[Local.GetMonth() - 1];
+		if (Local.GetYear() == Today.GetYear())
+		{
+			return FText::Format(LOCTEXT("DayMonthAt", "{0} {1} at {2}"), FText::AsNumber(Local.GetDay()), Month, Clock);
+		}
+		return FText::Format(LOCTEXT("DayMonthYearAt", "{0} {1} {2} at {3}"), FText::AsNumber(Local.GetDay()), Month,
+			FText::AsNumber(Local.GetYear(), &FNumberFormattingOptions::DefaultNoGrouping()), Clock);
 	}
 
 	namespace

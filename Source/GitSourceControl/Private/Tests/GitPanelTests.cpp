@@ -187,6 +187,24 @@ namespace
 		return StaticCastSharedPtr<STreeView<SGitChangesView::FItemPtr>>(FindTagged(Panel, Tag));
 	}
 
+	using FCommitList = SListView<SGitHistoryView::FCommitPtr>;
+
+	/** The History tab's list of commits. */
+	TSharedPtr<FCommitList> HistoryList(const TSharedRef<SWidget>& View)
+	{
+		return StaticCastSharedPtr<FCommitList>(FindTagged(View, TEXT("GitPanel.History.Commits")));
+	}
+
+	/** The listed commit with this id, or with this summary. */
+	SGitHistoryView::FCommitPtr FindListed(const FCommitList& List, const FString& OidOrSubject)
+	{
+		const SGitHistoryView::FCommitPtr* Found = List.GetItems().FindByPredicate([&OidOrSubject](const SGitHistoryView::FCommitPtr& Commit)
+		{
+			return !Commit->Oid.IsEmpty() && (Commit->Oid.Equals(OidOrSubject, ESearchCase::CaseSensitive) || Commit->Subject.Equals(OidOrSubject, ESearchCase::CaseSensitive));
+		});
+		return Found ? *Found : nullptr;
+	}
+
 	/** Selects the first item of a tagged list in the panel. */
 	template<typename ItemType>
 	void SelectFirst(const TSharedRef<SWidget>& Panel, FName Tag)
@@ -733,14 +751,15 @@ bool FGitPanelMenuShortcutsTest::RunTest(const FString&)
 	// History: Ctrl+C copies the selected commit's id.
 	const TSharedRef<SGitHistoryView> History = SNew(SGitHistoryView, Panel.Model);
 	History->RefreshIfNeeded();
-	const TSharedPtr<SListView<SGitHistoryView::FCommitPtr>> Commits = StaticCastSharedPtr<SListView<SGitHistoryView::FCommitPtr>>(FindTagged(History, TEXT("GitPanel.History.Commits")));
-	if (!TestTrue(TEXT("History lists the commit"), Commits.IsValid() && GitTest::WaitFor([&Commits]() { return !Commits->GetItems().IsEmpty(); })))
+	const TSharedPtr<FCommitList> Commits = HistoryList(History);
+	const FString Head = PanelHead(Repo);
+	if (!TestTrue(TEXT("History lists the commit"), Commits.IsValid() && GitTest::WaitFor([&Commits, &Head]() { return FindListed(*Commits, Head).IsValid(); })))
 	{
 		return false;
 	}
-	Commits->SetSelection(Commits->GetItems()[0], ESelectInfo::OnMouseClick);
+	Commits->SetSelection(FindListed(*Commits, Head), ESelectInfo::OnMouseClick);
 	TestTrue(TEXT("Ctrl+C is taken in the commit list"), Press(Commits.ToSharedRef(), EKeys::C, true));
-	TestEqualSensitive(TEXT("It copies the commit id"), Copied(), PanelHead(Repo));
+	TestEqualSensitive(TEXT("It copies the commit id"), Copied(), Head);
 
 	// Stashes: Delete deletes the selected stash, after asking.
 	Panel.Provider->GetSession()->RequestStashesAndBranches();
@@ -965,6 +984,149 @@ bool FGitPanelLeanBranchingTest::RunTest(const FString&)
 	Panel.Model->SyncBranch();
 	TestEqualSensitive(TEXT("main's own commit sits on the server's newest"), PanelHead(Bob, TEXT("HEAD~1")), PanelHead(Origin, TEXT("main")));
 	TestTrue(TEXT("The fix is kept"), GitTest::FileExists(Bob, TEXT("fix.txt")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelHistoryLabelsTest, "GitWorkspace.Panel.HistoryLabels", PanelTestFlags)
+bool FGitPanelHistoryLabelsTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Seed = Fixture.InitRepo(TEXT("seed"));
+	GitTest::WriteFile(Seed, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::CommitAll(Seed, TEXT("base"));
+	GitTest::Git(Seed, {TEXT("push"), TEXT("-q"), Origin, TEXT("main")});
+	const FString Repo = Fixture.Clone(Origin, TEXT("work"));
+	const FString Other = Fixture.Clone(Origin, TEXT("other"), TEXT("Bob"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	bool bShowedChanges = false;
+	const TSharedRef<SGitHistoryView> History = SNew(SGitHistoryView, Panel.Model).OnShowChanges_Lambda([&bShowedChanges]() { bShowedChanges = true; });
+	const TSharedPtr<FCommitList> List = HistoryList(History);
+	if (!TestTrue(TEXT("The commit list is tagged"), List.IsValid()))
+	{
+		return false;
+	}
+	// Reloads as the panel does when the repository changes, until Done.
+	auto Listed = [&Panel, &History](TFunctionRef<bool()> Done)
+	{
+		return GitTest::WaitFor([&Panel, &History, &Done]()
+		{
+			Panel.Provider->Tick();
+			History->RefreshIfNeeded();
+			return Done();
+		});
+	};
+	auto Row = [&History, &List](const SGitHistoryView::FCommitPtr& Commit)
+	{
+		return Commit.IsValid() ? AllTexts(History->OnGenerateCommitRow(Commit, List.ToSharedRef())->AsWidget()) : TArray<FString>();
+	};
+	auto UncommittedIndex = [&History, &List]() { return List->GetItems().IndexOfByPredicate([&History](const SGitHistoryView::FCommitPtr& Commit) { return History->IsUncommitted(Commit); }); };
+	auto Press = [](const TSharedRef<SWidget>& Widget, FKey Key, bool bControl = false)
+	{
+		const FModifierKeysState Keys(false, false, bControl, false, false, false, false, false, false);
+		return Widget->OnKeyDown(FGeometry(), FKeyEvent(Key, Keys, 0, false, 0, 0)).IsEventHandled();
+	};
+
+	// In step with the server: the branch and its upstream are labelled side by side.
+	TestTrue(TEXT("History is read"), Listed([&List]() { return FindListed(*List, TEXT("base")).IsValid(); }));
+	TArray<FString> Base = Row(FindListed(*List, TEXT("base")));
+	TestTrue(TEXT("The branch is labelled: ") + GitTest::Joined(Base), GitTest::HasExactly(Base, TEXT("main")));
+	TestTrue(TEXT("Its upstream is labelled on the same commit"), GitTest::HasExactly(Base, TEXT("origin/main")));
+	TestTrue(TEXT("The date says when, in words"), Base.ContainsByPredicate([](const FString& Text) { return Text.StartsWith(TEXT("Today at "), ESearchCase::CaseSensitive); }));
+	TestEqual(TEXT("Without changes there is no row for them"), UncommittedIndex(), INDEX_NONE);
+
+	// A teammate's commit comes in with a fetch, and one of yours is not pushed yet.
+	GitTest::WriteFile(Other, TEXT("b.txt"), TEXT("b\n"));
+	GitTest::CommitAll(Other, TEXT("theirs"));
+	GitTest::Git(Other, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+	Panel.Model->Fetch();
+	Panel.WaitIdle();
+	GitTest::WriteFile(Repo, TEXT("c.txt"), TEXT("c\n"));
+	GitTest::CommitAll(Repo, TEXT("mine"));
+	Panel.Refresh();
+	TestTrue(TEXT("Both sides are listed"), Listed([&List]() { return FindListed(*List, TEXT("mine")).IsValid() && FindListed(*List, TEXT("theirs")).IsValid(); }));
+	const SGitHistoryView::FCommitPtr Mine = FindListed(*List, TEXT("mine"));
+	const SGitHistoryView::FCommitPtr Theirs = FindListed(*List, TEXT("theirs"));
+	if (!TestTrue(TEXT("The commits are found"), Mine.IsValid() && Theirs.IsValid() && FindListed(*List, TEXT("base")).IsValid()))
+	{
+		return false;
+	}
+	TestTrue(TEXT("Your commit is not pushed yet"), Mine->bUnpushed && !Mine->bIncoming);
+	TestTrue(TEXT("The teammate's is not in your branch yet"), Theirs->bIncoming && !Theirs->bUnpushed);
+	const TArray<FString> MineRow = Row(Mine);
+	const TArray<FString> TheirsRow = Row(Theirs);
+	Base = Row(FindListed(*List, TEXT("base")));
+	TestTrue(TEXT("The branch label is on your commit: ") + GitTest::Joined(MineRow), GitTest::HasExactly(MineRow, TEXT("main")) && !GitTest::HasExactly(MineRow, TEXT("origin/main")));
+	TestTrue(TEXT("The upstream label is on the teammate's: ") + GitTest::Joined(TheirsRow), GitTest::HasExactly(TheirsRow, TEXT("origin/main")) && !GitTest::HasExactly(TheirsRow, TEXT("main")));
+	TestTrue(TEXT("The commit both share has no label"), !GitTest::HasExactly(Base, TEXT("main")) && !GitTest::HasExactly(Base, TEXT("origin/main")));
+	TestFalse(TEXT("The shared commit is not marked"), FindListed(*List, TEXT("base"))->bUnpushed || FindListed(*List, TEXT("base"))->bIncoming);
+
+	// Uncommitted changes are a row right above the commit they would follow.
+	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("a changed\n"));
+	Panel.Refresh();
+	TestTrue(TEXT("The changes are listed"), Listed([&UncommittedIndex]() { return UncommittedIndex() != INDEX_NONE; }));
+	const int32 HeadIndex = List->GetItems().IndexOfByKey(FindListed(*List, TEXT("mine")));
+	TestEqual(TEXT("They sit right above HEAD's commit"), UncommittedIndex(), HeadIndex - 1);
+	const SGitHistoryView::FCommitPtr Changes = UncommittedIndex() != INDEX_NONE ? List->GetItems()[UncommittedIndex()] : nullptr;
+	TArray<FString> ChangesRow = Row(Changes);
+	TestTrue(TEXT("The row is titled: ") + GitTest::Joined(ChangesRow), GitTest::HasExactly(ChangesRow, TEXT("Uncommitted changes")));
+	TestTrue(TEXT("It counts the changes not staged"), GitTest::HasExactly(ChangesRow, TEXT("1 file not staged")));
+	Panel.Model->Stage({TEXT("a.txt")});
+	TestTrue(TEXT("Staging shows up"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
+	History->RefreshIfNeeded();
+	ChangesRow = Row(Changes);
+	TestTrue(TEXT("Staged changes are counted as ready: ") + GitTest::Joined(ChangesRow), GitTest::HasExactly(ChangesRow, TEXT("1 file staged, ready to commit")));
+
+	// Opening the row shows the changes in the Changes tab; it has no id to copy.
+	List->SetSelection(Changes, ESelectInfo::OnMouseClick);
+	TestFalse(TEXT("Ctrl+C has nothing to copy"), Press(List.ToSharedRef(), EKeys::C, true));
+	TestTrue(TEXT("Enter is taken"), Press(List.ToSharedRef(), EKeys::Enter));
+	TestTrue(TEXT("Enter shows the Changes tab"), bShowedChanges);
+
+	// A search lists only the commits that match.
+	const TSharedPtr<SSearchBox> Search = StaticCastSharedPtr<SSearchBox>(FindTagged(History, TEXT("GitPanel.History.Search")));
+	if (TestTrue(TEXT("The search is tagged"), Search.IsValid()))
+	{
+		Search->SetText(FText::FromString(TEXT("mine")));
+		TestEqual(TEXT("Searching lists the match alone"), List->GetItems().Num(), 1);
+		Search->SetText(FText::GetEmpty());
+		TestTrue(TEXT("Clearing the search brings the changes back"), UncommittedIndex() != INDEX_NONE);
+	}
+
+	// Committing them moves the branch's label to the new commit, and the row goes.
+	Panel.Model->Commit(TEXT("more"), false);
+	TestTrue(TEXT("The commit finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("The new commit is listed"), Listed([&List]() { return FindListed(*List, TEXT("more")).IsValid(); }));
+	TestEqual(TEXT("No changes are left to list"), UncommittedIndex(), INDEX_NONE);
+	TestTrue(TEXT("The branch label moved on"), GitTest::HasExactly(Row(FindListed(*List, TEXT("more"))), TEXT("main")) && !GitTest::HasExactly(Row(FindListed(*List, TEXT("mine"))), TEXT("main")));
+
+	// Without a branch, HEAD is labelled as such.
+	GitTest::Git(Repo, {TEXT("switch"), TEXT("-q"), TEXT("--detach")});
+	Panel.Refresh();
+	TestTrue(TEXT("A detached HEAD is labelled HEAD"), Listed([&List, &Row]() { return GitTest::HasExactly(Row(FindListed(*List, TEXT("more"))), TEXT("HEAD")); }));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelDayAndTimeTest, "GitWorkspace.Panel.DayAndTime", PanelTestFlags)
+bool FGitPanelDayAndTimeTest::RunTest(const FString&)
+{
+	const FDateTime Now(2026, 11, 5, 16, 40, 0);
+	auto Shown = [&Now](int32 Year, int32 Month, int32 Day, int32 Hour, int32 Minute)
+	{
+		return GitWorkspaceText::DayAndTimeLocal(FDateTime(Year, Month, Day, Hour, Minute, 0), Now).ToString();
+	};
+	TestEqualSensitive(TEXT("Today"), Shown(2026, 11, 5, 9, 15), FString(TEXT("Today at 9:15 am")));
+	TestEqualSensitive(TEXT("Yesterday"), Shown(2026, 11, 4, 14, 30), FString(TEXT("Yesterday at 2:30 pm")));
+	TestEqualSensitive(TEXT("Earlier this year"), Shown(2026, 11, 3, 13, 15), FString(TEXT("3 Nov at 1:15 pm")));
+	TestEqualSensitive(TEXT("Another year"), Shown(2025, 11, 3, 13, 15), FString(TEXT("3 Nov 2025 at 1:15 pm")));
+	TestEqualSensitive(TEXT("Just after midnight"), Shown(2026, 11, 5, 0, 5), FString(TEXT("Today at 12:05 am")));
+	TestEqualSensitive(TEXT("Noon"), Shown(2026, 11, 5, 12, 0), FString(TEXT("Today at 12:00 pm")));
+	TestEqualSensitive(TEXT("Yesterday in the month before"), GitWorkspaceText::DayAndTimeLocal(FDateTime(2026, 10, 31, 23, 59, 0), FDateTime(2026, 11, 1, 8, 0, 0)).ToString(),
+		FString(TEXT("Yesterday at 11:59 pm")));
+	TestEqualSensitive(TEXT("Yesterday in the year before"), GitWorkspaceText::DayAndTimeLocal(FDateTime(2025, 12, 31, 18, 0, 0), FDateTime(2026, 1, 1, 8, 0, 0)).ToString(),
+		FString(TEXT("Yesterday at 6:00 pm")));
+	TestTrue(TEXT("Now is today, in local time"), GitWorkspaceText::DayAndTime(FDateTime::UtcNow()).ToString().StartsWith(TEXT("Today at "), ESearchCase::CaseSensitive));
 	return true;
 }
 
@@ -1460,7 +1622,17 @@ bool FGitPanelScreenshotsTest::RunTest(const FString&)
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Window->Resize(FVector2D(460.0f, 680.0f) * State->Window->GetDPIScaleFactor()); }, 0.1f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Capture(TEXT("changes-narrow")); }, 1.0f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { State->Window->Resize(FVector2D(1180.0f, 680.0f) * State->Window->GetDPIScaleFactor()); State->Widget->ShowTab(1); }, 0.1f));
-	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]() { SelectFirst<SGitHistoryView::FCommitPtr>(State->Widget.ToSharedRef(), TEXT("GitPanel.History.Commits")); }, 2.0f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
+	{
+		// The newest commit, below the uncommitted changes.
+		if (const TSharedPtr<FCommitList> Commits = HistoryList(State->Widget.ToSharedRef()))
+		{
+			if (const SGitHistoryView::FCommitPtr* Commit = Commits->GetItems().FindByPredicate([](const SGitHistoryView::FCommitPtr& Each) { return !Each->Oid.IsEmpty(); }))
+			{
+				Commits->SetSelection(*Commit, ESelectInfo::OnMouseClick);
+			}
+		}
+	}, 2.0f));
 	ADD_LATENT_AUTOMATION_COMMAND(FDelayedFunctionLatentCommand([State]()
 	{
 		// The commit's first file, inside its folders.

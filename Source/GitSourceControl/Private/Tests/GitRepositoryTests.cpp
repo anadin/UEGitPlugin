@@ -125,7 +125,7 @@ bool FGitRepositoryCommitMessagesTest::RunTest(const FString&)
 	TArray<GitCore::FHistoryCommit> History;
 	bool bHasMore = false;
 	FString Error;
-	TestTrue(TEXT("History is read"), Repository->ReadHistory(10, History, bHasMore, Error));
+	TestTrue(TEXT("History is read"), Repository->ReadHistory(10, FString(), History, bHasMore, Error));
 	TestEqualSensitive(TEXT("Its summary is the first line only"), History.IsEmpty() ? FString() : History[0].Subject, FString(TEXT("Old summary")));
 	return true;
 }
@@ -329,7 +329,7 @@ bool FGitRepositoryHistoryTest::RunTest(const FString&)
 	TArray<GitCore::FHistoryCommit> Commits;
 	bool bHasMore = true;
 	FString Error;
-	TestTrue(TEXT("An unborn branch has empty history"), Repository->ReadHistory(10, Commits, bHasMore, Error) && Commits.IsEmpty() && !bHasMore);
+	TestTrue(TEXT("An unborn branch has empty history"), Repository->ReadHistory(10, FString(), Commits, bHasMore, Error) && Commits.IsEmpty() && !bHasMore);
 
 	GitTest::WriteFile(Repo, TEXT("a.txt"), TEXT("one\n"));
 	const FString First = GitTest::CommitAll(Repo, TEXT("first"));
@@ -338,7 +338,8 @@ bool FGitRepositoryHistoryTest::RunTest(const FString&)
 	GitTest::Git(Repo, {TEXT("mv"), TEXT("a.txt"), TEXT("b b.txt")});
 	const FString Third = GitTest::CommitAll(Repo, TEXT("rename"));
 
-	TestTrue(TEXT("History is newest first"), Repository->ReadHistory(2, Commits, bHasMore, Error) && Commits.Num() == 2 && Commits[0].Oid.Equals(Third, ESearchCase::CaseSensitive) && bHasMore);
+	TestTrue(TEXT("History is newest first"), Repository->ReadHistory(2, FString(), Commits, bHasMore, Error) && Commits.Num() == 2 && Commits[0].Oid.Equals(Third, ESearchCase::CaseSensitive) && bHasMore);
+	TestFalse(TEXT("Without a remote, nothing is marked unpushed"), Commits.ContainsByPredicate([](const GitCore::FHistoryCommit& Commit) { return Commit.bUnpushed || Commit.bIncoming; }));
 	GitCore::FCommitDetails Details;
 	TestTrue(TEXT("A commit's files are listed"), Repository->ReadCommit(Third, Details, Error) && Details.Files.Num() == 2);
 	TestTrue(TEXT("The root commit compares with nothing"), Repository->ReadCommit(First, Details, Error) && Details.Files.Num() == 1 && Details.Files[0].Status == TEXT('A'));

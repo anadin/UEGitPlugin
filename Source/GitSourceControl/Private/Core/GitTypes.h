@@ -169,6 +169,10 @@ namespace GitCore
 		/** The first line of the message. */
 		FString Subject;
 		TArray<FString> Parents;
+		/** Only the branch has it: pushing publishes it. */
+		bool bUnpushed = false;
+		/** Only the branch's upstream has it: pulling brings it in. */
+		bool bIncoming = false;
 	};
 
 	struct FHistoryChange

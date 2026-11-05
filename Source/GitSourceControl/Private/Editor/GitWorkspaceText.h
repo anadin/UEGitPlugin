@@ -16,6 +16,10 @@ namespace GitWorkspaceText
 {
 	/** "just now", "5 min ago", "3 h ago", "2 days ago". */
 	FText Age(const FDateTime& Utc);
+	/** "Today at 9:15 am", "Yesterday at 2:30 pm", "3 Nov at 1:15 pm", or "3 Nov 2025 at 1:15 pm" in another year: local time. */
+	FText DayAndTime(const FDateTime& Utc);
+	/** DayAndTime for a time that is already local, seen on the local date Today. */
+	FText DayAndTimeLocal(const FDateTime& Local, const FDateTime& Today);
 	/** "Modified", "Added", "Deleted", "Renamed", "New", "Conflict" for one side of a status entry. */
 	FText ChangeKind(const GitCore::FStatusEntry& Entry, bool bStaged);
 	/** Icon from the revision control style for one side of a status entry. */
