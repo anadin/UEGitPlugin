@@ -4,6 +4,7 @@
 #include "GitTestFixtures.h"
 #include "Editor/GitWorkspaceModel.h"
 #include "Editor/Panel/GitFileTree.h"
+#include "Editor/Panel/GitHistoryGraph.h"
 #include "Editor/Panel/SGitDialogs.h"
 #include "Editor/Panel/SGitChangesView.h"
 #include "Editor/Panel/SGitDiffView.h"
@@ -1138,6 +1139,15 @@ bool FGitPanelHistoryLabelsTest::RunTest(const FString&)
 	TArray<FString> ChangesRow = Row(Changes);
 	TestTrue(TEXT("The row is titled: ") + GitTest::Joined(ChangesRow), GitTest::HasExactly(ChangesRow, TEXT("Uncommitted changes")));
 	TestTrue(TEXT("It counts the changes not staged"), GitTest::HasExactly(ChangesRow, TEXT("1 file not staged")));
+	const GitHistoryGraph::FRow* ChangesGraph = History->FindGraphRow(Changes);
+	const GitHistoryGraph::FRow* HeadGraph = History->FindGraphRow(FindListed(*List, TEXT("mine")));
+	if (TestTrue(TEXT("Every row has its part of the graph"), ChangesGraph != nullptr && HeadGraph != nullptr))
+	{
+		TestTrue(TEXT("The changes' line leads into HEAD's commit"), ChangesGraph->Out.Num() == 1 && ChangesGraph->Out[0].To == HeadGraph->Lane
+			&& HeadGraph->In.ContainsByPredicate([ChangesGraph](const GitHistoryGraph::FLine& Line) { return Line.From == ChangesGraph->Lane; }));
+		TestEqual(TEXT("Your branch's line is blue"), HeadGraph->Color, 0);
+		TestEqual(TEXT("Your commits and the server's make two lanes"), History->GetGraphLanes(), 2);
+	}
 	Panel.Model->Stage({TEXT("a.txt")});
 	TestTrue(TEXT("Staging shows up"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
 	History->RefreshIfNeeded();
@@ -1156,6 +1166,7 @@ bool FGitPanelHistoryLabelsTest::RunTest(const FString&)
 	{
 		Search->SetText(FText::FromString(TEXT("mine")));
 		TestEqual(TEXT("Searching lists the match alone"), List->GetItems().Num(), 1);
+		TestTrue(TEXT("Without its neighbours a row has no graph"), History->GetGraphLanes() == 0 && History->FindGraphRow(List->GetItems()[0]) == nullptr);
 		Search->SetText(FText::GetEmpty());
 		TestTrue(TEXT("Clearing the search brings the changes back"), UncommittedIndex() != INDEX_NONE);
 	}
@@ -1171,6 +1182,86 @@ bool FGitPanelHistoryLabelsTest::RunTest(const FString&)
 	GitTest::Git(Repo, {TEXT("switch"), TEXT("-q"), TEXT("--detach")});
 	Panel.Refresh();
 	TestTrue(TEXT("A detached HEAD is labelled HEAD"), Listed([&List, &Row]() { return GitTest::HasExactly(Row(FindListed(*List, TEXT("more"))), TEXT("HEAD")); }));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelHistoryGraphTest, "GitWorkspace.Panel.HistoryGraph", PanelTestFlags)
+bool FGitPanelHistoryGraphTest::RunTest(const FString&)
+{
+	// Lays out commits written "oid:parent,parent", newest first, and reads each row back as
+	// "lane.color in[from>to.color] out[...] by[...]": lines into the dot, out of it, and passing by.
+	auto Graph = [this](std::initializer_list<const TCHAR*> Spec, const FString& HeadTip, const FString& UpstreamTip = FString())
+	{
+		TArray<GitCore::FHistoryCommit> Commits;
+		for (const TCHAR* Each : Spec)
+		{
+			GitCore::FHistoryCommit& Commit = Commits.AddDefaulted_GetRef();
+			FString Parents;
+			if (!FString(Each).Split(TEXT(":"), &Commit.Oid, &Parents))
+			{
+				Commit.Oid = Each;
+			}
+			Parents.ParseIntoArray(Commit.Parents, TEXT(","));
+		}
+		TArray<const GitCore::FHistoryCommit*> Listed;
+		for (const GitCore::FHistoryCommit& Commit : Commits)
+		{
+			Listed.Add(&Commit);
+		}
+		auto Lines = [](const TArray<GitHistoryGraph::FLine>& Each)
+		{
+			TArray<FString> Parts;
+			for (const GitHistoryGraph::FLine& Line : Each)
+			{
+				Parts.Add(FString::Printf(TEXT("%d>%d.%d"), Line.From, Line.To, Line.Color));
+			}
+			return FString::Join(Parts, TEXT(" "));
+		};
+		const TArray<GitHistoryGraph::FRow> Rows = GitHistoryGraph::Layout(Listed, HeadTip, UpstreamTip);
+		TestEqual(TEXT("A row per commit"), Rows.Num(), Commits.Num());
+		TArray<FString> Shown;
+		for (const GitHistoryGraph::FRow& Row : Rows)
+		{
+			Shown.Add(FString::Printf(TEXT("%d.%d in[%s] out[%s] by[%s]"), Row.Lane, Row.Color, *Lines(Row.In), *Lines(Row.Out), *Lines(Row.Through)));
+		}
+		return GitTest::Joined(Shown) + FString::Printf(TEXT(" | lanes %d"), GitHistoryGraph::CountLanes(Rows));
+	};
+	auto Expect = [](std::initializer_list<const TCHAR*> Rows, int32 Lanes)
+	{
+		TArray<FString> Shown;
+		for (const TCHAR* Row : Rows)
+		{
+			Shown.Add(Row);
+		}
+		return GitTest::Joined(Shown) + FString::Printf(TEXT(" | lanes %d"), Lanes);
+	};
+
+	TestEqualSensitive(TEXT("A straight line"), Graph({TEXT("c:b"), TEXT("b:a"), TEXT("a")}, TEXT("c")),
+		Expect({TEXT("0.0 in[] out[0>0.0] by[]"), TEXT("0.0 in[0>0.0] out[0>0.0] by[]"), TEXT("0.0 in[0>0.0] out[] by[]")}, 1));
+	TestEqualSensitive(TEXT("A merge opens a lane for the branch it brings in, which joins again where the branch started"),
+		Graph({TEXT("m:b,f"), TEXT("f:a"), TEXT("b:a"), TEXT("a")}, TEXT("m")),
+		Expect({TEXT("0.0 in[] out[0>0.0 0>1.2] by[]"), TEXT("1.2 in[1>1.2] out[1>1.2] by[0>0.0]"), TEXT("0.0 in[0>0.0] out[0>0.0] by[1>1.2]"),
+			TEXT("0.0 in[0>0.0 1>0.2] out[] by[]")}, 2));
+	TestEqualSensitive(TEXT("Your branch and its upstream, each with new commits: blue goes on where they meet"),
+		Graph({TEXT("u:base"), TEXT("h:base"), TEXT("base")}, TEXT("h"), TEXT("u")),
+		Expect({TEXT("0.1 in[] out[0>0.1] by[]"), TEXT("1.0 in[] out[1>1.0] by[0>0.1]"), TEXT("0.0 in[0>0.1 1>0.0] out[] by[]")}, 2));
+	TestEqualSensitive(TEXT("Uncommitted changes start your branch's line above HEAD, here behind its upstream"),
+		Graph({TEXT("u:h"), TEXT("uncommitted:h"), TEXT("h:b"), TEXT("b")}, TEXT("uncommitted"), TEXT("u")),
+		Expect({TEXT("0.1 in[] out[0>0.1] by[]"), TEXT("1.0 in[] out[1>1.0] by[0>0.1]"), TEXT("0.0 in[0>0.1 1>0.0] out[0>0.0] by[]"),
+			TEXT("0.0 in[0>0.0] out[] by[]")}, 2));
+	TestEqualSensitive(TEXT("An octopus merge opens a lane per parent"),
+		Graph({TEXT("m:a,b,c"), TEXT("c:r"), TEXT("b:r"), TEXT("a:r"), TEXT("r")}, TEXT("m")),
+		Expect({TEXT("0.0 in[] out[0>0.0 0>1.2 0>2.3] by[]"), TEXT("2.3 in[2>2.3] out[2>2.3] by[0>0.0 1>1.2]"), TEXT("1.2 in[1>1.2] out[1>1.2] by[0>0.0 2>2.3]"),
+			TEXT("0.0 in[0>0.0] out[0>0.0] by[1>1.2 2>2.3]"), TEXT("0.0 in[0>0.0 1>0.2 2>0.3] out[] by[]")}, 3));
+	TestEqualSensitive(TEXT("A parent below the commits read leaves its line open"), Graph({TEXT("c:b"), TEXT("x")}, TEXT("c")),
+		Expect({TEXT("0.0 in[] out[0>0.0] by[]"), TEXT("1.2 in[] out[] by[0>0.0]")}, 2));
+	TestEqualSensitive(TEXT("A merge of a branch already in the graph joins its line"),
+		Graph({TEXT("g:f"), TEXT("m:a,f"), TEXT("f:a"), TEXT("a")}, TEXT("m")),
+		Expect({TEXT("0.2 in[] out[0>0.2] by[]"), TEXT("1.0 in[] out[1>1.0 1>0.2] by[0>0.2]"), TEXT("0.2 in[0>0.2] out[0>0.2] by[1>1.0]"),
+			TEXT("0.0 in[0>0.2 1>0.0] out[] by[]")}, 2));
+	TestEqualSensitive(TEXT("Your branch's line is blue and its upstream's purple, as their labels"),
+		GitHistoryGraph::LineColor(0).GetSpecifiedColor().ToString() + GitHistoryGraph::LineColor(1).GetSpecifiedColor().ToString(),
+		FStyleColors::AccentBlue.GetSpecifiedColor().ToString() + FStyleColors::AccentPurple.GetSpecifiedColor().ToString());
 	return true;
 }
 

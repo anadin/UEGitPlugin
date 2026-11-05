@@ -84,6 +84,9 @@ namespace
 			SLATE_ATTRIBUTE(FText, Note)
 			SLATE_ATTRIBUTE(FSlateColor, NoteColor)
 			SLATE_ATTRIBUTE(FText, HighlightText)
+			/** The row's part of the graph, and the lanes all rows make room for. */
+			SLATE_ATTRIBUTE(const GitHistoryGraph::FRow*, GraphRow)
+			SLATE_ATTRIBUTE(int32, GraphLanes)
 		SLATE_END_ARGS()
 
 		void Construct(const FArguments& InArgs, const TSharedRef<STableViewBase>& Owner)
@@ -96,7 +99,10 @@ namespace
 			Note = InArgs._Note;
 			NoteColor = InArgs._NoteColor;
 			Highlight = InArgs._HighlightText;
-			SMultiColumnTableRow<SGitHistoryView::FCommitPtr>::Construct(FSuperRowType::FArguments().Padding(FMargin(0.0f, 2.0f)), Owner);
+			GraphRow = InArgs._GraphRow;
+			GraphLanes = InArgs._GraphLanes;
+			// No padding: the graph spans the whole row, so its lines join those of the rows around it. The cells pad their text instead.
+			SMultiColumnTableRow<SGitHistoryView::FCommitPtr>::Construct(FSuperRowType::FArguments().Padding(FMargin(0.0f)), Owner);
 		}
 
 		virtual TSharedRef<SWidget> GenerateWidgetForColumn(const FName& Column) override
@@ -124,20 +130,30 @@ namespace
 			}
 			return SNew(STextBlock)
 				.Text(Text)
+				.Margin(FMargin(0.0f, 2.0f))
 				.HighlightText(Column == DateColumn ? TAttribute<FText>() : Highlight)
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 				.OverflowPolicy(ETextOverflowPolicy::Ellipsis);
 		}
 
 	private:
-		/** The marker, the labels and the summary. */
+		/** The graph, the marker, the labels and the summary. */
 		TSharedRef<SWidget> MakeSummary() const
 		{
 			const TSharedRef<SHorizontalBox> Summary = SNew(SHorizontalBox);
 			Summary->AddSlot()
 			.AutoWidth()
+			.VAlign(VAlign_Fill)
+			[
+				SNew(SGitGraphCell)
+				.Row(GraphRow)
+				.Lanes(GraphLanes)
+				.RingColor(bUncommitted ? NoteColor : TAttribute<FSlateColor>())
+			];
+			Summary->AddSlot()
+			.AutoWidth()
 			.VAlign(VAlign_Center)
-			.Padding(4.0f, 0.0f, 6.0f, 0.0f)
+			.Padding(4.0f, 2.0f, 6.0f, 2.0f)
 			[
 				MakeMarker()
 			];
@@ -146,6 +162,7 @@ namespace
 				Summary->AddSlot()
 				.AutoWidth()
 				.VAlign(VAlign_Center)
+				.Padding(0.0f, 2.0f)
 				[
 					SNew(STextBlock)
 					.Text(UncommittedTitle())
@@ -154,7 +171,7 @@ namespace
 				Summary->AddSlot()
 				.FillWidth(1.0f)
 				.VAlign(VAlign_Center)
-				.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+				.Padding(8.0f, 2.0f, 0.0f, 2.0f)
 				[
 					SNew(STextBlock)
 					.Text(Note)
@@ -171,7 +188,7 @@ namespace
 				Summary->AddSlot()
 				.AutoWidth()
 				.VAlign(VAlign_Center)
-				.Padding(0.0f, 0.0f, 4.0f, 0.0f)
+				.Padding(0.0f, 2.0f, 4.0f, 2.0f)
 				[
 					MakeLabel(Branch, &BranchBrush, BranchTooltip)
 				];
@@ -181,7 +198,7 @@ namespace
 				Summary->AddSlot()
 				.AutoWidth()
 				.VAlign(VAlign_Center)
-				.Padding(0.0f, 0.0f, 4.0f, 0.0f)
+				.Padding(0.0f, 2.0f, 4.0f, 2.0f)
 				[
 					MakeLabel(Upstream, &UpstreamBrush, FText::Format(LOCTEXT("UpstreamLabelTooltip", "Where {0} is on the server, as of the last fetch."), Upstream))
 				];
@@ -189,6 +206,7 @@ namespace
 			Summary->AddSlot()
 			.FillWidth(1.0f)
 			.VAlign(VAlign_Center)
+			.Padding(0.0f, 2.0f)
 			[
 				SNew(STextBlock)
 				.Text(FText::FromString(Commit->Subject))
@@ -201,22 +219,15 @@ namespace
 			return Summary;
 		}
 
-		/** A dot for uncommitted changes, an arrow for a commit only you have (up) or only the server has (down). */
+		/**
+		 * An arrow for a commit only you have (up) or only the server has (down). The uncommitted changes have none: the
+		 * graph shows them as a ring above HEAD's commit.
+		 */
 		TSharedRef<SWidget> MakeMarker() const
 		{
 			if (bUncommitted)
 			{
-				return SNew(SBox)
-					.WidthOverride(14.0f)
-					.HeightOverride(14.0f)
-					.HAlign(HAlign_Center)
-					.VAlign(VAlign_Center)
-					[
-						SNew(SImage)
-						.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
-						.DesiredSizeOverride(FVector2D(8.0f, 8.0f))
-						.ColorAndOpacity(NoteColor)
-					];
+				return SNew(SBox).WidthOverride(14.0f).HeightOverride(14.0f);
 			}
 			return SNew(SImage)
 				.Image(FAppStyle::GetBrush(Commit->bIncoming ? "Icons.CircleArrowDown" : "Icons.CircleArrowUp"))
@@ -234,6 +245,8 @@ namespace
 		TAttribute<FText> Note;
 		TAttribute<FSlateColor> NoteColor;
 		TAttribute<FText> Highlight;
+		TAttribute<const GitHistoryGraph::FRow*> GraphRow;
+		TAttribute<int32> GraphLanes;
 	};
 
 	const FSlateBrush* ChangeBrush(TCHAR Status)
@@ -682,11 +695,39 @@ void SGitHistoryView::Load()
 void SGitHistoryView::ApplyCommitFilter()
 {
 	Commits = AllCommits.FilterByPredicate([this](const FCommitPtr& Commit) { return CommitMatches(*Commit, CommitFilter); });
-	if (CommitFilter.IsEmpty() && ChangedFiles > 0)
+	const bool bListUncommitted = CommitFilter.IsEmpty() && ChangedFiles > 0;
+	if (bListUncommitted)
 	{
 		// Committing them would put them on top of HEAD's commit.
 		const int32 HeadIndex = Commits.IndexOfByPredicate([this](const FCommitPtr& Commit) { return Commit->Oid.Equals(LoadedHead, ESearchCase::CaseSensitive); });
 		Commits.Insert(Uncommitted, HeadIndex == INDEX_NONE ? 0 : HeadIndex);
+	}
+	// The graph joins each row to the next, so a search, which leaves rows out, shows none.
+	GraphRows.Reset();
+	GraphLanes = 0;
+	if (CommitFilter.IsEmpty())
+	{
+		// The uncommitted changes go into it as a commit whose parent is HEAD, starting your branch's line.
+		GitCore::FHistoryCommit Pending;
+		Pending.Oid = TEXT("uncommitted");
+		if (!LoadedHead.IsEmpty())
+		{
+			Pending.Parents.Add(LoadedHead);
+		}
+		TArray<const GitCore::FHistoryCommit*> Listed;
+		Listed.Reserve(Commits.Num());
+		for (const FCommitPtr& Commit : Commits)
+		{
+			Listed.Add(IsUncommitted(Commit) ? &Pending : Commit.Get());
+		}
+		const TArray<GitHistoryGraph::FRow> Rows = GitHistoryGraph::Layout(Listed, bListUncommitted ? Pending.Oid : LoadedHead, LoadedUpstreamHead);
+		for (int32 Index = 0; Index < Commits.Num(); ++Index)
+		{
+			GraphRows.Add(Commits[Index].Get(), Rows[Index]);
+		}
+		// Wider than this, a graph is cut off at the right.
+		constexpr int32 MaxLanes = 12;
+		GraphLanes = FMath::Min(GitHistoryGraph::CountLanes(Rows), MaxLanes);
 	}
 	if (CommitList.IsValid())
 	{
@@ -702,7 +743,9 @@ TSharedRef<ITableRow> SGitHistoryView::OnGenerateCommitRow(FCommitPtr Commit, co
 			.Commit(Commit)
 			.bUncommitted(true)
 			.Note(this, &SGitHistoryView::GetUncommittedNote)
-			.NoteColor(this, &SGitHistoryView::GetUncommittedColor);
+			.NoteColor(this, &SGitHistoryView::GetUncommittedColor)
+			.GraphRow(TAttribute<const GitHistoryGraph::FRow*>::Create(TAttribute<const GitHistoryGraph::FRow*>::FGetter::CreateSP(this, &SGitHistoryView::FindGraphRow, Commit)))
+			.GraphLanes(this, &SGitHistoryView::GetGraphLanes);
 	}
 	FText Branch;
 	FText BranchTooltip;
@@ -718,7 +761,9 @@ TSharedRef<ITableRow> SGitHistoryView::OnGenerateCommitRow(FCommitPtr Commit, co
 		.Branch(Branch)
 		.BranchTooltip(BranchTooltip)
 		.Upstream(bUpstream ? FText::FromString(LoadedUpstream) : FText::GetEmpty())
-		.HighlightText(this, &SGitHistoryView::GetCommitFilterText);
+		.HighlightText(this, &SGitHistoryView::GetCommitFilterText)
+		.GraphRow(TAttribute<const GitHistoryGraph::FRow*>::Create(TAttribute<const GitHistoryGraph::FRow*>::FGetter::CreateSP(this, &SGitHistoryView::FindGraphRow, Commit)))
+		.GraphLanes(this, &SGitHistoryView::GetGraphLanes);
 }
 
 void SGitHistoryView::OnCommitSelected(FCommitPtr Commit, ESelectInfo::Type SelectInfo)

@@ -4,6 +4,7 @@
 #include "CoreMinimal.h"
 #include "Core/GitTypes.h"
 #include "GitFileTree.h"
+#include "GitHistoryGraph.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/Views/SListView.h"
 #include "Widgets/Views/STreeView.h"
@@ -51,6 +52,10 @@ public:
 	TSharedRef<ITableRow> OnGenerateCommitRow(FCommitPtr Commit, const TSharedRef<STableViewBase>& Owner);
 	/** The item of the uncommitted changes' row (no commit id). */
 	bool IsUncommitted(const FCommitPtr& Commit) const { return Commit.IsValid() && Commit == Uncommitted; }
+	/** A listed commit's row of the graph; none while searching, when the rows listed are not each other's neighbours. */
+	const GitHistoryGraph::FRow* FindGraphRow(FCommitPtr Commit) const { return GraphRows.Find(Commit.Get()); }
+	/** The lanes the graph makes room for. */
+	int32 GetGraphLanes() const { return GraphLanes; }
 
 private:
 	void Load();
@@ -95,6 +100,9 @@ private:
 	TArray<FCommitPtr> Commits;
 	/** The uncommitted changes' row, listed while there are some. */
 	FCommitPtr Uncommitted;
+	/** The graph of the commits listed, by commit. */
+	TMap<const GitCore::FHistoryCommit*, GitHistoryGraph::FRow> GraphRows;
+	int32 GraphLanes = 0;
 	int32 ChangedFiles = 0;
 	int32 UnstagedFiles = 0;
 	int32 StagedFiles = 0;

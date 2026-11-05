@@ -340,6 +340,24 @@ bool FGitRepositoryHistoryTest::RunTest(const FString&)
 
 	TestTrue(TEXT("History is newest first"), Repository->ReadHistory(2, FString(), Commits, bHasMore, Error) && Commits.Num() == 2 && Commits[0].Oid.Equals(Third, ESearchCase::CaseSensitive) && bHasMore);
 	TestFalse(TEXT("Without a remote, nothing is marked unpushed"), Commits.ContainsByPredicate([](const GitCore::FHistoryCommit& Commit) { return Commit.bUnpushed || Commit.bIncoming; }));
+
+	// The graph needs every commit above its parents, even when the clocks of the computers that made them disagree:
+	// here a commit is older than its parent, which git log otherwise lists first.
+	const FString Skewed = Fixture.InitRepo(TEXT("skewed"));
+	const FTCHARToUTF8 Stream(TEXT("commit refs/heads/main\nmark :1\ncommitter Test <test@example.com> 3000 +0000\ndata 6\nparent\n")
+		TEXT("commit refs/heads/main\nmark :2\ncommitter Test <test@example.com> 1000 +0000\ndata 5\nchild\nfrom :1\n")
+		TEXT("commit refs/heads/other\nmark :3\ncommitter Test <test@example.com> 2000 +0000\ndata 7\nsibling\nfrom :1\n"));
+	TestTrue(TEXT("The skewed commits are made"), GitTest::Git(Skewed, {TEXT("fast-import"), TEXT("--quiet")}, TArray<uint8>(reinterpret_cast<const uint8*>(Stream.Get()), Stream.Length())).Succeeded());
+	const GitCore::FGitRepositoryPtr SkewedRepository = GitTest::OpenRepository(*this, Skewed);
+	if (SkewedRepository.IsValid() && TestTrue(TEXT("History is read across both branches"), SkewedRepository->ReadHistory(10, TEXT("other"), Commits, bHasMore, Error)))
+	{
+		TArray<FString> Order;
+		for (const GitCore::FHistoryCommit& Commit : Commits)
+		{
+			Order.Add(Commit.Subject + (Commit.bUnpushed ? TEXT(" up") : TEXT("")) + (Commit.bIncoming ? TEXT(" down") : TEXT("")));
+		}
+		TestEqualSensitive(TEXT("Both children come before their parent, the newer first"), GitTest::Joined(Order), GitTest::Joined({TEXT("sibling down"), TEXT("child up"), TEXT("parent")}));
+	}
 	GitCore::FCommitDetails Details;
 	TestTrue(TEXT("A commit's files are listed"), Repository->ReadCommit(Third, Details, Error) && Details.Files.Num() == 2);
 	TestTrue(TEXT("The root commit compares with nothing"), Repository->ReadCommit(First, Details, Error) && Details.Files.Num() == 1 && Details.Files[0].Status == TEXT('A'));

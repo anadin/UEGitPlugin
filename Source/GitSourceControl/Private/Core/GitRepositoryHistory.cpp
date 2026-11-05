@@ -27,7 +27,8 @@ namespace GitCore
 			UpstreamHead.Reset();
 		}
 		const FString MaxCount = FString::Printf(TEXT("--max-count=%d"), Limit + 1);
-		TArray<FString> Args = {TEXT("log"), TEXT("-z"), TEXT("--no-notes"), TEXT("--encoding=UTF-8"), MaxCount, LogFormat, Head};
+		// Every commit above its parents, for the graph, even when clocks disagree; otherwise newest first.
+		TArray<FString> Args = {TEXT("log"), TEXT("-z"), TEXT("--no-notes"), TEXT("--encoding=UTF-8"), TEXT("--date-order"), MaxCount, LogFormat, Head};
 		if (!UpstreamHead.IsEmpty())
 		{
 			Args.Add(UpstreamHead);
@@ -48,15 +49,16 @@ namespace GitCore
 			Out.SetNum(Limit);
 		}
 
-		// Which side each commit is on. Listed in the same order as the log, the first Limit + 1 cover every commit shown.
+		// Which side each commit is on. In the same order as the log (a commit's children are all on its side), the first
+		// Limit + 1 cover every commit shown.
 		TArray<FString> Sides;
 		if (!UpstreamHead.IsEmpty())
 		{
-			Sides = {TEXT("rev-list"), TEXT("--left-right"), MaxCount, Head + TEXT("...") + UpstreamHead, TEXT("--")};
+			Sides = {TEXT("rev-list"), TEXT("--left-right"), TEXT("--date-order"), MaxCount, Head + TEXT("...") + UpstreamHead, TEXT("--")};
 		}
 		else if (!bHasUpstream && Run(ECallKind::LocalQuick, {TEXT("for-each-ref"), TEXT("--count=1"), TEXT("refs/remotes")}).StdoutText().TrimStartAndEnd().Len() > 0)
 		{
-			Sides = {TEXT("rev-list"), MaxCount, Head, TEXT("--not"), TEXT("--remotes"), TEXT("--")};
+			Sides = {TEXT("rev-list"), TEXT("--date-order"), MaxCount, Head, TEXT("--not"), TEXT("--remotes"), TEXT("--")};
 		}
 		if (Sides.IsEmpty())
 		{
