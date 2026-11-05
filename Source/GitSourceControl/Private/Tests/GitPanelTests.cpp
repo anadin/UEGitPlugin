@@ -330,6 +330,72 @@ bool FGitPanelStageCommitPushTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelCommitKeyTest, "GitWorkspace.Panel.CommitKeyClearsMessage", PanelTestFlags)
+bool FGitPanelCommitKeyTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Seed = Fixture.InitRepo(TEXT("seed"));
+	GitTest::WriteFile(Seed, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::CommitAll(Seed, TEXT("base"));
+	GitTest::Git(Seed, {TEXT("push"), TEXT("-q"), Origin, TEXT("main")});
+	const FString Repo = Fixture.Clone(Origin, TEXT("work"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Repo);
+	const TSharedRef<SGitChangesView> Changes = SNew(SGitChangesView, Panel.Model);
+	const TSharedPtr<SMultiLineEditableTextBox> MessageBox = StaticCastSharedPtr<SMultiLineEditableTextBox>(FindTagged(Changes, TEXT("GitPanel.Changes.Message")));
+	if (!TestTrue(TEXT("The message box is tagged"), MessageBox.IsValid()))
+	{
+		return false;
+	}
+	// Typing keeps the keyboard in the message box, which takes a window.
+#if PLATFORM_MAC
+	if (!FApp::CanEverRender())
+	{
+		// Without rendering a window has no native window, and macOS's input methods say so when a text box takes the keyboard.
+		AddExpectedErrorPlain(TEXT("a context failed when its window couldn't be found"), EAutomationExpectedErrorFlags::Contains, 0);
+	}
+#endif
+	const TSharedRef<SWindow> Window = SNew(SWindow).Title(FText::FromString(TEXT("Commit keys"))).ClientSize(FVector2D(900.0f, 600.0f));
+	Window->SetContent(Changes);
+	FSlateApplication::Get().AddWindow(Window);
+	ON_SCOPE_EXIT
+	{
+		Window->RequestDestroyWindow();
+	};
+	// Commits Message with the keys; Meanwhile is typed while the commit runs.
+	auto CommitWithKeys = [this, &Panel, &Repo, &MessageBox](const FString& Message, bool bPush, const FString& Meanwhile = FString())
+	{
+		GitTest::WriteFile(Repo, TEXT("a.txt"), Message + TEXT("\n"));
+		Panel.Refresh();
+		Panel.Model->Stage({TEXT("a.txt")});
+		TestTrue(TEXT("The edit is staged"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
+		FSlateApplication::Get().SetKeyboardFocus(MessageBox, EFocusCause::SetDirectly);
+		if (!TestTrue(TEXT("The message box has the keyboard"), MessageBox->HasKeyboardFocus()))
+		{
+			return;
+		}
+		MessageBox->SetText(FText::FromString(Message));
+		// Ctrl+Enter (Cmd+Enter on macOS) commits, with Shift it pushes too.
+		const FModifierKeysState Keys(bPush, false, true, false, false, false, false, false, false);
+		FSlateApplication::Get().ProcessKeyDownEvent(FKeyEvent(EKeys::Enter, Keys, FSlateApplication::Get().GetUserIndexForKeyboard(), false, 0, 0));
+		// The commit finishes on the game thread, which runs it only while waiting below.
+		if (!Meanwhile.IsEmpty())
+		{
+			MessageBox->SetText(FText::FromString(Meanwhile));
+		}
+		TestTrue(TEXT("The commit finishes"), Panel.WaitIdle());
+		TestEqualSensitive(TEXT("The commit has the message"), PanelSubject(Repo), Message);
+		TestEqualSensitive(TEXT("The message box is empty again, or holds what was typed meanwhile"), MessageBox->GetPlainText().ToString(), Meanwhile);
+		TestTrue(TEXT("It keeps the keyboard for the next message"), MessageBox->HasKeyboardFocus());
+	};
+	CommitWithKeys(TEXT("Committed with the keyboard"), false);
+	CommitWithKeys(TEXT("Committed and pushed with the keyboard"), true);
+	TestEqualSensitive(TEXT("Shift pushes as well"), PanelHead(Origin, TEXT("main")), PanelHead(Repo));
+	CommitWithKeys(TEXT("Committed while typing on"), false, TEXT("The next message"));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelPublishTest, "GitWorkspace.Panel.PublishAsks", PanelTestFlags)
 bool FGitPanelPublishTest::RunTest(const FString&)
 {

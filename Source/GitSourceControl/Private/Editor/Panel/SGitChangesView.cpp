@@ -1719,7 +1719,7 @@ TSharedRef<SWidget> SGitChangesView::MakeCommitBar()
 					.AddMetaData<FTagMetaData>(TEXT("GitPanel.Changes.Message"))
 					.HintText(LOCTEXT("MessageHint", "Commit message (the first line is the summary)"))
 					.AutoWrapText(true)
-					.Text_Lambda([this]() { return FText::FromString(CommitMessage); })
+					// The box owns the text: a bound text does not reach it while it has the keyboard.
 					.OnTextChanged_Lambda([this](const FText& Text) { CommitMessage = Text.ToString(); })
 					.OnKeyDownHandler_Lambda([this](const FGeometry&, const FKeyEvent& Event)
 					{
@@ -1822,11 +1822,16 @@ void SGitChangesView::Commit(bool bPush)
 	{
 		return;
 	}
-	Model->Commit(CommitMessage.TrimStartAndEnd(), bPush, [WeakThis = TWeakPtr<SGitChangesView>(SharedThis(this))](bool bCommitted)
+	const FString Message = CommitMessage;
+	Model->Commit(Message.TrimStartAndEnd(), bPush, [WeakThis = TWeakPtr<SGitChangesView>(SharedThis(this)), Message](bool bCommitted)
 	{
-		if (const TSharedPtr<SGitChangesView> Self = WeakThis.Pin(); Self.IsValid() && bCommitted)
+		const TSharedPtr<SGitChangesView> Self = WeakThis.Pin();
+		// A message typed while the commit ran is the next one, and stays.
+		if (Self.IsValid() && bCommitted && Self->CommitMessage.Equals(Message, ESearchCase::CaseSensitive))
 		{
+			// SetText reaches the box even while it has the keyboard, as after Ctrl+Enter (Cmd+Enter on macOS).
 			Self->CommitMessage.Reset();
+			Self->MessageBox->SetText(FText::GetEmpty());
 		}
 	});
 }
