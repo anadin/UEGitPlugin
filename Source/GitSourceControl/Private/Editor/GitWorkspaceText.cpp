@@ -165,6 +165,26 @@ namespace GitWorkspaceText
 			"nothing is sent to the server. Stop editing the file in the other copy.");
 	}
 
+	FText LockLabel()
+	{
+		return LOCTEXT("LockAction", "Lock");
+	}
+
+	FText LockTooltip()
+	{
+		return LOCTEXT("LockActionTooltip", "Take the locks so nobody else edits these assets. Unreal's Check Out does the same.");
+	}
+
+	FText UnlockLabel()
+	{
+		return LOCTEXT("UnlockAction", "Unlock");
+	}
+
+	FText UnlockTooltip()
+	{
+		return LOCTEXT("UnlockActionTooltip", "Release your locks so others can edit these assets. Your changes stay; lock them again before you check them in.");
+	}
+
 	FText Shortcut(EModifierKey::Type Modifiers, const FKey& Key)
 	{
 		return FInputChord(Modifiers, Key).GetInputText();

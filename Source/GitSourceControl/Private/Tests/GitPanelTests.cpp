@@ -724,6 +724,86 @@ bool FGitPanelLocksAndDiscardTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelLockChoicesTest, "GitWorkspace.Panel.LockChoices", PanelTestFlags)
+bool FGitPanelLockChoicesTest::RunTest(const FString&)
+{
+	GitTest::FLockedTeam Team(*this);
+	if (!Team.IsReady())
+	{
+		return false;
+	}
+	const FString Barrel = TEXT("Content/Props/Barrel.uasset");
+	const FString Crate = TEXT("Content/Props/Small/Crate.uasset");
+	const FString Hero = TEXT("Content/Hero.uasset");
+	const FString Map = TEXT("Content/Map.umap");
+	GitTest::WriteFile(Team.Alice, Barrel, TEXT("barrel\n"));
+	GitTest::WriteFile(Team.Alice, Crate, TEXT("crate\n"));
+	GitTest::CommitAll(Team.Alice, TEXT("props"));
+	GitTest::Git(Team.Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+	GitTest::WriteFile(Team.Alice, TEXT("Content/Props/New.uasset"), TEXT("new\n"));
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Team.Alice);
+	Panel.Refresh();
+
+	// Alice locks the hero here and the barrel in another copy (git lfs itself, so this clone has no record of it); Bob locks the map.
+	Panel.Model->Lock({Hero});
+	TestTrue(TEXT("Locking finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("The barrel is locked from elsewhere"), GitTest::Git(Team.Alice, {TEXT("lfs"), TEXT("lock"), Barrel}).Succeeded());
+	TestTrue(TEXT("Bob locks the map"), GitTest::Git(Team.Bob, {TEXT("lfs"), TEXT("lock"), Map}).Succeeded());
+	Panel.Model->CheckLocks();
+	TestTrue(TEXT("Checking locks finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("Every lock is read"), Panel.WaitUntil([&Hero, &Barrel, &Map](const GitCore::FSessionSnapshot& Snapshot)
+	{
+		return Snapshot.Locks.Find(Hero) && Snapshot.Locks.Find(Barrel) && Snapshot.Locks.Find(Map);
+	}));
+
+	// What the Content Browser and Changes menus offer, file by file.
+	const FGitWorkspaceModel::FLockChoices Choices = Panel.Model->GetLockChoices({Hero, Barrel, Crate, Map, TEXT("readme.txt"), TEXT("Content/Props/New.uasset")});
+	TestEqualSensitive(TEXT("Lock: the committed lockable asset nobody holds"), GitTest::Joined(Choices.Lock), Crate);
+	TestEqualSensitive(TEXT("Claim Lock: your lock from elsewhere"), GitTest::Joined(Choices.Claim), Barrel);
+	TestEqualSensitive(TEXT("Unlock: your locks, here and elsewhere"), GitTest::Joined(Choices.Unlock), GitTest::Joined({Hero, Barrel}));
+	TestEqualSensitive(TEXT("Someone else's lock is only theirs"), GitTest::Joined(Choices.Theirs), Map);
+
+	// A folder's entries act on the assets in it, all the way down, and on the locks there.
+	TestEqualSensitive(TEXT("A folder holds its assets and its subfolders'"), GitTest::Joined(Panel.Model->GetFilesInFolders({TEXT("Content/Props")})),
+		GitTest::Joined({Barrel, Crate}));
+	TestEqualSensitive(TEXT("A trailing slash changes nothing"), GitTest::Joined(Panel.Model->GetFilesInFolders({TEXT("Content/Props/")})), GitTest::Joined({Barrel, Crate}));
+	TestEqualSensitive(TEXT("A folder whose name starts another's holds none of its files"), GitTest::Joined(Panel.Model->GetFilesInFolders({TEXT("Content/Prop")})), FString());
+	TestEqualSensitive(TEXT("Letter case counts as the file system counts it"), GitTest::Joined(Panel.Model->GetFilesInFolders({TEXT("content/props")})),
+		GitCore::PathCase() == ESearchCase::IgnoreCase ? GitTest::Joined({Barrel, Crate}) : FString());
+	const FGitWorkspaceModel::FLockChoices Folder = Panel.Model->GetLockChoices(Panel.Model->GetFilesInFolders({TEXT("Content")}));
+	TestEqualSensitive(TEXT("Locking the Content folder locks what nobody holds"), GitTest::Joined(Folder.Lock), Crate);
+	TestEqualSensitive(TEXT("Unlocking it releases your locks"), GitTest::Joined(Folder.Unlock), GitTest::Joined({Hero, Barrel}));
+
+	// The Changes tab's menu offers the same, under the same names.
+	GitTest::WriteFile(Team.Alice, Hero, TEXT("hero v2\n"));
+	GitTest::WriteFile(Team.Alice, Crate, TEXT("crate v2\n"));
+	Panel.Refresh();
+	const TSharedRef<SGitChangesView> Changes = SNew(SGitChangesView, Panel.Model);
+	Changes->SelectPaths({Hero, Crate});
+	const TSharedPtr<SWidget> Menu = Changes->OnContextMenu();
+	const TArray<FString> Entries = Menu.IsValid() ? AllTexts(Menu.ToSharedRef()) : TArray<FString>();
+	TestTrue(TEXT("The menu has Lock: ") + GitTest::Joined(Entries), GitTest::HasExactly(Entries, GitWorkspaceText::LockLabel().ToString()));
+	TestTrue(TEXT("And Unlock"), GitTest::HasExactly(Entries, GitWorkspaceText::UnlockLabel().ToString()));
+
+	// Acting on them: Lock takes the free asset's lock, and Unlock releases yours.
+	Panel.Model->Lock(Choices.Lock);
+	TestTrue(TEXT("Locking finishes"), Panel.WaitIdle());
+	Panel.Model->Unlock(Choices.Unlock, false);
+	TestTrue(TEXT("Unlocking finishes"), Panel.WaitIdle());
+	GitCore::FLockSnapshot Server;
+	Panel.Provider->GetSession()->GetRepository().VerifyLocks(TEXT("origin"), GitCore::ECallKind::UserNetwork, Server);
+	// The test server names every owner alike; it tells Alice's locks from Bob's as ours and theirs.
+	TArray<FString> Held;
+	for (const TPair<FString, GitCore::FLockInfo>& Lock : Server.ByPath)
+	{
+		Held.Add(Lock.Key + (Lock.Value.bOurs ? TEXT(" ours") : TEXT(" theirs")));
+	}
+	Held.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::CaseSensitive) < 0; });
+	TestEqualSensitive(TEXT("The server holds Alice's new lock and Bob's"), GitTest::Joined(Held), GitTest::Joined({TEXT("Content/Map.umap theirs"), Crate + TEXT(" ours")}));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelLockProgressTest, "GitWorkspace.Panel.LockProgress", PanelTestFlags)
 bool FGitPanelLockProgressTest::RunTest(const FString&)
 {

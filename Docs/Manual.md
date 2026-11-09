@@ -27,6 +27,8 @@ Pull stops before changing anything when it cannot combine your work with your t
 
 Start editing an asset and Unreal asks to **check it out**. Say yes: Git Workspace takes the asset's lock, so nobody else can change it until you check it in. When someone else holds the lock, Check Out is refused and the Content Browser shows who has it.
 
+To lock assets before you start, right-click them, or their folder, in the Content Browser and choose **Lock**.
+
 Save as often as you like. Saving never talks to the server.
 
 ### 3. Check in
@@ -52,7 +54,7 @@ Each asks first, and keeps a copy of what it throws away in `Saved/GitSourceCont
 ## Locks
 
 - **Who has what**: the Content Browser shows each lock's owner. The Git panel's **Locks** tab lists every lock, yours first.
-- **Give a lock back** without checking in: select it in the Locks tab and click **Release**.
+- **Give a lock back** without checking in: right-click the asset, or its folder, in the Content Browser and choose **Unlock**, or select the lock in the Locks tab and click **Release**. Your changes stay; lock the asset again before you check it in.
 - **Locked by you elsewhere**: you took the lock in another copy of the project, such as another clone or computer. Right-click the asset and choose **Claim Lock** to use it in this copy, and stop working on it in the other one.
 - **Someone has gone home with a lock**: ask them first. If they cannot release it, right-click it in the Locks tab and choose **Release someone else's lock…**.
 
@@ -67,7 +69,7 @@ Your edits, in two lists: **Changes**, not staged yet, and **Staged**, what the 
 - Select files and press Space to move them from one list to the other. To stage part of a text file, select lines in its diff and click **Stage lines**.
 - Write a message and click **Commit**, or press Ctrl+Enter. To push as well, hold Alt over the button so it says **Commit and push**, or press Ctrl+Shift+Enter.
 - Ctrl+D compares a file with its last committed version; assets open in Unreal's own diff.
-- Right-click for Show in Content Browser, Show in Explorer (Finder on macOS), History, Lock and more.
+- Right-click for Show in Content Browser, Show in Explorer (Finder on macOS), History, Lock, Unlock and more.
 
 Check in from the status bar does all of this in one step for the files you tick: commit, push, and release the locks.
 

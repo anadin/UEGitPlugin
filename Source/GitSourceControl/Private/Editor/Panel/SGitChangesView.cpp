@@ -1095,25 +1095,10 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 	{
 		return nullptr;
 	}
-	const GitCore::FSessionSnapshotRef Snapshot = Model->GetSnapshot();
 	const bool bAnyUnstaged = !SelectedPaths(false).IsEmpty();
 	const bool bAnyStaged = !SelectedPaths(true).IsEmpty();
-	bool bAnyMine = false;
-	bool bAnyElsewhere = false;
-	bool bAnyTheirs = false;
-	bool bAnyLockable = false;
-	for (const FItemPtr& Item : Files)
-	{
-		const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Item->Entry.Path);
-		if (Lock)
-		{
-			(Lock->bOurs ? bAnyMine : bAnyTheirs) = true;
-			bAnyElsewhere |= Snapshot->IsOursElsewhere(*Lock);
-		}
-		// Only unlocked files can be locked; your locks from elsewhere are claimed instead.
-		const GitCore::FFileAttributes* Attributes = Snapshot->FindAttributes(Item->Entry.Path);
-		bAnyLockable |= !Lock && Attributes && Attributes->bLockable && !Item->Entry.IsAdded();
-	}
+	// The same lock entries as in the Content Browser, by the same rules.
+	const FGitWorkspaceModel::FLockChoices Locks = Model->GetLockChoices(SelectedPaths());
 	const FItemPtr Single = SingleSelection();
 	const TArray<FItemPtr> Folders = SelectedFolders();
 	const FName StyleName = FRevisionControlStyleManager::GetStyleSetName();
@@ -1162,25 +1147,25 @@ TSharedPtr<SWidget> SGitChangesView::OnContextMenu()
 		Menu.EndSection();
 	}
 
-	if (Model->IsLockingEnabled() && (bAnyLockable || bAnyMine || bAnyTheirs))
+	if (!Locks.Lock.IsEmpty() || !Locks.Unlock.IsEmpty() || !Locks.Theirs.IsEmpty())
 	{
 		Menu.BeginSection("Locks", LOCTEXT("LocksSection", "Lock"));
-		if (bAnyLockable)
+		if (!Locks.Lock.IsEmpty())
 		{
-			Menu.AddMenuEntry(LOCTEXT("LockMenu", "Lock (check out)"), LOCTEXT("LockMenuTooltip", "Take the lock so nobody else edits these assets."),
+			Menu.AddMenuEntry(GitWorkspaceText::LockLabel(), GitWorkspaceText::LockTooltip(),
 				FSlateIcon(StyleName, "RevisionControl.Actions.CheckOut"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::LockSelection, true, false)));
 		}
-		if (bAnyElsewhere)
+		if (!Locks.Claim.IsEmpty())
 		{
 			Menu.AddMenuEntry(LOCTEXT("ClaimMenu", "Claim lock"), GitWorkspaceText::ClaimLockTooltip(),
 				FSlateIcon(StyleName, "RevisionControl.Actions.CheckOut"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::ClaimSelection)));
 		}
-		if (bAnyMine)
+		if (!Locks.Unlock.IsEmpty())
 		{
-			Menu.AddMenuEntry(LOCTEXT("UnlockMenu", "Release lock"), LOCTEXT("UnlockMenuTooltip", "Let others edit these assets. Your local changes stay."),
+			Menu.AddMenuEntry(GitWorkspaceText::UnlockLabel(), GitWorkspaceText::UnlockTooltip(),
 				FSlateIcon(StyleName, "RevisionControl.Unlocked"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::LockSelection, false, false)));
 		}
-		if (bAnyTheirs)
+		if (!Locks.Theirs.IsEmpty())
 		{
 			Menu.AddMenuEntry(LOCTEXT("ForceUnlockMenu", "Release someone else's lock…"), LOCTEXT("ForceUnlockMenuTooltip", "Only when its owner cannot release it."),
 				FSlateIcon(StyleName, "RevisionControl.Unlocked"), FUIAction(FExecuteAction::CreateSP(this, &SGitChangesView::LockSelection, false, true)));

@@ -91,6 +91,22 @@ public:
 	void Lock(const TArray<FString>& Paths);
 	/** Releases locks held on Paths, counting them as it goes; bForce also releases other people's locks. */
 	void Unlock(const TArray<FString>& Paths, bool bForce);
+	/** What the lock actions would act on among some repository paths: the right-click menus offer the ones that have any. */
+	struct FLockChoices
+	{
+		/** Files Lock locks: lockable, committed (a new file has nothing on the server to lock), and locked by nobody. */
+		TArray<FString> Lock;
+		/** Your locks taken in another clone, worktree or computer, which Claim takes over. */
+		TArray<FString> Claim;
+		/** Your locks, here or elsewhere, which Unlock releases. */
+		TArray<FString> Unlock;
+		/** Other people's locks, which only a forced release frees. */
+		TArray<FString> Theirs;
+	};
+	/** Empty while locking is off. */
+	FLockChoices GetLockChoices(const TArray<FString>& RelativePaths) const;
+	/** The packages in repository folders (and theirs, all the way down) and the files locked there: what a folder's lock actions act on. */
+	TArray<FString> GetFilesInFolders(const TArray<FString>& RelativeFolders) const;
 	/**
 	 * Takes over your locks on Paths that were taken in another clone, worktree or computer, so the
 	 * files can be saved and checked in here. Nothing is sent to the server.

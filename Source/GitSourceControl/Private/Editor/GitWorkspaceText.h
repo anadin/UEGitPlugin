@@ -30,6 +30,11 @@ namespace GitWorkspaceText
 	FString ShortId(const FString& Commit);
 	/** What a lock you took elsewhere (another clone, worktree or computer) means, and what claiming it does. */
 	FText ClaimLockTooltip();
+	/** "Lock" and "Unlock", the lock actions' names in every right-click menu, and what each does. */
+	FText LockLabel();
+	FText LockTooltip();
+	FText UnlockLabel();
+	FText UnlockTooltip();
 	/** A keyboard shortcut as Unreal names it on this platform: "Ctrl+S", or "Cmd+S" on macOS, where Control means Command. */
 	FText Shortcut(EModifierKey::Type Modifiers, const FKey& Key);
 	/** "Alt", or "Option" on macOS. */

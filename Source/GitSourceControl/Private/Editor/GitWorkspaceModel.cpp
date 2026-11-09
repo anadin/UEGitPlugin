@@ -1001,6 +1001,81 @@ void FGitWorkspaceModel::Unlock(const TArray<FString>& Paths, bool bForce)
 	}, nullptr, false, Progress);
 }
 
+FGitWorkspaceModel::FLockChoices FGitWorkspaceModel::GetLockChoices(const TArray<FString>& RelativePaths) const
+{
+	FLockChoices Choices;
+	if (!IsLockingEnabled())
+	{
+		return Choices;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	for (const FString& Path : RelativePaths)
+	{
+		if (const GitCore::FLockInfo* Held = Snapshot->Locks.Find(Path))
+		{
+			if (!Held->bOurs)
+			{
+				Choices.Theirs.Add(Path);
+				continue;
+			}
+			Choices.Unlock.Add(Path);
+			if (Snapshot->IsOursElsewhere(*Held))
+			{
+				Choices.Claim.Add(Path);
+			}
+			continue;
+		}
+		const GitCore::FStatusEntry* Entry = Snapshot->Status.Find(Path);
+		const bool bNew = Entry ? Entry->IsAdded() : !Snapshot->IsTracked(Path);
+		const GitCore::FFileAttributes* Attributes = Snapshot->FindAttributes(Path);
+		if (!bNew && Attributes && Attributes->bLockable)
+		{
+			Choices.Lock.Add(Path);
+		}
+	}
+	return Choices;
+}
+
+TArray<FString> FGitWorkspaceModel::GetFilesInFolders(const TArray<FString>& RelativeFolders) const
+{
+	TArray<FString> Prefixes;
+	for (const FString& Folder : RelativeFolders)
+	{
+		if (!Folder.IsEmpty())
+		{
+			Prefixes.Add(Folder.EndsWith(TEXT("/")) ? Folder : Folder + TEXT("/"));
+		}
+	}
+	// A folder named in the editor's spelling holds the files Git spells differently only in letter case.
+	auto InFolders = [&Prefixes](const FString& Path)
+	{
+		return Prefixes.ContainsByPredicate([&Path](const FString& Prefix) { return Path.StartsWith(Prefix, GitCore::PathCase()); });
+	};
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	TSet<FString> Files;
+	if (Snapshot->Tracked.IsValid())
+	{
+		for (const FString& Path : *Snapshot->Tracked)
+		{
+			if (IsPackagePath(Path) && InFolders(Path))
+			{
+				Files.Add(Path);
+			}
+		}
+	}
+	// Locks there too, also on files that are gone or not packages.
+	for (const TPair<FString, GitCore::FLockInfo>& Lock : Snapshot->Locks.ByPath)
+	{
+		if (InFolders(Lock.Key))
+		{
+			Files.Add(Lock.Key);
+		}
+	}
+	TArray<FString> Sorted = Files.Array();
+	Sorted.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::CaseSensitive) < 0; });
+	return Sorted;
+}
+
 void FGitWorkspaceModel::ClaimLocks(const TArray<FString>& Paths)
 {
 	Run(LOCTEXT("Claiming", "Claiming locks…"), ELane::Mutation, [Paths](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)

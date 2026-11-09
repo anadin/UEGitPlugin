@@ -29,15 +29,6 @@ namespace GitCore
 			return Path;
 		}
 
-		ESearchCase::Type PathCase()
-		{
-#if PLATFORM_LINUX
-			return ESearchCase::CaseSensitive;
-#else
-			return ESearchCase::IgnoreCase;
-#endif
-		}
-
 		bool StripRoot(const FString& Absolute, const FString& Base, FString& OutRelative)
 		{
 			if (Base.IsEmpty())
@@ -57,6 +48,15 @@ namespace GitCore
 			}
 			return false;
 		}
+	}
+
+	ESearchCase::Type PathCase()
+	{
+#if PLATFORM_LINUX
+		return ESearchCase::CaseSensitive;
+#else
+		return ESearchCase::IgnoreCase;
+#endif
 	}
 
 	FString FindGitExecutable(const FString& ConfiguredPath)

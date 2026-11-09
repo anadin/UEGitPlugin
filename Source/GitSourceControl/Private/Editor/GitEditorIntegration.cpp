@@ -207,6 +207,60 @@ namespace
 		int32 Submittable = 0;
 	};
 
+	/**
+	 * Lock, Claim Lock (for assets) and Unlock, each for the files it applies to. bFolders: the files are a folder's, and each
+	 * entry says how many it acts on.
+	 */
+	void AddLockEntries(FToolMenuSection& Section, const FGitWorkspaceModel::FLockChoices& Choices, bool bFolders)
+	{
+		const FName StyleName = FRevisionControlStyleManager::GetStyleSetName();
+		const FCanExecuteAction NotBusy = FCanExecuteAction::CreateLambda([]()
+		{
+			const FGitWorkspaceModel* Model = FGitWorkspaceModel::Get();
+			return Model && !Model->IsBusy();
+		});
+		auto Label = [bFolders](const FText& Action, int32 Count)
+		{
+			return bFolders ? FText::Format(LOCTEXT("FolderLockAction", "{0} {1} {1}|plural(one=Asset,other=Assets)"), Action, Count) : Action;
+		};
+		if (!Choices.Lock.IsEmpty())
+		{
+			Section.AddMenuEntry("GitLock", Label(GitWorkspaceText::LockLabel(), Choices.Lock.Num()), GitWorkspaceText::LockTooltip(),
+				FSlateIcon(StyleName, "RevisionControl.Actions.CheckOut"),
+				FUIAction(FExecuteAction::CreateLambda([Paths = Choices.Lock]()
+				{
+					if (FGitWorkspaceModel* Model = FGitWorkspaceModel::Get())
+					{
+						Model->Lock(Paths);
+					}
+				}), NotBusy));
+		}
+		if (!Choices.Claim.IsEmpty() && !bFolders)
+		{
+			Section.AddMenuEntry("GitClaimLock", LOCTEXT("ClaimLock", "Claim Lock"), GitWorkspaceText::ClaimLockTooltip(),
+				FSlateIcon(StyleName, "RevisionControl.Actions.CheckOut"),
+				FUIAction(FExecuteAction::CreateLambda([Paths = Choices.Claim]()
+				{
+					if (FGitWorkspaceModel* Model = FGitWorkspaceModel::Get())
+					{
+						Model->ClaimLocks(Paths);
+					}
+				}), NotBusy));
+		}
+		if (!Choices.Unlock.IsEmpty())
+		{
+			Section.AddMenuEntry("GitUnlock", Label(GitWorkspaceText::UnlockLabel(), Choices.Unlock.Num()), GitWorkspaceText::UnlockTooltip(),
+				FSlateIcon(StyleName, "RevisionControl.Unlocked"),
+				FUIAction(FExecuteAction::CreateLambda([Paths = Choices.Unlock]()
+				{
+					if (FGitWorkspaceModel* Model = FGitWorkspaceModel::Get())
+					{
+						Model->Unlock(Paths, false);
+					}
+				}), NotBusy));
+		}
+	}
+
 	void AddContentBrowserEntry(UToolMenu* Menu)
 	{
 		const UContentBrowserAssetContextMenuContext* Context = Menu->FindContext<UContentBrowserAssetContextMenuContext>();
@@ -228,35 +282,51 @@ namespace
 				GitEditorIntegration::ShowInPanel(Files);
 			})));
 
+		// Lock, Claim Lock and Unlock, for the assets they apply to.
 		const GitCore::FGitSessionPtr Session = Workspace->GetSession();
-		const GitCore::FSessionSnapshotRef Snapshot = Workspace->GetSnapshot();
-		TArray<FString> Claimable;
+		TArray<FString> Paths;
 		for (const FString& File : Files)
 		{
 			const FString Path = Session.IsValid() ? Session->GetRepository().ToRelative(File) : FString();
-			const GitCore::FLockInfo* Lock = Path.IsEmpty() ? nullptr : Snapshot->Locks.Find(Path);
-			if (Lock && Snapshot->IsOursElsewhere(*Lock))
+			if (!Path.IsEmpty())
 			{
-				Claimable.Add(Path);
+				Paths.Add(Path);
 			}
 		}
-		if (!Claimable.IsEmpty())
+		AddLockEntries(Section, Workspace->GetLockChoices(Paths), false);
+	}
+
+	/** Lock and Unlock for the assets in the selected folders, all the way down. */
+	void AddContentBrowserFolderEntries(UToolMenu* Menu)
+	{
+		const UContentBrowserFolderContext* Context = Menu->FindContext<UContentBrowserFolderContext>();
+		const FGitWorkspaceModel* Workspace = FGitWorkspaceModel::Get();
+		const GitCore::FGitSessionPtr Session = Workspace ? Workspace->GetSession() : nullptr;
+		if (!Context || !Workspace || !Workspace->IsActive() || !Session.IsValid() || Context->GetSelectedPackagePaths().IsEmpty())
 		{
-			Section.AddMenuEntry("GitClaimLock", LOCTEXT("ClaimLock", "Claim Lock"), GitWorkspaceText::ClaimLockTooltip(),
-				FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Actions.CheckOut"),
-				FUIAction(FExecuteAction::CreateLambda([Claimable]()
-				{
-					if (FGitWorkspaceModel* Model = FGitWorkspaceModel::Get())
-					{
-						Model->ClaimLocks(Claimable);
-					}
-				}),
-				FCanExecuteAction::CreateLambda([]()
-				{
-					const FGitWorkspaceModel* Model = FGitWorkspaceModel::Get();
-					return Model && !Model->IsBusy();
-				})));
+			return;
 		}
+		TArray<FString> Folders;
+		for (const FString& PackagePath : Context->GetSelectedPackagePaths())
+		{
+			FString OnDisk;
+			if (FPackageName::TryConvertLongPackageNameToFilename(PackagePath / TEXT(""), OnDisk))
+			{
+				// Empty for a folder outside the repository (a content folder is never its root).
+				const FString Folder = Session->GetRepository().ToRelative(FPaths::ConvertRelativePathToFull(OnDisk));
+				if (!Folder.IsEmpty())
+				{
+					Folders.Add(Folder);
+				}
+			}
+		}
+		const FGitWorkspaceModel::FLockChoices Choices = Workspace->GetLockChoices(Workspace->GetFilesInFolders(Folders));
+		if (Choices.Lock.IsEmpty() && Choices.Unlock.IsEmpty())
+		{
+			return;
+		}
+		FToolMenuSection& Section = Menu->AddSection("GitWorkspaceLocks", LOCTEXT("GitSection", "Git"));
+		AddLockEntries(Section, Choices, true);
 	}
 
 	void RegisterMenus()
@@ -295,6 +365,10 @@ namespace
 		if (UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("ContentBrowser.AssetContextMenu"))
 		{
 			Menu->AddDynamicSection("GitWorkspace", FNewToolMenuDelegate::CreateStatic(&AddContentBrowserEntry));
+		}
+		if (UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("ContentBrowser.FolderContextMenu"))
+		{
+			Menu->AddDynamicSection("GitWorkspace", FNewToolMenuDelegate::CreateStatic(&AddContentBrowserFolderEntries));
 		}
 	}
 
