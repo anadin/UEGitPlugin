@@ -639,7 +639,6 @@ bool FGitProviderPullMergeTest::RunTest(const FString&)
 		GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), Branch});
 		GitTest::Git(Alice, {TEXT("switch"), TEXT("-q"), TEXT("main")});
 	};
-	AddExpectedErrorPlain(TEXT("already on the server"), EAutomationExpectedErrorFlags::Contains, 1);
 	GitTest::FScopedNoBackgroundFetch NoFetch;
 	GitTest::FTestProvider Provider(Bob);
 	const FString Everything = Bob / TEXT("Source");
@@ -674,16 +673,20 @@ bool FGitProviderPullMergeTest::RunTest(const FString&)
 	TestTrue(TEXT("The feature's file arrived"), GitTest::FileExists(Bob, TEXT("Docs/Feature.txt")));
 	TestTrue(TEXT("The result names the branch: ") + Messages(FromFeature), Messages(FromFeature).Contains(TEXT("origin/feature"), ESearchCase::CaseSensitive));
 
-	// A rebase never rewrites commits the server already has: Bob published his to a branch of his own.
+	// A rebase never rewrites commits the server already has: Bob published his to a branch of his own, so the pull merges.
 	GitTest::Git(Bob, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("HEAD:refs/heads/bob")});
 	AlicePushesTo(TEXT("feature"), TEXT("Docs/Feature.txt"), TEXT("feature v2\n"));
 	const FString HeadBefore = Head(Bob);
 	Feature.bRebase = true;
 	Provider->SetPullOptions(Feature);
 	const FSourceControlOperationRef Rewrite = ISourceControlOperation::Create<FSync>();
-	TestEqual(TEXT("A rebase that rewrites published commits is refused"), Run(Provider, Rewrite, {Everything}), ECommandResult::Failed);
+	TestEqual(TEXT("A pull that would rebase published commits merges instead: ") + Messages(Rewrite), Run(Provider, Rewrite, {Everything}), ECommandResult::Succeeded);
 	Provider->SetPullOptions({});
-	TestEqualSensitive(TEXT("HEAD did not move"), Head(Bob), HeadBefore);
+	TestTrue(TEXT("It says why it merged: ") + Messages(Rewrite), Messages(Rewrite).Contains(TEXT("instead of rebasing"), ESearchCase::CaseSensitive));
+	TestEqualSensitive(TEXT("The published commits are kept as they are"), GitTest::Output(GitTest::Git(Bob, {TEXT("rev-parse"), TEXT("HEAD^1")})), HeadBefore);
+	TestEqualSensitive(TEXT("And joined to the new ones by a merge"), GitTest::Output(GitTest::Git(Bob, {TEXT("rev-parse"), TEXT("HEAD^2")})),
+		GitTest::Output(GitTest::Git(Bob, {TEXT("rev-parse"), TEXT("origin/feature")})));
+	TestEqualSensitive(TEXT("The new file arrived"), GitTest::ReadFile(Bob, TEXT("Docs/Feature.txt")), FString(TEXT("feature v2\n")));
 	return true;
 }
 

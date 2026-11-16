@@ -21,6 +21,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "ImageCore.h"
 #include "ImageUtils.h"
+#include "SourceControlOperations.h"
 #include "Misc/App.h"
 #include "Misc/ScopeExit.h"
 #include "Types/ISlateMetaData.h"
@@ -1022,6 +1023,130 @@ bool FGitPanelPushAfterMergeTest::RunTest(const FString&)
 	TestTrue(TEXT("Bob's own change to the locked hero is refused"), Panel.Model->GetLastFailure().IsSet() &&
 		Panel.Model->GetLastFailure()->Message.ToString().Contains(TEXT("Hero.uasset is locked by someone else"), ESearchCase::CaseSensitive));
 	TestEqualSensitive(TEXT("Nothing reached the server"), PanelHead(Team.Origin, TEXT("feature")), ServerBefore);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelPushAfterPullTest, "GitWorkspace.Panel.PushAfterPull", PanelTestFlags)
+bool FGitPanelPushAfterPullTest::RunTest(const FString&)
+{
+	GitTest::FLockedTeam Team(*this);
+	if (!Team.IsReady())
+	{
+		return false;
+	}
+	AddExpectedErrorPlain(TEXT("The server has newer commits"), EAutomationExpectedErrorFlags::Contains, 1);
+	GitTest::Git(Team.Bob, {TEXT("lfs"), TEXT("install"), TEXT("--local")});
+
+	// Bob locks the map, changes it and pushes, keeping the lock.
+	const GitCore::FGitRepositoryPtr Bob = GitTest::OpenRepository(*this, Team.Bob);
+	GitCore::FLockInfo BobsLock;
+	if (!Bob.IsValid() || !TestTrue(TEXT("Bob locks the map"), Bob->Lock(TEXT("origin"), TEXT("Content/Map.umap"), BobsLock).bOk))
+	{
+		return false;
+	}
+	GitTest::WriteFile(Team.Bob, TEXT("Content/Map.umap"), TEXT("map v2\n"));
+	GitTest::CommitAll(Team.Bob, TEXT("Map v2"));
+	TestTrue(TEXT("Bob pushes"), GitTest::Git(Team.Bob, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")}).Succeeded());
+
+	// Alice locks and commits the hero in the Git panel, not knowing about Bob's push.
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Team.Alice);
+	Panel.Refresh();
+	Panel.Model->Lock({TEXT("Content/Hero.uasset")});
+	TestTrue(TEXT("Alice locks the hero"), Panel.WaitIdle());
+	GitTest::WriteFile(Team.Alice, TEXT("Content/Hero.uasset"), TEXT("hero v2\n"));
+	Panel.Refresh();
+	Panel.Model->Stage({TEXT("Content/Hero.uasset")});
+	TestTrue(TEXT("The hero is staged"), Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot) { return Snapshot.Status.StagedCount() == 1; }));
+	bool bCommitted = false;
+	Panel.Model->Commit(TEXT("Hero v2"), false, [&bCommitted](bool bDone) { bCommitted = bDone; });
+	TestTrue(TEXT("Alice commits"), Panel.WaitIdle() && bCommitted);
+	auto Failure = [&Panel]() { return Panel.Model->GetLastFailure().IsSet() ? Panel.Model->GetLastFailure()->Message.ToString() : FString(); };
+
+	// 1. Push: the server has newer commits.
+	Panel.Model->Push();
+	TestTrue(TEXT("The first push finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("It says to pull first: ") + Failure(), Failure().Contains(TEXT("Pull, then push again"), ESearchCase::CaseSensitive));
+
+	// 2. Pull, as the Git panel's Pull does.
+	const FSourceControlOperationRef Sync = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("The pull succeeds"), Panel.Provider->Execute(Sync, nullptr, {Team.Alice}, EConcurrency::Synchronous), ECommandResult::Succeeded);
+	TestEqualSensitive(TEXT("Bob's map arrived"), GitTest::ReadFile(Team.Alice, TEXT("Content/Map.umap")), FString(TEXT("map v2\n")));
+
+	// 3. Push again.
+	Panel.Model->DismissFailure();
+	Panel.Model->Push();
+	TestTrue(TEXT("The second push finishes"), Panel.WaitIdle());
+	TestFalse(TEXT("The second push works: ") + Failure(), Panel.Model->GetLastFailure().IsSet());
+	TestEqualSensitive(TEXT("Alice's commit reached the server"), PanelHead(Team.Origin, TEXT("main")), PanelHead(Team.Alice));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitPanelPushAfterFinishTest, "GitWorkspace.Panel.PushAfterFinish", PanelTestFlags)
+bool FGitPanelPushAfterFinishTest::RunTest(const FString&)
+{
+	GitTest::FFixture Fixture;
+	const FString Origin = Fixture.InitBare();
+	const FString Seed = Fixture.InitRepo(TEXT("seed"));
+	GitTest::WriteFile(Seed, TEXT("a.txt"), TEXT("a\n"));
+	GitTest::CommitAll(Seed, TEXT("base"));
+	GitTest::Git(Seed, {TEXT("push"), TEXT("-q"), Origin, TEXT("main")});
+	const FString Alice = Fixture.Clone(Origin, TEXT("alice"), TEXT("Alice"));
+	const FString Bob = Fixture.Clone(Origin, TEXT("bob"), TEXT("Bob"));
+	AddExpectedErrorPlain(TEXT("The server has newer commits"), EAutomationExpectedErrorFlags::Contains, 1);
+	GitTest::FScopedNoBackgroundFetch NoFetch;
+	FPanelFixture Panel(Bob);
+	Panel.Refresh();
+	Panel.WaitUntil([](const GitCore::FSessionSnapshot& Snapshot)
+	{
+		return Snapshot.Branches.ContainsByPredicate([](const GitCore::FBranchInfo& Branch) { return Branch.bRemote && Branch.Name.Equals(TEXT("origin/main"), ESearchCase::CaseSensitive); });
+	});
+	auto Failure = [&Panel]() { return Panel.Model->GetLastFailure().IsSet() ? Panel.Model->GetLastFailure()->Message.ToString() : FString(); };
+
+	// Bob starts a branch, commits, publishes it and finishes it into main: main now holds a commit that origin/feature has too.
+	Panel.Model->StartBranch(TEXT("feature"));
+	TestTrue(TEXT("Start finishes"), Panel.WaitIdle());
+	GitTest::WriteFile(Bob, TEXT("feature.txt"), TEXT("feature\n"));
+	GitTest::CommitAll(Bob, TEXT("Feature"));
+	Panel.Refresh();
+	Panel.Model->Push(true);
+	TestTrue(TEXT("Publish finishes: ") + Failure(), Panel.WaitIdle() && !Panel.Model->GetLastFailure().IsSet());
+	{
+		GitWorkspaceDialogs::FScopedConfirmAnswer Yes(true);
+		Panel.Model->FinishBranch();
+	}
+	TestTrue(TEXT("Finish finishes: ") + Failure(), Panel.WaitIdle() && !Panel.Model->GetLastFailure().IsSet());
+
+	// Meanwhile Alice pushes to main.
+	GitTest::WriteFile(Alice, TEXT("alice.txt"), TEXT("alice\n"));
+	GitTest::CommitAll(Alice, TEXT("Alice"));
+	GitTest::Git(Alice, {TEXT("push"), TEXT("-q"), TEXT("origin"), TEXT("main")});
+
+	// 1. Push main: the server has newer commits.
+	const FString Finished = PanelHead(Bob);
+	Panel.Refresh();
+	Panel.Model->Push();
+	TestTrue(TEXT("The first push finishes"), Panel.WaitIdle());
+	TestTrue(TEXT("It says to pull first: ") + Failure(), Failure().Contains(TEXT("Pull, then push again"), ESearchCase::CaseSensitive));
+	Panel.Model->DismissFailure();
+
+	// 2. Pull, rebasing as by default: the finished commit is on origin/feature, so the pull merges rather than copy it.
+	const FSourceControlOperationRef Sync = ISourceControlOperation::Create<FSync>();
+	TestEqual(TEXT("The pull succeeds"), Panel.Provider->Execute(Sync, nullptr, {Bob}, EConcurrency::Synchronous), ECommandResult::Succeeded);
+	FString Said;
+	for (const FText& Message : Sync->GetResultInfo().InfoMessages)
+	{
+		Said += Message.ToString();
+	}
+	TestTrue(TEXT("It says it merged instead of rebasing: ") + Said, Said.Contains(TEXT("instead of rebasing"), ESearchCase::CaseSensitive));
+	TestEqualSensitive(TEXT("The finished commit is kept as it is"), PanelHead(Bob, TEXT("HEAD^1")), Finished);
+	TestTrue(TEXT("Alice's commit arrived"), GitTest::FileExists(Bob, TEXT("alice.txt")));
+
+	// 3. Push again: it goes through.
+	Panel.Model->Push();
+	TestTrue(TEXT("The second push finishes"), Panel.WaitIdle());
+	TestFalse(TEXT("The second push works: ") + Failure(), Panel.Model->GetLastFailure().IsSet());
+	TestEqualSensitive(TEXT("Main reached the server"), PanelHead(Origin, TEXT("main")), PanelHead(Bob));
 	return true;
 }
 

@@ -887,21 +887,8 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		}
 	}
 
-	const FPullPlan Plan = PlanPull(*Snapshot, Source, Pull);
-	if (!Plan.NewInTheWay.IsEmpty())
-	{
-		Command.AddError(FText::Format(LOCTEXT("SyncNewInTheWay", "Nothing was changed: new files of yours have the same names as files coming from the server ({0}). Move or delete them first."),
-			FText::FromString(FileList(Plan.NewInTheWay))));
-		return false;
-	}
-	if (Plan.bStash && !Pull.bStash)
-	{
-		Command.AddError(Plan.Overlap.IsEmpty()
-			? LOCTEXT("SyncNeedsStash", "Nothing was changed: rebasing needs your local changes out of the way. Submit, stash or revert them first, or pull with Stash and reapply local changes.")
-			: FText::Format(LOCTEXT("SyncOverlap", "Nothing was changed: you have local changes to files that also changed on the server ({0}). Submit, stash or revert them first, or pull with Stash and reapply local changes."),
-				FText::FromString(FileList(Plan.Overlap))));
-		return false;
-	}
+	FPullPlan Plan = PlanPull(*Snapshot, Source, Pull);
+	bool bMergedInstead = false;
 	if (Plan.Mode == EIntegrate::Rebase)
 	{
 		// A rebase rewrites the commits it replays, so never ones the server already has; lean branching's Sync
@@ -920,12 +907,32 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		}
 		if (Count < Source.Ahead)
 		{
-			Command.AddError(Pull.bSyncBranch
-				? LOCTEXT("SyncBranchShared", "Nothing was changed: some of this branch's commits are also on other branches on the server, and rebasing would leave those behind. Pull with merge instead.")
-				: FText::Format(LOCTEXT("SyncRewritesPublished", "Nothing was changed: rebasing onto {0} would rewrite commits that are already on the server. Pull from the Git panel with Rebase instead of merge unticked to merge them instead."),
-					FText::FromString(Source.Upstream)));
-			return false;
+			if (Pull.bSyncBranch)
+			{
+				Command.AddError(LOCTEXT("SyncBranchShared", "Nothing was changed: some of this branch's commits are also on other branches on the server, and rebasing would leave those behind. Pull with merge instead."));
+				return false;
+			}
+			// Some are on another branch on the server, such as a finished branch's after lean branching's Finish:
+			// merging brings the new commits in and leaves those as they are, so the push that follows goes through.
+			FPullOptions Merge = Pull;
+			Merge.bRebase = false;
+			Plan = PlanPull(*Snapshot, Source, Merge);
+			bMergedInstead = true;
 		}
+	}
+	if (!Plan.NewInTheWay.IsEmpty())
+	{
+		Command.AddError(FText::Format(LOCTEXT("SyncNewInTheWay", "Nothing was changed: new files of yours have the same names as files coming from the server ({0}). Move or delete them first."),
+			FText::FromString(FileList(Plan.NewInTheWay))));
+		return false;
+	}
+	if (Plan.bStash && !Pull.bStash)
+	{
+		Command.AddError(Plan.Overlap.IsEmpty()
+			? LOCTEXT("SyncNeedsStash", "Nothing was changed: rebasing needs your local changes out of the way. Submit, stash or revert them first, or pull with Stash and reapply local changes.")
+			: FText::Format(LOCTEXT("SyncOverlap", "Nothing was changed: you have local changes to files that also changed on the server ({0}). Submit, stash or revert them first, or pull with Stash and reapply local changes."),
+				FText::FromString(FileList(Plan.Overlap))));
+		return false;
 	}
 	if (Plan.Mode != EIntegrate::FastForward)
 	{
@@ -1020,6 +1027,11 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& Command)
 		Command.AddInfo(FText::Format(bCopyUpdated
 			? LOCTEXT("SyncedBranchAndCopy", "Synced with {1}: {0} new {0}|plural(one=commit,other=commits). {2} on the server now matches.")
 			: LOCTEXT("SyncedBranch", "Synced with {1}: {0} new {0}|plural(one=commit,other=commits)."), Source.Behind, FText::FromString(Source.Upstream), FText::FromString(Copy.Name)));
+	}
+	else if (bMergedInstead)
+	{
+		Command.AddInfo(FText::Format(LOCTEXT("MergedInstead", "Merged {0} {0}|plural(one=commit,other=commits) from {1} instead of rebasing: some of your commits are on the server already, on another branch, and rebasing would copy them."),
+			Source.Behind, FText::FromString(Source.Upstream)));
 	}
 	else
 	{

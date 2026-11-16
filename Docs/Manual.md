@@ -102,7 +102,7 @@ When your `main` (or `master`, or `develop`) is on the server, the menu's **Lean
 
 1. **Start branch on main…** creates a branch from the newest main.
 2. **Sync** brings your team's new work on main into your branch. Do it often.
-3. **Finish (merge into main)…** puts your branch's commits on main and switches to main. Then **Push**.
+3. **Finish (merge into main)…** puts your branch's commits on main and switches to main. Then **Push**. If someone pushed to main meanwhile, the push asks you to Pull first: Pull merges their work in, and the next Push goes through.
 
 ## When something goes wrong
 
