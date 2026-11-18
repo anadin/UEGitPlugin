@@ -64,7 +64,7 @@ Open it with the branch button in the status bar, or **Window > Git**. Its toolb
 
 ### Changes
 
-Your edits, in two lists: **Changes**, not staged yet, and **Staged**, what the next commit contains.
+Your edits, in two lists: **Changes**, not staged yet, and **Staged**, what the next commit contains. Files stored through Git LFS carry a small **LFS** tag after their name.
 
 - Select files and press Space to move them from one list to the other. To stage part of a text file, select lines in its diff and click **Stage lines**.
 - Write a message and click **Commit**, or press Ctrl+Enter. To push as well, hold Alt over the button so it says **Commit and push**, or press Ctrl+Shift+Enter.

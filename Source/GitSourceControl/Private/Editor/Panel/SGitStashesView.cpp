@@ -265,6 +265,7 @@ void SGitStashesView::ApplyStashFilter()
 	{
 		List->ClearSelection();
 		StashPaths.Reset();
+		StashLfsPaths.Reset();
 		RebuildFiles();
 	}
 }
@@ -278,13 +279,14 @@ SGitStashesView::FStashPtr SGitStashesView::Selection() const
 void SGitStashesView::OnSelected(FStashPtr Stash, ESelectInfo::Type SelectInfo)
 {
 	StashPaths.Reset();
+	StashLfsPaths.Reset();
 	RebuildFiles();
 	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
 	if (!Stash.IsValid() || !Model.IsValid())
 	{
 		return;
 	}
-	Model->LoadStashPaths(Stash->Selector, [WeakThis = TWeakPtr<SGitStashesView>(SharedThis(this)), Oid = Stash->Oid](TArray<FString>&& Paths, const FString& Error)
+	Model->LoadStashPaths(Stash->Selector, [WeakThis = TWeakPtr<SGitStashesView>(SharedThis(this)), Oid = Stash->Oid](TArray<FString>&& Paths, TSet<FString>&& LfsPaths, const FString& Error)
 	{
 		const TSharedPtr<SGitStashesView> Self = WeakThis.Pin();
 		if (!Self.IsValid() || !Self->Selection().IsValid() || Self->Selection()->Oid != Oid)
@@ -292,6 +294,7 @@ void SGitStashesView::OnSelected(FStashPtr Stash, ESelectInfo::Type SelectInfo)
 			return;
 		}
 		Self->StashPaths = MoveTemp(Paths);
+		Self->StashLfsPaths = MoveTemp(LfsPaths);
 		Self->RebuildFiles();
 	});
 }
@@ -396,7 +399,7 @@ TSharedRef<ITableRow> SGitStashesView::OnGenerateFileRow(FPathItemPtr Item, cons
 	}
 	const FGitFileDisplay& Display = Displays.Get(WeakModel.Pin().Get(), Item->Path);
 	Row->SetCell(GitFileTree::MakeNameCell(Row, false, Display.Name, bBuiltFolders ? FText::GetEmpty() : Display.Folder, Display.Icon,
-		FText::FromString(Item->Path), Highlight));
+		FText::FromString(Item->Path), Highlight, SNullWidget::NullWidget, StashLfsPaths.Contains(Item->Path)));
 	return Row;
 }
 

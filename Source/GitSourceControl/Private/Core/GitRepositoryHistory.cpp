@@ -129,6 +129,17 @@ namespace GitCore
 			}
 			return false;
 		}
+		// The attribute files as they are now: before Git 2.40, check-attr cannot read a commit's own.
+		TArray<FString> Paths;
+		for (const FHistoryChange& Change : Out.Files)
+		{
+			Paths.Add(Change.Path);
+		}
+		const TSet<FString> Lfs = FindLfsPaths(Paths);
+		for (FHistoryChange& Change : Out.Files)
+		{
+			Change.bLfs = Lfs.Contains(Change.Path);
+		}
 		return true;
 	}
 

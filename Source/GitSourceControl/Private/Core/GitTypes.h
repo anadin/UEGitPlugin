@@ -184,6 +184,8 @@ namespace GitCore
 		FString OldMode;
 		FString NewMode;
 		TCHAR Status = TEXT('?');
+		/** Stored through Git LFS, as the attribute files say now. */
+		bool bLfs = false;
 	};
 
 	struct FCommitDetails

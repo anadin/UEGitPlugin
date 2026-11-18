@@ -104,6 +104,24 @@ namespace GitCore
 		return true;
 	}
 
+	TSet<FString> FGitRepository::FindLfsPaths(const TArray<FString>& Paths) const
+	{
+		TSet<FString> Lfs;
+		TMap<FString, FFileAttributes> Attributes;
+		FString Error;
+		if (!Paths.IsEmpty() && ReadAttributes(Paths, Attributes, Error))
+		{
+			for (const TPair<FString, FFileAttributes>& Pair : Attributes)
+			{
+				if (Pair.Value.bLfs)
+				{
+					Lfs.Add(Pair.Key);
+				}
+			}
+		}
+		return Lfs;
+	}
+
 	FString FGitRepository::ReadIndexToken() const
 	{
 		// The index ends with a checksum of its contents; together with size and time it

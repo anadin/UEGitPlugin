@@ -120,6 +120,8 @@ namespace GitCore
 		bool ReadStatus(FStatusSnapshot& Out, FString& OutError, bool bAllowIndexRefresh, const TArray<FString>* OnlyPaths = nullptr) const;
 		bool ReadTrackedPaths(TSet<FString>& Out, FString& OutError) const;
 		bool ReadAttributes(const TArray<FString>& Paths, TMap<FString, FFileAttributes>& Out, FString& OutError) const;
+		/** Which of Paths are stored through Git LFS, as the attribute files say now; none when the attributes cannot be read. */
+		TSet<FString> FindLfsPaths(const TArray<FString>& Paths) const;
 		FString ReadIndexToken() const;
 		bool IsOperationInProgress() const;
 

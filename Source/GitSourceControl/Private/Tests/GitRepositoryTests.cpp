@@ -358,6 +358,25 @@ bool FGitRepositoryHistoryTest::RunTest(const FString&)
 		}
 		TestEqualSensitive(TEXT("Both children come before their parent, the newer first"), GitTest::Joined(Order), GitTest::Joined({TEXT("sibling down"), TEXT("child up"), TEXT("parent")}));
 	}
+
+	// A commit's files say which are stored through Git LFS.
+	GitTest::WriteFile(Repo, TEXT(".gitattributes"), TEXT("*.uasset filter=lfs diff=lfs merge=lfs -text\n"));
+	GitTest::WriteFile(Repo, TEXT("Content/Hero.uasset"), TEXT("hero\n"));
+	GitTest::WriteFile(Repo, TEXT("notes.txt"), TEXT("notes\n"));
+	const FString WithLfs = GitTest::CommitAll(Repo, TEXT("LFS and text"));
+	GitCore::FCommitDetails LfsCommit;
+	if (TestTrue(TEXT("The LFS commit is read"), Repository->ReadCommit(WithLfs, LfsCommit, Error)))
+	{
+		TArray<FString> Lfs;
+		for (const GitCore::FHistoryChange& Change : LfsCommit.Files)
+		{
+			if (Change.bLfs)
+			{
+				Lfs.Add(Change.Path);
+			}
+		}
+		TestEqualSensitive(TEXT("Only the asset is stored through Git LFS"), GitTest::Joined(Lfs), FString(TEXT("Content/Hero.uasset")));
+	}
 	GitCore::FCommitDetails Details;
 	TestTrue(TEXT("A commit's files are listed"), Repository->ReadCommit(Third, Details, Error) && Details.Files.Num() == 2);
 	TestTrue(TEXT("The root commit compares with nothing"), Repository->ReadCommit(First, Details, Error) && Details.Files.Num() == 1 && Details.Files[0].Status == TEXT('A'));

@@ -5,11 +5,14 @@
 #include "Editor/GitWorkspaceText.h"
 #include "Provider/GitSourceControlUserSettings.h"
 
+#include "Brushes/SlateRoundedBoxBrush.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "HAL/PlatformApplicationMisc.h"
 #include "Styling/AppStyle.h"
+#include "Styling/StyleColors.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Layout/SBorder.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SExpanderArrow.h"
@@ -109,8 +112,23 @@ void GitFileTree::AddFolderEntries(FMenuBuilder& Menu, TFunction<void(bool bExpa
 		GitWorkspaceText::Shortcut(EModifierKey::Shift, EKeys::Left));
 }
 
+TSharedRef<SWidget> GitFileTree::MakeLfsTag()
+{
+	static const FSlateRoundedBoxBrush Outline(FLinearColor::Transparent, 3.0f, FStyleColors::InputOutline, 1.0f);
+	return SNew(SBorder)
+		.BorderImage(&Outline)
+		.Padding(FMargin(4.0f, 0.0f, 4.0f, 1.0f))
+		.ToolTipText(LOCTEXT("LfsTagTooltip", "Stored with Git LFS: the repository keeps a small pointer, and the LFS server keeps the content."))
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("LfsTag", "LFS"))
+			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 7))
+			.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+		];
+}
+
 TSharedRef<SWidget> GitFileTree::MakeNameCell(const TSharedRef<ITableRow>& Row, bool bFolder, const FText& Name, const FText& Note, const FSlateBrush* Icon,
-	const FText& Tooltip, const TAttribute<FText>& Highlight, const TSharedRef<SWidget>& Trailing)
+	const FText& Tooltip, const TAttribute<FText>& Highlight, const TSharedRef<SWidget>& Trailing, bool bLfs)
 {
 	const TWeakPtr<ITableRow> WeakRow = Row;
 	return SNew(SHorizontalBox)
@@ -146,6 +164,13 @@ TSharedRef<SWidget> GitFileTree::MakeNameCell(const TSharedRef<ITableRow>& Row, 
 			SNew(STextBlock)
 			.Text(Name)
 			.HighlightText(Highlight)
+		]
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(6.0f, 0.0f, 0.0f, 0.0f)
+		[
+			bLfs ? MakeLfsTag() : SNullWidget::NullWidget
 		]
 		+ SHorizontalBox::Slot()
 		.FillWidth(1.0f)

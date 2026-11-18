@@ -243,7 +243,7 @@ namespace
 					];
 				// The tree shows the folder; a flat list names it next to the file.
 				return GitFileTree::MakeNameCell(SharedThis(this), false, Display.Name, GitFileTree::ShowFolders() ? FText::GetEmpty() : Display.Folder, Display.Icon,
-					Tooltip, Highlight, Badges);
+					Tooltip, Highlight, Badges, Pinned->IsLfsFile(Entry.Path));
 			}
 			if (Column == ChangeColumn)
 			{
@@ -651,6 +651,12 @@ void SGitChangesView::FocusSearch()
 const FGitFileDisplay& SGitChangesView::GetDisplay(const FString& Path)
 {
 	return Displays.Get(WeakModel.Pin().Get(), Path);
+}
+
+bool SGitChangesView::IsLfsFile(const FString& Path) const
+{
+	const TSharedPtr<FGitWorkspaceModel> Model = WeakModel.Pin();
+	return Model.IsValid() && Model->IsLfs(Path);
 }
 
 FText SGitChangesView::GetLockText(const FString& Path) const

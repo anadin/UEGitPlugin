@@ -787,6 +787,12 @@ bool FGitPanelLockChoicesTest::RunTest(const FString&)
 	TestTrue(TEXT("The menu has Lock: ") + GitTest::Joined(Entries), GitTest::HasExactly(Entries, GitWorkspaceText::LockLabel().ToString()));
 	TestTrue(TEXT("And Unlock"), GitTest::HasExactly(Entries, GitWorkspaceText::UnlockLabel().ToString()));
 
+	// The Changes tab tags files stored through Git LFS.
+	GitTest::WriteFile(Team.Alice, TEXT("readme.txt"), TEXT("text v2\n"));
+	Panel.Refresh();
+	TestTrue(TEXT("A changed asset is stored through Git LFS"), Panel.Model->IsLfs(Hero));
+	TestFalse(TEXT("A changed text file is not"), Panel.Model->IsLfs(TEXT("readme.txt")));
+
 	// Acting on them: Lock takes the free asset's lock, and Unlock releases yours.
 	Panel.Model->Lock(Choices.Lock);
 	TestTrue(TEXT("Locking finishes"), Panel.WaitIdle());
@@ -802,6 +808,19 @@ bool FGitPanelLockChoicesTest::RunTest(const FString&)
 	}
 	Held.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::CaseSensitive) < 0; });
 	TestEqualSensitive(TEXT("The server holds Alice's new lock and Bob's"), GitTest::Joined(Held), GitTest::Joined({TEXT("Content/Map.umap theirs"), Crate + TEXT(" ours")}));
+
+	// A stash's files come with which of them are stored through Git LFS.
+	TestTrue(TEXT("The changes are stashed"), GitTest::Git(Team.Alice, {TEXT("stash"), TEXT("push"), TEXT("-q"), TEXT("-m"), TEXT("LFS check")}).Succeeded());
+	bool bLoaded = false;
+	TArray<FString> StashLfs;
+	Panel.Model->LoadStashPaths(TEXT("stash@{0}"), [&bLoaded, &StashLfs](TArray<FString>&& Paths, TSet<FString>&& LfsPaths, const FString&)
+	{
+		StashLfs = LfsPaths.Array();
+		bLoaded = true;
+	});
+	TestTrue(TEXT("The stash's files are read"), GitTest::WaitFor([&bLoaded]() { return bLoaded; }));
+	StashLfs.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::CaseSensitive) < 0; });
+	TestEqualSensitive(TEXT("Its assets are stored through Git LFS, its text file is not"), GitTest::Joined(StashLfs), GitTest::Joined({Hero, Crate}));
 	return true;
 }
 

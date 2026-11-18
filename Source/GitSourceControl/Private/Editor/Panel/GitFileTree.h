@@ -45,7 +45,9 @@ namespace GitFileTree
 	 * subdued note such as a folder's file count. Trailing goes after the note.
 	 */
 	TSharedRef<SWidget> MakeNameCell(const TSharedRef<ITableRow>& Row, bool bFolder, const FText& Name, const FText& Note, const FSlateBrush* Icon,
-		const FText& Tooltip, const TAttribute<FText>& Highlight, const TSharedRef<SWidget>& Trailing = SNullWidget::NullWidget);
+		const FText& Tooltip, const TAttribute<FText>& Highlight, const TSharedRef<SWidget>& Trailing = SNullWidget::NullWidget, bool bLfs = false);
+	/** "LFS", a small tag after the name of a file stored through Git LFS. */
+	TSharedRef<SWidget> MakeLfsTag();
 
 	template<typename ItemType>
 	void Tidy(TArray<TSharedPtr<ItemType>>& Items)

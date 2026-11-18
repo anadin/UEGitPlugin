@@ -1555,12 +1555,12 @@ void FGitWorkspaceModel::LoadCommit(const FString& Oid, TFunction<void(GitCore::
 	});
 }
 
-void FGitWorkspaceModel::LoadStashPaths(const FString& Selector, TFunction<void(TArray<FString>&&, const FString&)> OnLoaded)
+void FGitWorkspaceModel::LoadStashPaths(const FString& Selector, TFunction<void(TArray<FString>&&, TSet<FString>&&, const FString&)> OnLoaded)
 {
 	const GitCore::FGitSessionPtr Session = GetSession();
 	if (!Session.IsValid())
 	{
-		OnLoaded({}, FString());
+		OnLoaded({}, {}, FString());
 		return;
 	}
 	Session->EnqueueRead([Session, Selector, OnLoaded]()
@@ -1568,11 +1568,18 @@ void FGitWorkspaceModel::LoadStashPaths(const FString& Selector, TFunction<void(
 		TArray<FString> Paths;
 		FString Error;
 		Session->GetRepository().ReadStashPaths(Selector, Paths, Error);
-		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Paths = MoveTemp(Paths), Error]() mutable
+		TSet<FString> Lfs = Session->GetRepository().FindLfsPaths(Paths);
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Paths = MoveTemp(Paths), Lfs = MoveTemp(Lfs), Error]() mutable
 		{
-			OnLoaded(MoveTemp(Paths), Error);
+			OnLoaded(MoveTemp(Paths), MoveTemp(Lfs), Error);
 		});
 	});
+}
+
+bool FGitWorkspaceModel::IsLfs(const FString& RelativePath) const
+{
+	const GitCore::FFileAttributes* Attributes = GetSnapshot()->FindAttributes(RelativePath);
+	return Attributes && Attributes->bLfs;
 }
 
 void FGitWorkspaceModel::LoadDiff(const FString& RelativePath, bool bStaged, TFunction<void(FString&&, const FString&)> OnLoaded)

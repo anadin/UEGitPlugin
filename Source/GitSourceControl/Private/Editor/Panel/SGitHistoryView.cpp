@@ -934,7 +934,7 @@ TSharedRef<ITableRow> SGitHistoryView::OnGenerateFileRow(FFileItemPtr Item, cons
 	}
 	const FString Location = bRenamed ? Change.OldPath + TEXT(" → ") + Change.Path : Change.Path;
 	Row->SetCell(GitFileTree::MakeNameCell(Row, false, Display.Name, Note, ChangeBrush(Change.Status),
-		FText::Format(LOCTEXT("ChangeTooltip", "{0}\nDouble-click to compare with the previous version."), FText::FromString(Location)), Highlight));
+		FText::Format(LOCTEXT("ChangeTooltip", "{0}\nDouble-click to compare with the previous version."), FText::FromString(Location)), Highlight, SNullWidget::NullWidget, Change.bLfs));
 	return Row;
 }
 

@@ -62,6 +62,8 @@ private:
 	TSharedPtr<SSearchBox> SearchBox;
 	/** The selected stash's files, and the tree shown for them. */
 	TArray<FString> StashPaths;
+	/** The selected stash's files stored through Git LFS. */
+	TSet<FString> StashLfsPaths;
 	TArray<FPathItemPtr> Files;
 	TSharedPtr<STreeView<FPathItemPtr>> FileTree;
 	FGitFileDisplays Displays;

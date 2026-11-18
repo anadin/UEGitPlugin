@@ -40,6 +40,7 @@
 - A short manual, [Docs/Manual.md](Docs/Manual.md), walks through everyday use: Pull, check out, check in, undo, locks, the Git panel and branches. The README links to it, and says how far Windows has got.
 - Content Browser: **Lock** and **Unlock** in the right-click menu of assets and folders. Unlock releases your locks and keeps your changes; on a folder, both act on every asset in it and say how many. The Git panel's Changes menu now names them the same (they were "Lock (check out)" and "Release lock"), and both menus offer them by the same rules.
 - Pushing main after lean branching's Finish no longer goes round in circles when someone pushed to main meanwhile. The push said to pull first, and Pull, rebasing by default, refused: the finished branch's commits are on the server already, so rebasing would copy them. Pull now merges in that case and says so, and the push that follows goes through. Lean branching's Sync still only rebases.
+- Git panel: files stored through Git LFS carry a small **LFS** tag after their name, in Changes and in a commit's or stash's files.
 
 ## 4.0.0-alpha
 
