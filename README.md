@@ -24,10 +24,10 @@ New to Git Workspace? The [manual](Docs/Manual.md) walks through everyday use.
 ## Install
 
 1. Put the plugin in your project's `Plugins/UEGitPlugin` folder (for example as a Git submodule) and build the editor.
-2. Enable **Git Workspace** in **Edit > Plugins** and restart the editor.
+2. Enable **Git Workspace** in **Edit > Plugins** and restart the editor. Unreal's own **Git** plugin stays available next to it.
 3. In the status bar, open **Revision Control > Connect to Revision Control**, choose **Git Workspace** and accept. Git is found automatically; set its path in the same dialog if needed.
 
-Projects that used the older **Git LFS 2** provider switch to Git Workspace automatically.
+**Replacing a plugin named GitSourceControl** (Project Borealis' Git LFS 2 plugin, or a build of this one from before it was renamed): replace its folder with this one, then in your `.uproject` change the plugin's `"Name"` from `"GitSourceControl"` to `"GitWorkspace"`, or enable Git Workspace in **Edit > Plugins**. The provider choice and settings carry over; **Git LFS 2** becomes Git Workspace automatically.
 
 ## Set up the project
 

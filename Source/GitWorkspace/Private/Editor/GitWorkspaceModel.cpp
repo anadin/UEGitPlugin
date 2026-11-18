@@ -1,0 +1,1856 @@
+// Copyright UEGitPlugin contributors. Distributed under the MIT license.
+#include "GitWorkspaceModel.h"
+
+#include "GitWorkspaceModule.h"
+#include "GitWorkspaceText.h"
+#include "Provider/GitProviderIdentity.h"
+#include "Provider/GitWorkspaceRevision.h"
+#include "Provider/GitWorkspaceUserSettings.h"
+#include "Provider/GitWorkspaceWorkers.h"
+#include "Editor/Panel/SGitDiffView.h"
+#include "Editor/Panel/SGitDialogs.h"
+
+#include "AssetDefinition.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "AssetToolsModule.h"
+#include "Async/Async.h"
+#include "ContentBrowserModule.h"
+#include "Containers/Ticker.h"
+#include "DiffUtils.h"
+#include "Editor.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "HAL/FileManager.h"
+#include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
+#include "IContentBrowserSingleton.h"
+#include "ISourceControlModule.h"
+#include "Logging/MessageLog.h"
+#include "Misc/FileHelper.h"
+#include "Misc/MessageDialog.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
+#include "Misc/ScopedSlowTask.h"
+#include "SourceControlHelpers.h"
+#include "SourceControlOperations.h"
+#include "SourceControlWindows.h"
+#include "Styling/AppStyle.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#include "UObject/Package.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Notifications/SNotificationList.h"
+#include "Widgets/SWindow.h"
+
+#define LOCTEXT_NAMESPACE "GitWorkspaceModel"
+
+namespace
+{
+	TSharedPtr<FGitWorkspaceModel> Instance;
+
+	FGitWorkspaceProvider& ProviderInstance()
+	{
+		return FGitWorkspaceModule::Get().GetProvider();
+	}
+
+	bool IsPackagePath(const FString& Path)
+	{
+		return FPackageName::IsPackageExtension(*FPaths::GetExtension(Path));
+	}
+
+	bool IsExternalPackage(const FString& Path)
+	{
+		return Path.Contains(TEXT("/__ExternalActors__/")) || Path.Contains(TEXT("/__ExternalObjects__/"));
+	}
+
+	/**
+	 * The same place outside World Partition's external folders: "Content/__ExternalActors__/Maps/Main"
+	 * becomes "Content/Maps/Main". Empty for other paths.
+	 */
+	FString OutsideExternalFolder(const FString& Path)
+	{
+		for (const TCHAR* Folder : {TEXT("/__ExternalActors__"), TEXT("/__ExternalObjects__")})
+		{
+			const int32 Length = FCString::Strlen(Folder);
+			const int32 Start = Path.Find(FString(Folder) + TEXT("/"));
+			if (Start != INDEX_NONE)
+			{
+				return Path.Left(Start + 1) + Path.Mid(Start + Length + 1);
+			}
+			if (Path.EndsWith(Folder))
+			{
+				return Path.LeftChop(Length);
+			}
+		}
+		return FString();
+	}
+
+	/**
+	 * The package name of a file under a mounted content folder. TryConvertFilenameToLongPackageName is
+	 * not enough: it hands back an unmounted macOS or Linux path as if it were a package name.
+	 */
+	bool MountedPackageName(const FString& AbsoluteFile, FString& OutPackageName)
+	{
+		FPackageName::EFlexNameType Type = FPackageName::EFlexNameType::Invalid;
+		return FPackageName::TryConvertToMountedPath(AbsoluteFile, nullptr, &OutPackageName, nullptr, nullptr, nullptr, &Type) &&
+			Type == FPackageName::EFlexNameType::LocalPath;
+	}
+
+	/** Adds the assets (not redirectors) the Asset Registry knows for a package file under a mounted content folder. */
+	bool FindAssets(const FString& AbsoluteFile, TArray<FAssetData>& OutAssets)
+	{
+		FString PackageName;
+		if (!MountedPackageName(AbsoluteFile, PackageName))
+		{
+			return false;
+		}
+		TArray<FAssetData> Found;
+		IAssetRegistry::GetChecked().GetAssetsByPackageName(FName(*PackageName), Found, true);
+		bool bFound = false;
+		for (const FAssetData& Asset : Found)
+		{
+			if (!Asset.IsRedirector())
+			{
+				OutAssets.AddUnique(Asset);
+				bFound = true;
+			}
+		}
+		return bFound;
+	}
+
+	/** Adds the Content Browser folder ("/Game/Props") of a folder on disk under a mounted content folder. */
+	void AddContentFolder(const FString& AbsoluteFolder, TArray<FString>& OutFolders)
+	{
+		FString PackageName;
+		if (IFileManager::Get().DirectoryExists(*AbsoluteFolder) && MountedPackageName(AbsoluteFolder / TEXT("Folder.uasset"), PackageName))
+		{
+			OutFolders.AddUnique(FPackageName::GetLongPackagePath(PackageName));
+		}
+	}
+
+	/** What Show in Content Browser selects for repository files and folders. */
+	void FindContentBrowserTargets(const GitCore::FGitRepository& Repository, const TArray<FString>& RelativePaths, TArray<FAssetData>& OutAssets, TArray<FString>& OutFolders)
+	{
+		for (const FString& Path : RelativePaths)
+		{
+			const FString Absolute = Repository.ToAbsolute(Path);
+			// The Content Browser hides World Partition's external folders: their actors show as their level.
+			const FString Outside = OutsideExternalFolder(Path);
+			if (IFileManager::Get().DirectoryExists(*Absolute))
+			{
+				if (Outside.IsEmpty())
+				{
+					AddContentFolder(Absolute, OutFolders);
+				}
+				else if (!FindAssets(Repository.ToAbsolute(Outside + TEXT(".umap")), OutAssets))
+				{
+					// Not a level's folder (or its level is gone): the matching content folder, else the one it would be in.
+					const FString Folder = Repository.ToAbsolute(Outside);
+					AddContentFolder(IFileManager::Get().DirectoryExists(*Folder) ? Folder : FPaths::GetPath(Folder), OutFolders);
+				}
+				continue;
+			}
+			if (!IsPackagePath(Path))
+			{
+				continue;
+			}
+			if (!Outside.IsEmpty())
+			{
+				const FString Level = Repository.ToAbsolute(OutsideExternalFolder(GitWorkspaceText::TreeFolder(Path)));
+				if (!FindAssets(Level + TEXT(".umap"), OutAssets))
+				{
+					AddContentFolder(FPaths::GetPath(Level), OutFolders);
+				}
+				continue;
+			}
+			// An asset that is gone shows the folder it was in.
+			if (!FindAssets(Absolute, OutAssets))
+			{
+				AddContentFolder(FPaths::GetPath(Absolute), OutFolders);
+			}
+		}
+	}
+
+	/**
+	 * What Show in Finder / Explorer opens: each folder once, with the first file asked for selected
+	 * in it. A path that is gone shows the nearest folder that still exists.
+	 */
+	TArray<FString> FindRevealTargets(const GitCore::FGitRepository& Repository, const TArray<FString>& RelativePaths)
+	{
+		TArray<FString> Targets;
+		TSet<FString> Folders;
+		for (const FString& Path : RelativePaths)
+		{
+			FString Relative = Path;
+			FString Target = Repository.ToAbsolute(Relative);
+			bool bFolder = IFileManager::Get().DirectoryExists(*Target);
+			if (!bFolder && !IFileManager::Get().FileExists(*Target))
+			{
+				do
+				{
+					Relative = FPaths::GetPath(Relative);
+					Target = Repository.ToAbsolute(Relative);
+				}
+				while (!Relative.IsEmpty() && !IFileManager::Get().DirectoryExists(*Target));
+				bFolder = true;
+			}
+			bool bShown = false;
+			Folders.Add(bFolder ? Target : FPaths::GetPath(Target), &bShown);
+			if (!bShown)
+			{
+				Targets.Add(Target);
+			}
+		}
+		return Targets;
+	}
+
+	/**
+	 * Lock check, LFS upload and push of every outgoing commit. Runs on the mutation lane.
+	 * bAgreed: the user agreed to a push that creates a branch on the server or changes the branch this one follows.
+	 */
+	FGitActionResult PushNow(GitCore::FGitSession& Session, bool bLocking, bool bAgreed, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		const GitCore::FGitRepository& Repository = Session.GetRepository();
+		Session.RefreshStatus();
+		GitCore::FPushTarget Target;
+		const GitCore::FOpResult Resolved = Repository.ResolvePush(Session.GetSnapshot()->Status, Repository.DefaultRemote(), Target);
+		if (!Resolved.bOk)
+		{
+			return FGitActionResult::FromOp(Resolved);
+		}
+		if (Target.NeedsAgreement() && !bAgreed)
+		{
+			// The question was asked, or skipped, from the last snapshot; the branch has changed since.
+			Session.RefreshRemote();
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("PushNeedsAgreement", "Not pushed: this push would publish {0}. Push again to be asked."),
+				FText::FromString(Target.Remote + TEXT("/") + Target.Branch)));
+		}
+		if (bLocking)
+		{
+			// Changing a file someone else has locked clashes with their work, and Git LFS refuses such pushes
+			// when lfs.locksverify is on: say so before trying.
+			Session.RefreshLocks(GitCore::ECallKind::UserNetwork);
+			TArray<FString> Blocked;
+			FString Error;
+			if (!Session.FindLockedByOthers(Target.Remote, Blocked, &Error))
+			{
+				return FGitActionResult::Failure(FText::FromString(Error));
+			}
+			if (!Blocked.IsEmpty())
+			{
+				return FGitActionResult::Failure(FText::Format(LOCTEXT("PushBlocked", "Not pushed: {0} is locked by someone else."), GitWorkspaceText::FileList(Blocked)));
+			}
+		}
+		Session.CancelBackgroundWork();
+		const GitCore::FOpResult Pushed = Repository.Push(Target, Cancel);
+		Session.RefreshStatus();
+		Session.RefreshRemote();
+		return FGitActionResult::FromOp(Pushed);
+	}
+
+	/** Splits a remote branch's name, such as origin/main, into remote and branch. Remote names may hold slashes, so the longest match wins. */
+	bool SplitRemoteBranch(const GitCore::FSessionSnapshot& Snapshot, const FString& Name, FString& OutRemote, FString& OutBranch)
+	{
+		OutRemote.Reset();
+		OutBranch.Reset();
+		for (const FString& Remote : Snapshot.Remotes)
+		{
+			if (Name.StartsWith(Remote + TEXT("/"), ESearchCase::CaseSensitive) && Remote.Len() > OutRemote.Len())
+			{
+				OutRemote = Remote;
+				OutBranch = Name.Mid(Remote.Len() + 1);
+			}
+		}
+		return !OutRemote.IsEmpty();
+	}
+
+	/** Waits on the game thread for Op to run on the mutation lane, with a progress dialog. */
+	FGitActionResult RunAndWait(const GitCore::FGitSessionRef& Session, const FText& Activity, TFunctionRef<FGitActionResult(GitCore::FGitSession&)> Op)
+	{
+		struct FShared
+		{
+			FThreadSafeBool bDone;
+			FGitActionResult Result;
+		};
+		const TSharedRef<FShared, ESPMode::ThreadSafe> Shared = MakeShared<FShared, ESPMode::ThreadSafe>();
+		// The game thread waits below, so referencing Op from the lane is safe.
+		Session->EnqueueMutation([Session, Shared, &Op]()
+		{
+			Shared->Result = Op(*Session);
+			Shared->bDone = true;
+		});
+		FScopedSlowTask Progress(1.0f, Activity);
+		Progress.MakeDialogDelayed(0.3f);
+		while (!Shared->bDone)
+		{
+			Progress.TickProgress();
+			FPlatformProcess::Sleep(0.02f);
+		}
+		return Shared->Result;
+	}
+}
+
+FGitActionResult FGitActionResult::Success(const FText& InMessage)
+{
+	FGitActionResult Result;
+	Result.Message = InMessage;
+	return Result;
+}
+
+FGitActionResult FGitActionResult::Failure(const FText& InMessage, const FString& InDetails)
+{
+	FGitActionResult Result;
+	Result.bOk = false;
+	Result.Message = InMessage;
+	Result.Details = InDetails;
+	return Result;
+}
+
+FGitActionResult FGitActionResult::FromOp(const GitCore::FOpResult& Op)
+{
+	return Op.bOk ? Success(FText::FromString(Op.Message)) : Failure(FText::FromString(Op.Message), Op.Details);
+}
+
+FGitWorkspaceModel* FGitWorkspaceModel::Get()
+{
+	return Instance.Get();
+}
+
+void FGitWorkspaceModel::Startup()
+{
+	Instance = MakeShared<FGitWorkspaceModel>();
+	Instance->RepositoryChangedHandle = ProviderInstance().OnRepositoryChanged().AddSP(Instance.ToSharedRef(), &FGitWorkspaceModel::OnRepositoryChanged);
+}
+
+void FGitWorkspaceModel::Shutdown()
+{
+	if (Instance.IsValid())
+	{
+		ProviderInstance().OnRepositoryChanged().Remove(Instance->RepositoryChangedHandle);
+		Instance.Reset();
+	}
+}
+
+TSharedRef<FGitWorkspaceModel> FGitWorkspaceModel::CreateFor(FGitWorkspaceProvider& InProvider)
+{
+	const TSharedRef<FGitWorkspaceModel> Model = MakeShared<FGitWorkspaceModel>();
+	Model->BoundProvider = &InProvider;
+	Model->RepositoryChangedHandle = InProvider.OnRepositoryChanged().AddSP(Model, &FGitWorkspaceModel::OnRepositoryChanged);
+	return Model;
+}
+
+FGitWorkspaceModel::~FGitWorkspaceModel()
+{
+	if (BoundProvider)
+	{
+		BoundProvider->OnRepositoryChanged().Remove(RepositoryChangedHandle);
+	}
+	if (ProgressTicker.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ProgressTicker);
+	}
+}
+
+FGitWorkspaceProvider& FGitWorkspaceModel::GetProvider() const
+{
+	return BoundProvider ? *BoundProvider : ProviderInstance();
+}
+
+void FGitWorkspaceModel::RunAtSafePoint(TFunction<void()> Task) const
+{
+	if (BoundProvider)
+	{
+		Task();
+		return;
+	}
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Task = MoveTemp(Task)](float)
+	{
+		Task();
+		return false;
+	}));
+}
+
+bool FGitWorkspaceModel::IsActive() const
+{
+	if (BoundProvider)
+	{
+		return BoundProvider->GetSession().IsValid();
+	}
+	ISourceControlModule& SourceControl = ISourceControlModule::Get();
+	return SourceControl.IsEnabled() && SourceControl.GetProvider().GetName() == GitWorkspaceProvider::Name() && ProviderInstance().GetSession().IsValid();
+}
+
+GitCore::FGitSessionPtr FGitWorkspaceModel::GetSession() const
+{
+	return IsActive() ? GetProvider().GetSession() : nullptr;
+}
+
+GitCore::FSessionSnapshotRef FGitWorkspaceModel::GetSnapshot() const
+{
+	static const GitCore::FSessionSnapshotRef Empty = MakeShared<GitCore::FSessionSnapshot, ESPMode::ThreadSafe>();
+	const GitCore::FGitSessionPtr Session = GetSession();
+	return Session.IsValid() ? Session->GetSnapshot() : Empty;
+}
+
+bool FGitWorkspaceModel::IsLockingEnabled() const
+{
+	return IsActive() && GetProvider().IsLockingEnabled();
+}
+
+bool FGitWorkspaceModel::IsBusy() const
+{
+	// A session closed under a running action (provider switched off) ends it.
+	return !Activity.IsEmpty() && ActivitySession.IsValid();
+}
+
+FText FGitWorkspaceModel::GetActivity() const
+{
+	GitCore::FLockProgressPtr Progress = ActivityProgress;
+	if (!Progress.IsValid() && ActivityOperation.IsValid())
+	{
+		Progress = GetProvider().FindProgress(ActivityOperation.ToSharedRef());
+	}
+	return Progress.IsValid() && Progress->Total > 1 ? FGitProgressBar::Describe(*Progress) : Activity;
+}
+
+void FGitWorkspaceModel::Cancel()
+{
+	if (ActivityCancel.IsValid())
+	{
+		ActivityCancel->Cancel();
+	}
+	if (ActivityOperation.IsValid())
+	{
+		GetProvider().CancelOperation(ActivityOperation.ToSharedRef());
+	}
+}
+
+void FGitWorkspaceModel::DismissFailure()
+{
+	LastFailure.Reset();
+	Changed.Broadcast();
+}
+
+void FGitWorkspaceModel::OnRepositoryChanged()
+{
+	Changed.Broadcast();
+}
+
+bool FGitWorkspaceModel::Run(const FText& InActivity, ELane Lane, FWork Work, FDone Done, bool bQuietSuccess, GitCore::FLockProgressPtr Progress)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid() || IsBusy())
+	{
+		return false;
+	}
+	Activity = InActivity;
+	ActivitySession = Session;
+	ActivityCancel = MakeShared<GitCore::FCancelToken, ESPMode::ThreadSafe>();
+	ActivityProgress = Progress;
+	if (Progress.IsValid())
+	{
+		ProgressTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak = AsWeak()](float)
+		{
+			const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin();
+			if (Self.IsValid() && Self->ActivityProgress.IsValid())
+			{
+				Self->ProgressBar.Update(*Self->ActivityProgress);
+				return true;
+			}
+			return false;
+		}), 0.1f);
+	}
+	LastFailure.Reset();
+	Changed.Broadcast();
+	auto Task = [Weak = AsWeak(), Session, Cancel = ActivityCancel, Work = MoveTemp(Work), Done = MoveTemp(Done), bQuietSuccess]() mutable
+	{
+		FGitActionResult Result = Work(*Session, Cancel);
+		AsyncTask(ENamedThreads::GameThread, [Weak, Result = MoveTemp(Result), Done = MoveTemp(Done), bQuietSuccess]() mutable
+		{
+			if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
+			{
+				Self->Finish(Result, bQuietSuccess);
+				if (Done)
+				{
+					Done(Result);
+				}
+			}
+		});
+	};
+	if (Lane == ELane::Mutation)
+	{
+		Session->EnqueueMutation(MoveTemp(Task));
+	}
+	else
+	{
+		Session->EnqueueBackground(MoveTemp(Task));
+	}
+	return true;
+}
+
+void FGitWorkspaceModel::RunQuick(FWork Work)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		return;
+	}
+	Session->EnqueueMutation([Weak = AsWeak(), Session, Work = MoveTemp(Work)]() mutable
+	{
+		FGitActionResult Result = Work(*Session, nullptr);
+		if (!Result.bOk)
+		{
+			AsyncTask(ENamedThreads::GameThread, [Weak, Result = MoveTemp(Result)]()
+			{
+				if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
+				{
+					Self->LastFailure = Result;
+					Self->Present(Result);
+					Self->Changed.Broadcast();
+				}
+			});
+		}
+	});
+}
+
+void FGitWorkspaceModel::EndActivity()
+{
+	Activity = FText::GetEmpty();
+	ActivitySession.Reset();
+	ActivityCancel.Reset();
+	ActivityOperation.Reset();
+	ActivityProgress.Reset();
+	ProgressBar.Close();
+	if (ProgressTicker.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ProgressTicker);
+		ProgressTicker.Reset();
+	}
+}
+
+void FGitWorkspaceModel::OnOperationComplete(const FSourceControlOperationRef& Operation, ECommandResult::Type Result)
+{
+	if (ActivityOperation.Get() != &Operation.Get())
+	{
+		return;
+	}
+	EndActivity();
+	// The provider has shown the outcome; the panel's banner keeps a failure.
+	const TArray<FText>& Errors = Operation->GetResultInfo().ErrorMessages;
+	if (Result == ECommandResult::Failed && !Errors.IsEmpty())
+	{
+		LastFailure = FGitActionResult::Failure(Errors[0]);
+	}
+	Changed.Broadcast();
+}
+
+void FGitWorkspaceModel::Finish(const FGitActionResult& Result, bool bQuietSuccess)
+{
+	EndActivity();
+	if (!Result.bOk)
+	{
+		LastFailure = Result;
+	}
+	if (!Result.bOk || !bQuietSuccess)
+	{
+		Present(Result);
+	}
+	Changed.Broadcast();
+}
+
+void FGitWorkspaceModel::Present(const FGitActionResult& Result)
+{
+	if (Result.Message.IsEmpty())
+	{
+		return;
+	}
+	FNotificationInfo Info(Result.Message);
+	Info.ExpireDuration = Result.bOk ? 4.0f : 8.0f;
+	Info.bUseSuccessFailIcons = true;
+	if (!Result.bOk)
+	{
+		FMessageLog Log("SourceControl");
+		Log.Error(Result.Message);
+		if (!Result.Details.IsEmpty())
+		{
+			Log.Info(FText::FromString(Result.Details));
+		}
+		Info.Hyperlink = FSimpleDelegate::CreateLambda([]() { FMessageLog("SourceControl").Open(); });
+		Info.HyperlinkText = LOCTEXT("ShowLog", "Show log");
+	}
+	if (const TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
+	{
+		Item->SetCompletionState(Result.bOk ? SNotificationItem::CS_Success : SNotificationItem::CS_Fail);
+	}
+}
+
+void FGitWorkspaceModel::Fetch()
+{
+	Run(LOCTEXT("Fetching", "Checking for new commits…"), ELane::Background, [](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		FString Error;
+		if (!Session.Fetch(GitCore::ECallKind::UserNetwork, Cancel, &Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error));
+		}
+		const GitCore::FRemoteState& Remote = Session.GetSnapshot()->Remote;
+		if (Remote.Upstream.IsEmpty())
+		{
+			return FGitActionResult::Success(LOCTEXT("FetchedNoUpstream", "Fetched. This branch is not published yet."));
+		}
+		return Remote.Behind > 0
+			? FGitActionResult::Success(FText::Format(LOCTEXT("FetchedBehind", "{0} new {0}|plural(one=commit,other=commits) on {1}."), Remote.Behind, FText::FromString(Remote.Upstream)))
+			: FGitActionResult::Success(LOCTEXT("FetchedUpToDate", "You are up to date."));
+	});
+}
+
+void FGitWorkspaceModel::Push(bool bPublishing)
+{
+	if (IsBusy())
+	{
+		return;
+	}
+	const GitCore::FPushTarget Target = GetSnapshot()->Remote.Push;
+	const bool bAsk = !bPublishing && Target.NeedsAgreement();
+	if (bAsk && !GitWorkspaceDialogs::ConfirmPush(Target, false))
+	{
+		return;
+	}
+	const bool bAgreed = bPublishing || bAsk;
+	const bool bLocking = IsLockingEnabled();
+	Run(LOCTEXT("Pushing", "Pushing…"), ELane::Mutation, [bLocking, bAgreed](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		return PushNow(Session, bLocking, bAgreed, Cancel);
+	});
+}
+
+void FGitWorkspaceModel::Sync()
+{
+	if (IsActive() && !IsBusy())
+	{
+		FSourceControlWindows::SyncLatest();
+	}
+}
+
+void FGitWorkspaceModel::PullWithOptions()
+{
+	if (!IsActive() || IsBusy())
+	{
+		return;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	TMap<FString, TArray<FString>> Branches;
+	GitCore::FPullOptions Options = PullChoices(*Snapshot, Branches);
+	if (Options.Branch.IsEmpty())
+	{
+		Present(FGitActionResult::Failure(LOCTEXT("NothingToPull", "There is no remote branch to pull from. Add a remote, or Fetch first.")));
+		return;
+	}
+	if (!GitWorkspaceDialogs::AskPull(Snapshot->Status.Branch, Branches, Options))
+	{
+		return;
+	}
+	UGitWorkspaceUserSettings* User = GetMutableDefault<UGitWorkspaceUserSettings>();
+	User->bPullRebase = Options.bRebase;
+	User->bPullStash = Options.bStash;
+	User->SaveConfig();
+	if (Options.Remote + TEXT("/") + Options.Branch == Snapshot->Status.Upstream)
+	{
+		// Every pull uses the upstream; only another branch needs naming.
+		Options.Remote.Reset();
+		Options.Branch.Reset();
+	}
+	SyncWith(Options);
+}
+
+void FGitWorkspaceModel::SyncWith(const GitCore::FPullOptions& Options)
+{
+	// Unreal's Sync runs its preview and the pull before returning, so both see these options.
+	FGitWorkspaceProvider& Provider = GetProvider();
+	Provider.SetPullOptions(Options);
+	ON_SCOPE_EXIT
+	{
+		Provider.SetPullOptions({});
+	};
+	if (BoundProvider)
+	{
+		// Nothing is loaded from a test repository: its provider syncs it directly.
+		Provider.Execute(ISourceControlOperation::Create<FSync>(), {GetSession()->GetRepository().GetRoot()}, EConcurrency::Synchronous);
+		return;
+	}
+	FSourceControlWindows::SyncLatest();
+}
+
+GitCore::FPullOptions FGitWorkspaceModel::PullChoices(const GitCore::FSessionSnapshot& Snapshot, TMap<FString, TArray<FString>>& OutBranches)
+{
+	const UGitWorkspaceUserSettings* User = GetDefault<UGitWorkspaceUserSettings>();
+	GitCore::FPullOptions Options;
+	Options.bRebase = User->bPullRebase;
+	Options.bStash = User->bPullStash;
+	OutBranches.Reset();
+	for (const FString& Remote : Snapshot.Remotes)
+	{
+		OutBranches.Add(Remote);
+	}
+	for (const GitCore::FBranchInfo& Branch : Snapshot.Branches)
+	{
+		FString Remote;
+		FString Name;
+		if (Branch.bRemote && SplitRemoteBranch(Snapshot, Branch.Name, Remote, Name))
+		{
+			OutBranches.FindOrAdd(Remote).Add(Name);
+		}
+	}
+	if (!Snapshot.Status.Upstream.IsEmpty() && SplitRemoteBranch(Snapshot, Snapshot.Status.Upstream, Options.Remote, Options.Branch))
+	{
+		OutBranches.FindOrAdd(Options.Remote).AddUnique(Options.Branch);
+		return Options;
+	}
+	// No upstream on a remote: the branch's own name, else main or master, on origin or the first remote.
+	Options.Remote = OutBranches.Contains(TEXT("origin")) ? FString(TEXT("origin")) : Snapshot.Remotes.IsEmpty() ? FString() : Snapshot.Remotes[0];
+	if (const TArray<FString>* Names = OutBranches.Find(Options.Remote))
+	{
+		for (const FString& Candidate : {Snapshot.Status.Branch, FString(TEXT("main")), FString(TEXT("master"))})
+		{
+			if (Names->Contains(Candidate))
+			{
+				Options.Branch = Candidate;
+				break;
+			}
+		}
+		if (Options.Branch.IsEmpty() && !Names->IsEmpty())
+		{
+			Options.Branch = (*Names)[0];
+		}
+	}
+	return Options;
+}
+
+void FGitWorkspaceModel::CheckIn()
+{
+	if (IsActive())
+	{
+		FSourceControlWindows::ChoosePackagesToCheckIn();
+	}
+}
+
+void FGitWorkspaceModel::CheckLocks()
+{
+	Run(LOCTEXT("CheckingLocks", "Checking locks…"), ELane::Background, [](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		FString Error;
+		if (!Session.RefreshLocks(GitCore::ECallKind::UserNetwork, &Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error.IsEmpty() ? Session.GetSnapshot()->Locks.Error : Error));
+		}
+		int32 Mine = 0;
+		const GitCore::FLockSnapshot& Locks = Session.GetSnapshot()->Locks;
+		for (const TPair<FString, GitCore::FLockInfo>& Pair : Locks.ByPath)
+		{
+			Mine += Pair.Value.bOurs ? 1 : 0;
+		}
+		return FGitActionResult::Success(FText::Format(LOCTEXT("LocksChecked", "{0} {0}|plural(one=lock,other=locks) on the server, {1} yours."), Locks.ByPath.Num(), Mine));
+	});
+}
+
+void FGitWorkspaceModel::Stage(const TArray<FString>& Paths)
+{
+	if (Paths.IsEmpty())
+	{
+		return;
+	}
+	RunQuick([Paths](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		const GitCore::FOpResult Result = Session.GetRepository().Stage(Paths);
+		Session.RefreshStatus(&Paths);
+		return FGitActionResult::FromOp(Result);
+	});
+}
+
+void FGitWorkspaceModel::Unstage(const TArray<FString>& Paths)
+{
+	if (Paths.IsEmpty())
+	{
+		return;
+	}
+	RunQuick([Paths](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		const GitCore::FOpResult Result = Session.GetRepository().Unstage(Paths);
+		Session.RefreshStatus(&Paths);
+		return FGitActionResult::FromOp(Result);
+	});
+}
+
+void FGitWorkspaceModel::Commit(const FString& Message, bool bPush, TFunction<void(bool bCommitted)> OnDone)
+{
+	// The commit must contain what the user reviewed; the repository refuses if HEAD or the index moved since.
+	const GitCore::FSessionSnapshotRef Seen = GetSnapshot();
+	const FString Head = Seen->Status.Head;
+	const FString StagedToken = Seen->Status.StagedToken;
+	const int32 Count = Seen->Status.StagedCount();
+	const bool bLocking = IsLockingEnabled();
+	// A push that would publish the branch asks before committing, so saying no leaves nothing half done.
+	const bool bAsk = bPush && Seen->Remote.Push.NeedsAgreement();
+	const bool bAgreed = bAsk && !IsBusy() && GitWorkspaceDialogs::ConfirmPush(Seen->Remote.Push, true);
+	if (bAsk && !bAgreed)
+	{
+		if (OnDone)
+		{
+			OnDone(false);
+		}
+		return;
+	}
+	const FText Doing = bPush ? LOCTEXT("CommittingAndPushing", "Committing and pushing…") : LOCTEXT("Committing", "Committing…");
+	const bool bStarted = Run(Doing, ELane::Mutation, [Message, bPush, bAgreed, Head, StagedToken, Count, bLocking](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		FString Commit;
+		const GitCore::FOpResult Committed = Session.GetRepository().CommitIndex(Message, Head, StagedToken, Commit);
+		Session.RefreshStatus();
+		if (!Committed.bOk)
+		{
+			return FGitActionResult::FromOp(Committed);
+		}
+		const FText Id = FText::FromString(GitWorkspaceText::ShortId(Commit));
+		FGitActionResult Result = FGitActionResult::Success(FText::Format(LOCTEXT("Committed", "Committed {0} {0}|plural(one=file,other=files) as {1}."), Count, Id));
+		Result.Paths = {Commit};
+		if (!bPush)
+		{
+			return Result;
+		}
+		const FGitActionResult Pushed = PushNow(Session, bLocking, bAgreed, Cancel);
+		if (!Pushed.bOk)
+		{
+			FGitActionResult Failed = FGitActionResult::Failure(FText::Format(LOCTEXT("CommittedNotPushed", "Committed {0} locally, but not pushed: {1}"), Id, Pushed.Message), Pushed.Details);
+			Failed.Paths = {Commit};
+			return Failed;
+		}
+		Result.Message = FText::Format(LOCTEXT("CommittedAndPushed", "Committed {0} {0}|plural(one=file,other=files) as {1} and pushed."), Count, Id);
+		return Result;
+	},
+	[OnDone](const FGitActionResult& Result)
+	{
+		if (OnDone)
+		{
+			OnDone(!Result.Paths.IsEmpty());
+		}
+	});
+	if (!bStarted && OnDone)
+	{
+		OnDone(false);
+	}
+}
+
+void FGitWorkspaceModel::Discard(const TArray<FString>& Paths)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid() || Paths.IsEmpty() || IsBusy())
+	{
+		return;
+	}
+	Activity = LOCTEXT("Discarding", "Discarding changes…");
+	ActivitySession = Session;
+	Changed.Broadcast();
+	RunAtSafePoint([Weak = AsWeak(), Session, Paths]()
+	{
+		const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin();
+		if (!Self.IsValid())
+		{
+			return;
+		}
+		const GitCore::FSessionSnapshotRef Snapshot = Session->GetSnapshot();
+		TArray<FString> Packages;
+		TArray<FString> Others;
+		TArray<FString> NewOthers;
+		for (const FString& Path : Paths)
+		{
+			const FString File = Session->GetRepository().ToAbsolute(Path);
+			const GitCore::FStatusEntry* Entry = Snapshot->Status.Find(Path);
+			if (IsPackagePath(Path))
+			{
+				Packages.Add(File);
+			}
+			else if (Entry && Entry->bUntracked)
+			{
+				NewOthers.Add(File);
+			}
+			else
+			{
+				Others.Add(File);
+			}
+		}
+		bool bOk = true;
+		if (Self->BoundProvider)
+		{
+			// Nothing is loaded from a test repository: the provider reverts everything directly.
+			Others.Append(Packages);
+			Packages.Reset();
+		}
+		// The editor unloads the packages, the provider reverts them (keeping a backup) and the editor reloads them.
+		if (!Packages.IsEmpty())
+		{
+			bOk &= USourceControlHelpers::RevertAndReloadPackages(Packages, false, true);
+		}
+		if (!Others.IsEmpty())
+		{
+			bOk &= Self->GetProvider().Execute(ISourceControlOperation::Create<FRevert>(), Others) == ECommandResult::Succeeded;
+		}
+		for (const FString& File : NewOthers)
+		{
+			bOk &= IFileManager::Get().Delete(*File, false, true, true);
+		}
+		Session->RequestStatusRefresh();
+		Self->Finish(bOk ? FGitActionResult::Success(FText::Format(LOCTEXT("Discarded", "Discarded changes to {0}."), GitWorkspaceText::FileList(Paths)))
+			: FGitActionResult::Failure(LOCTEXT("DiscardFailed", "Some changes could not be discarded. See the Source Control log.")), false);
+	});
+}
+
+void FGitWorkspaceModel::ApplyLines(const FString& RelativePath, GitCore::ELineAction Action, const FString& ShownDiff, const GitCore::FLineSelection& Lines)
+{
+	if (Lines.IsEmpty() || !IsActive())
+	{
+		return;
+	}
+	const FGitCommandSettings Settings = GetProvider().MakeCommandSettings();
+	RunQuick([RelativePath, Action, ShownDiff, Lines, Settings](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		const GitCore::FGitRepository& Repository = Session.GetRepository();
+		const GitCore::FOpResult Result = Repository.ApplyLines(RelativePath, Action, ShownDiff, Lines,
+			[&Repository, &RelativePath, &Settings]() { GitWorkers::BackUpFiles(Repository, {RelativePath}, Settings); });
+		const TArray<FString> Paths = {RelativePath};
+		Session.RefreshStatus(&Paths);
+		return FGitActionResult::FromOp(Result);
+	});
+}
+
+void FGitWorkspaceModel::Lock(const TArray<FString>& Paths)
+{
+	TArray<FString> Files;
+	for (const FString& Path : Paths)
+	{
+		Files.Add(ToAbsolute(Path));
+	}
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid() || Files.IsEmpty())
+	{
+		return;
+	}
+	const FSourceControlOperationRef Operation = ISourceControlOperation::Create<FCheckOut>();
+	if (IsBusy())
+	{
+		// It queues behind the running action; the status bar still shows its progress.
+		GetProvider().Execute(Operation, Files, EConcurrency::Asynchronous);
+		return;
+	}
+	Activity = LOCTEXT("Locking", "Locking…");
+	ActivitySession = Session;
+	ActivityOperation = Operation;
+	LastFailure.Reset();
+	Changed.Broadcast();
+	GetProvider().Execute(Operation, Files, EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateSP(this, &FGitWorkspaceModel::OnOperationComplete));
+}
+
+void FGitWorkspaceModel::Unlock(const TArray<FString>& Paths, bool bForce)
+{
+	const GitCore::FLockProgressRef Progress = MakeShared<GitCore::FLockProgress, ESPMode::ThreadSafe>();
+	Run(LOCTEXT("Unlocking", "Releasing locks…"), ELane::Mutation, [Paths, bForce, Progress](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		const FString Remote = Session.ResolveLockRemote();
+		TArray<GitCore::FLockInfo> Locks;
+		for (const FString& Path : Paths)
+		{
+			const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Path);
+			if (Lock && (Lock->bOurs || bForce))
+			{
+				Locks.Add(*Lock);
+			}
+		}
+		Progress->Start(Locks.Num(), true);
+		TArray<FString> Released;
+		TArray<FString> Failed;
+		FString Details;
+		for (const GitCore::FLockInfo& Lock : Locks)
+		{
+			if (Cancel.IsValid() && Cancel->IsCancelled())
+			{
+				break;
+			}
+			const GitCore::FOpResult Result = Session.GetRepository().Unlock(Remote, Lock.Id, !Lock.bOurs);
+			if (Result.bOk)
+			{
+				Session.RecordLockReleased(Lock.Path);
+				Released.Add(Lock.Path);
+			}
+			else
+			{
+				Failed.Add(Lock.Path);
+				Details += Result.Message + TEXT("\n") + Result.Details + TEXT("\n");
+			}
+			++Progress->Done;
+		}
+		if (!Failed.IsEmpty())
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("UnlockFailed", "Could not release the lock on {0}."), GitWorkspaceText::FileList(Failed)), Details);
+		}
+		if (Progress->Done < Locks.Num())
+		{
+			return FGitActionResult::Success(FText::Format(LOCTEXT("UnlockStopped", "Stopped after releasing {0} of {1} locks."), Released.Num(), Locks.Num()));
+		}
+		return FGitActionResult::Success(FText::Format(LOCTEXT("Unlocked", "Released {0} {0}|plural(one=lock,other=locks)."), Released.Num()));
+	}, nullptr, false, Progress);
+}
+
+FGitWorkspaceModel::FLockChoices FGitWorkspaceModel::GetLockChoices(const TArray<FString>& RelativePaths) const
+{
+	FLockChoices Choices;
+	if (!IsLockingEnabled())
+	{
+		return Choices;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	for (const FString& Path : RelativePaths)
+	{
+		if (const GitCore::FLockInfo* Held = Snapshot->Locks.Find(Path))
+		{
+			if (!Held->bOurs)
+			{
+				Choices.Theirs.Add(Path);
+				continue;
+			}
+			Choices.Unlock.Add(Path);
+			if (Snapshot->IsOursElsewhere(*Held))
+			{
+				Choices.Claim.Add(Path);
+			}
+			continue;
+		}
+		const GitCore::FStatusEntry* Entry = Snapshot->Status.Find(Path);
+		const bool bNew = Entry ? Entry->IsAdded() : !Snapshot->IsTracked(Path);
+		const GitCore::FFileAttributes* Attributes = Snapshot->FindAttributes(Path);
+		if (!bNew && Attributes && Attributes->bLockable)
+		{
+			Choices.Lock.Add(Path);
+		}
+	}
+	return Choices;
+}
+
+TArray<FString> FGitWorkspaceModel::GetFilesInFolders(const TArray<FString>& RelativeFolders) const
+{
+	TArray<FString> Prefixes;
+	for (const FString& Folder : RelativeFolders)
+	{
+		if (!Folder.IsEmpty())
+		{
+			Prefixes.Add(Folder.EndsWith(TEXT("/")) ? Folder : Folder + TEXT("/"));
+		}
+	}
+	// A folder named in the editor's spelling holds the files Git spells differently only in letter case.
+	auto InFolders = [&Prefixes](const FString& Path)
+	{
+		return Prefixes.ContainsByPredicate([&Path](const FString& Prefix) { return Path.StartsWith(Prefix, GitCore::PathCase()); });
+	};
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	TSet<FString> Files;
+	if (Snapshot->Tracked.IsValid())
+	{
+		for (const FString& Path : *Snapshot->Tracked)
+		{
+			if (IsPackagePath(Path) && InFolders(Path))
+			{
+				Files.Add(Path);
+			}
+		}
+	}
+	// Locks there too, also on files that are gone or not packages.
+	for (const TPair<FString, GitCore::FLockInfo>& Lock : Snapshot->Locks.ByPath)
+	{
+		if (InFolders(Lock.Key))
+		{
+			Files.Add(Lock.Key);
+		}
+	}
+	TArray<FString> Sorted = Files.Array();
+	Sorted.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::CaseSensitive) < 0; });
+	return Sorted;
+}
+
+void FGitWorkspaceModel::ClaimLocks(const TArray<FString>& Paths)
+{
+	Run(LOCTEXT("Claiming", "Claiming locks…"), ELane::Mutation, [Paths](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		// The server already lists these locks as yours: this worktree only records that it uses them now.
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		TArray<FString> Claimed;
+		TArray<FString> Failed;
+		FString Details;
+		for (const FString& Path : Paths)
+		{
+			const GitCore::FLockInfo* Lock = Snapshot->Locks.Find(Path);
+			if (!Lock || !Snapshot->IsOursElsewhere(*Lock))
+			{
+				continue;
+			}
+			FString Error;
+			if (!Session.RecordLockTaken(*Lock, &Error))
+			{
+				Failed.Add(Path);
+				Details += Error + TEXT("\n");
+				continue;
+			}
+			// Git LFS leaves lockable files read-only until they are locked.
+			FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*Session.GetRepository().ToAbsolute(Path), false);
+			Claimed.Add(Path);
+		}
+		if (!Failed.IsEmpty())
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("ClaimFailed", "Could not claim the lock on {0}."), GitWorkspaceText::FileList(Failed)), Details);
+		}
+		if (Claimed.IsEmpty())
+		{
+			return FGitActionResult::Failure(LOCTEXT("NothingToClaim", "None of these locks is yours from elsewhere any more. Check locks to see who holds them."));
+		}
+		return FGitActionResult::Success(FText::Format(LOCTEXT("Claimed", "Claimed the lock on {0}. You can save and check in here."), GitWorkspaceText::FileList(Claimed)));
+	});
+}
+
+void FGitWorkspaceModel::CreateBranch(const FString& Name)
+{
+	Run(LOCTEXT("CreatingBranch", "Creating the branch…"), ELane::Mutation, [Name](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		const GitCore::FOpResult Created = Session.GetRepository().CreateBranch(Name);
+		Session.RefreshStatus();
+		Session.RefreshBranches();
+		return Created.bOk ? FGitActionResult::Success(FText::Format(LOCTEXT("BranchCreated", "Created {0} and switched to it. Push to publish it."), FText::FromString(Name)))
+			: FGitActionResult::FromOp(Created);
+	});
+}
+
+void FGitWorkspaceModel::SwitchBranch(const FString& Name)
+{
+	const FText Doing = FText::Format(LOCTEXT("SwitchingTo", "Switching to {0}…"), FText::FromString(Name));
+	// First, without changing anything: refuse when local changes are in the way, and download LFS files.
+	Run(Doing, ELane::Mutation, [Name](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		const GitCore::FGitRepository& Repository = Session.GetRepository();
+		Session.RefreshStatus();
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		if (Snapshot->Status.bOperationInProgress)
+		{
+			return FGitActionResult::Failure(LOCTEXT("SwitchMidOperation", "Finish the merge or rebase in progress before switching branches."));
+		}
+		TSet<FString> Switched;
+		FString Error;
+		if (!Repository.ChangedPaths(TEXT("HEAD"), Name, Switched, Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error));
+		}
+		TArray<FString> Overlap;
+		for (const GitCore::FStatusEntry& Entry : Snapshot->Status.Entries)
+		{
+			if (Switched.Contains(Entry.Path))
+			{
+				Overlap.Add(Entry.Path);
+			}
+		}
+		if (!Overlap.IsEmpty())
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("SwitchOverlap", "Nothing was changed: {0} also differs on {1}. Commit, stash or discard those changes first."),
+				GitWorkspaceText::FileList(Overlap), FText::FromString(Name)));
+		}
+		const FString Remote = Repository.DefaultRemote();
+		if (!Remote.IsEmpty())
+		{
+			const GitCore::FOpResult Downloaded = Repository.FetchLfsObjects(Remote, Name, Cancel);
+			if (!Downloaded.bOk)
+			{
+				return FGitActionResult::FromOp(Downloaded);
+			}
+		}
+		FGitActionResult Prepared = FGitActionResult::Success();
+		Prepared.Paths = Switched.Array();
+		return Prepared;
+	},
+	[this, Name, Doing](const FGitActionResult& Prepared)
+	{
+		if (!Prepared.bOk)
+		{
+			return;
+		}
+		ApplyAndReload(Doing, Prepared.Paths, [Name](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+		{
+			const GitCore::FOpResult Switched = Session.GetRepository().SwitchBranch(Name);
+			Session.RefreshStatus();
+			Session.RefreshBranches();
+			return Switched.bOk ? FGitActionResult::Success(FText::Format(LOCTEXT("Switched", "Switched to {0}."), FText::FromString(Name))) : FGitActionResult::FromOp(Switched);
+		});
+	}, true);
+}
+
+bool FGitWorkspaceModel::FindMainBranch(const GitCore::FSessionSnapshot& Snapshot, FString& OutBranch, FString& OutUpstream)
+{
+	for (const TCHAR* Candidate : {TEXT("main"), TEXT("master"), TEXT("develop")})
+	{
+		const GitCore::FBranchInfo* Local = Snapshot.Branches.FindByPredicate([Candidate](const GitCore::FBranchInfo& Branch)
+		{
+			return !Branch.bRemote && Branch.Name.Equals(Candidate, ESearchCase::CaseSensitive);
+		});
+		// Sync and Finish work against its branch on the server, so that must have been fetched.
+		if (Local && Snapshot.Branches.ContainsByPredicate([Local](const GitCore::FBranchInfo& Branch)
+			{
+				return Branch.bRemote && !Local->Upstream.IsEmpty() && Branch.Name.Equals(Local->Upstream, ESearchCase::CaseSensitive);
+			}))
+		{
+			OutBranch = Local->Name;
+			OutUpstream = Local->Upstream;
+			return true;
+		}
+	}
+	return false;
+}
+
+void FGitWorkspaceModel::StartBranch(const FString& Name)
+{
+	FString Main;
+	FString Upstream;
+	if (!FindMainBranch(*GetSnapshot(), Main, Upstream))
+	{
+		return;
+	}
+	struct FStart
+	{
+		FString From;
+		FString Oid;
+	};
+	const TSharedRef<FStart> Start = MakeShared<FStart>();
+	const FText Doing = FText::Format(LOCTEXT("StartingBranch", "Starting {0}…"), FText::FromString(Name));
+	// First, without changing anything: pick where to start, refuse when local changes are in the way, and download LFS files.
+	Run(Doing, ELane::Mutation, [Main, Upstream, Start](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)
+	{
+		const GitCore::FGitRepository& Repository = Session.GetRepository();
+		Session.RefreshStatus();
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		if (Snapshot->Status.bOperationInProgress)
+		{
+			return FGitActionResult::Failure(LOCTEXT("StartMidOperation", "Finish the merge or rebase in progress before starting a branch."));
+		}
+		// The newer of the two, so the branch has everything known of main: its upstream, unless main has commits of its own.
+		bool bMainBehind = false;
+		FString Error;
+		if (!Repository.IsAncestor(Main, Upstream, bMainBehind, Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error));
+		}
+		Start->From = bMainBehind ? Upstream : Main;
+		if (!Repository.ResolveCommit(Start->From, Start->Oid))
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("StartNotFound", "{0} could not be found. Fetch, then try again."), FText::FromString(Start->From)));
+		}
+		TSet<FString> Switched;
+		if (!Snapshot->Status.bUnborn && !Repository.ChangedPaths(TEXT("HEAD"), Start->Oid, Switched, Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error));
+		}
+		TArray<FString> Overlap;
+		for (const GitCore::FStatusEntry& Entry : Snapshot->Status.Entries)
+		{
+			if (Switched.Contains(Entry.Path))
+			{
+				Overlap.Add(Entry.Path);
+			}
+		}
+		if (!Overlap.IsEmpty())
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("StartOverlap", "Nothing was changed: {0} also differs on {1}. Commit, stash or discard those changes first."),
+				GitWorkspaceText::FileList(Overlap), FText::FromString(Start->From)));
+		}
+		const FString Remote = Repository.DefaultRemote();
+		if (!Remote.IsEmpty() && !Switched.IsEmpty())
+		{
+			const GitCore::FOpResult Downloaded = Repository.FetchLfsObjects(Remote, Start->Oid, Cancel);
+			if (!Downloaded.bOk)
+			{
+				return FGitActionResult::FromOp(Downloaded);
+			}
+		}
+		FGitActionResult Prepared = FGitActionResult::Success();
+		Prepared.Paths = Switched.Array();
+		return Prepared;
+	},
+	[this, Name, Doing, Start](const FGitActionResult& Prepared)
+	{
+		if (!Prepared.bOk)
+		{
+			return;
+		}
+		ApplyAndReload(Doing, Prepared.Paths, [Name, Start](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+		{
+			const GitCore::FOpResult Created = Session.GetRepository().CreateBranch(Name, Start->Oid);
+			Session.RefreshStatus();
+			Session.RefreshBranches();
+			return Created.bOk ? FGitActionResult::Success(FText::Format(LOCTEXT("BranchStarted", "Started {0} on {1}. Push to publish it."), FText::FromString(Name), FText::FromString(Start->From)))
+				: FGitActionResult::FromOp(Created);
+		});
+	}, true);
+}
+
+void FGitWorkspaceModel::SyncBranch()
+{
+	if (!IsActive() || IsBusy())
+	{
+		return;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	FString Main;
+	FString Upstream;
+	GitCore::FPullOptions Options;
+	if (Snapshot->Status.Branch.IsEmpty() || !FindMainBranch(*Snapshot, Main, Upstream) || !SplitRemoteBranch(*Snapshot, Upstream, Options.Remote, Options.Branch))
+	{
+		return;
+	}
+	Options.bRebase = true;
+	Options.bStash = true;
+	Options.bSyncBranch = !Snapshot->Status.Branch.Equals(Main, ESearchCase::CaseSensitive);
+	SyncWith(Options);
+}
+
+void FGitWorkspaceModel::FinishBranch()
+{
+	if (!IsActive() || IsBusy())
+	{
+		return;
+	}
+	const GitCore::FSessionSnapshotRef Snapshot = GetSnapshot();
+	const FString Branch = Snapshot->Status.Branch;
+	FString Main;
+	FString Upstream;
+	if (Branch.IsEmpty() || !FindMainBranch(*Snapshot, Main, Upstream) || Branch.Equals(Main, ESearchCase::CaseSensitive))
+	{
+		return;
+	}
+	if (!GitWorkspaceDialogs::Confirm(LOCTEXT("FinishTitle", "Finish branch"),
+		FText::Format(LOCTEXT("FinishPrompt", "Merge {0} into {1} and switch to {1}? Your files stay as they are, and nothing is pushed until you push {1}."), FText::FromString(Branch), FText::FromString(Main)),
+		{}, LOCTEXT("FinishButton", "Finish")))
+	{
+		return;
+	}
+	Run(FText::Format(LOCTEXT("Finishing", "Finishing {0}…"), FText::FromString(Branch)), ELane::Mutation, [Branch, Main, Upstream](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		Session.RefreshStatus();
+		const GitCore::FSessionSnapshotRef Current = Session.GetSnapshot();
+		if (Current->Status.bOperationInProgress || Current->Status.HasConflicts())
+		{
+			return FGitActionResult::Failure(LOCTEXT("FinishMidOperation", "Finish the merge or rebase in progress (or resolve its conflicts) first."));
+		}
+		if (!Current->Status.Branch.Equals(Branch, ESearchCase::CaseSensitive))
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("FinishMoved", "Nothing was changed: you are no longer on {0}."), FText::FromString(Branch)));
+		}
+		int32 Commits = 0;
+		const GitCore::FOpResult Finished = Session.GetRepository().FinishBranch(Main, Upstream, Commits);
+		Session.RefreshStatus();
+		Session.RefreshBranches();
+		if (!Finished.bOk)
+		{
+			return FGitActionResult::FromOp(Finished);
+		}
+		return FGitActionResult::Success(Commits == 1
+			? FText::Format(LOCTEXT("FinishedOne", "Finished {0}: {1} now has its commit. Push {1} to publish it."), FText::FromString(Branch), FText::FromString(Main))
+			: FText::Format(LOCTEXT("FinishedMerge", "Finished {0}: its {2} commits are merged into {1}. Push {1} to publish them."), FText::FromString(Branch), FText::FromString(Main), Commits));
+	});
+}
+
+void FGitWorkspaceModel::StashChanges(const FString& Message, bool bIncludeUntracked)
+{
+	const FText Doing = LOCTEXT("Stashing", "Stashing changes…");
+	Run(Doing, ELane::Mutation, [bIncludeUntracked](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		Session.RefreshStatus();
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		if (Snapshot->Status.HasConflicts() || Snapshot->Status.bOperationInProgress)
+		{
+			return FGitActionResult::Failure(LOCTEXT("StashMidOperation", "Finish the merge or rebase in progress (or resolve its conflicts) before stashing."));
+		}
+		FGitActionResult Prepared = FGitActionResult::Success();
+		for (const GitCore::FStatusEntry& Entry : Snapshot->Status.Entries)
+		{
+			if (!Entry.bUntracked || bIncludeUntracked)
+			{
+				Prepared.Paths.Add(Entry.Path);
+			}
+		}
+		if (Prepared.Paths.IsEmpty())
+		{
+			return FGitActionResult::Failure(LOCTEXT("NothingToStash", "There are no changes to stash."));
+		}
+		return Prepared;
+	},
+	[this, Doing, Message, bIncludeUntracked](const FGitActionResult& Prepared)
+	{
+		if (!Prepared.bOk)
+		{
+			return;
+		}
+		// Stashing puts the files back to their committed versions, so loaded packages reload.
+		ApplyAndReload(Doing, Prepared.Paths, [Message, bIncludeUntracked](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+		{
+			const GitCore::FOpResult Stashed = Session.GetRepository().StashPush({}, Message, bIncludeUntracked);
+			Session.RefreshStatus();
+			Session.RefreshStashes();
+			return Stashed.bOk ? FGitActionResult::Success(LOCTEXT("Stashed", "Your changes were stashed.")) : FGitActionResult::FromOp(Stashed);
+		});
+	}, true);
+}
+
+void FGitWorkspaceModel::ApplyStash(const FString& Selector, bool bDrop)
+{
+	const FText Doing = bDrop ? LOCTEXT("Popping", "Restoring the stash…") : LOCTEXT("Applying", "Applying the stash…");
+	Run(Doing, ELane::Mutation, [Selector](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		Session.RefreshStatus();
+		TArray<FString> Paths;
+		FString Error;
+		if (!Session.GetRepository().ReadStashPaths(Selector, Paths, Error))
+		{
+			return FGitActionResult::Failure(FText::FromString(Error));
+		}
+		const GitCore::FSessionSnapshotRef Snapshot = Session.GetSnapshot();
+		TArray<FString> Overlap;
+		for (const FString& Path : Paths)
+		{
+			if (Snapshot->Status.Find(Path))
+			{
+				Overlap.Add(Path);
+			}
+		}
+		if (!Overlap.IsEmpty())
+		{
+			return FGitActionResult::Failure(FText::Format(LOCTEXT("StashOverlap", "Nothing was changed: you have local changes to {0}, which the stash also changes. Commit, stash or discard them first."),
+				GitWorkspaceText::FileList(Overlap)));
+		}
+		FGitActionResult Prepared = FGitActionResult::Success();
+		Prepared.Paths = MoveTemp(Paths);
+		return Prepared;
+	},
+	[this, Doing, Selector, bDrop](const FGitActionResult& Prepared)
+	{
+		if (!Prepared.bOk)
+		{
+			return;
+		}
+		ApplyAndReload(Doing, Prepared.Paths, [Selector, bDrop](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+		{
+			const GitCore::FOpResult Applied = Session.GetRepository().StashApply(Selector, true, bDrop);
+			Session.RefreshStatus();
+			Session.RefreshStashes();
+			if (!Applied.bOk)
+			{
+				return FGitActionResult::FromOp(Applied);
+			}
+			return FGitActionResult::Success(bDrop ? LOCTEXT("Popped", "Restored the stash and removed it.") : LOCTEXT("Applied", "Applied the stash. It is kept until you delete it."));
+		});
+	}, true);
+}
+
+void FGitWorkspaceModel::DropStash(const FString& Selector)
+{
+	Run(LOCTEXT("DroppingStash", "Deleting the stash…"), ELane::Mutation, [Selector](GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr&)
+	{
+		const GitCore::FOpResult Dropped = Session.GetRepository().StashDrop(Selector);
+		Session.RefreshStashes();
+		return Dropped.bOk ? FGitActionResult::Success(LOCTEXT("Dropped", "Deleted the stash.")) : FGitActionResult::FromOp(Dropped);
+	});
+}
+
+void FGitWorkspaceModel::ApplyAndReload(const FText& InActivity, const TArray<FString>& Paths, FWork Op)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		return;
+	}
+	Activity = InActivity;
+	ActivitySession = Session;
+	Changed.Broadcast();
+	const TSharedRef<FWork> SharedOp = MakeShared<FWork>(MoveTemp(Op));
+	RunAtSafePoint([Weak = AsWeak(), Session = Session.ToSharedRef(), InActivity, Paths, SharedOp]()
+	{
+		const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin();
+		if (!Self.IsValid())
+		{
+			return;
+		}
+		TArray<FString> Packages;
+		for (const FString& Path : Paths)
+		{
+			if (IsPackagePath(Path))
+			{
+				Packages.Add(Session->GetRepository().ToAbsolute(Path));
+			}
+		}
+		FGitActionResult Result = FGitActionResult::Failure(LOCTEXT("ReloadRefused", "Nothing was changed: the editor could not unload the affected assets. See the Output Log."));
+		auto Apply = [&Result, &Session, &InActivity, &SharedOp](const TArray<FString>&)
+		{
+			Result = RunAndWait(Session, InActivity, [&SharedOp](GitCore::FGitSession& InSession) { return (*SharedOp)(InSession, nullptr); });
+			return Result.bOk;
+		};
+		if (Self->BoundProvider)
+		{
+			Apply(Packages);
+		}
+		else
+		{
+			USourceControlHelpers::ApplyOperationAndReloadPackages(Packages, Apply, true, true);
+		}
+		// New and changed packages show up in the Content Browser without waiting for the file watcher.
+		TArray<FString> Existing = Packages.FilterByPredicate([](const FString& File) { return IFileManager::Get().FileExists(*File); });
+		if (!Existing.IsEmpty())
+		{
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().ScanModifiedAssetFiles(Existing);
+		}
+		Session->RequestLockRefresh(false);
+		Self->Finish(Result, false);
+	});
+}
+
+void FGitWorkspaceModel::LoadHistory(int32 Limit, const FString& Upstream, TFunction<void(TArray<GitCore::FHistoryCommit>&&, bool, const FString&)> OnLoaded)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		OnLoaded({}, false, FString());
+		return;
+	}
+	Session->EnqueueRead([Session, Limit, Upstream, OnLoaded]()
+	{
+		TArray<GitCore::FHistoryCommit> Commits;
+		bool bHasMore = false;
+		FString Error;
+		Session->GetRepository().ReadHistory(Limit, Upstream, Commits, bHasMore, Error);
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Commits = MoveTemp(Commits), bHasMore, Error]() mutable
+		{
+			OnLoaded(MoveTemp(Commits), bHasMore, Error);
+		});
+	});
+}
+
+void FGitWorkspaceModel::LoadCommit(const FString& Oid, TFunction<void(GitCore::FCommitDetails&&, const FString&)> OnLoaded)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		OnLoaded({}, FString());
+		return;
+	}
+	Session->EnqueueRead([Session, Oid, OnLoaded]()
+	{
+		GitCore::FCommitDetails Details;
+		FString Error;
+		Session->GetRepository().ReadCommit(Oid, Details, Error);
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Details = MoveTemp(Details), Error]() mutable
+		{
+			OnLoaded(MoveTemp(Details), Error);
+		});
+	});
+}
+
+void FGitWorkspaceModel::LoadStashPaths(const FString& Selector, TFunction<void(TArray<FString>&&, TSet<FString>&&, const FString&)> OnLoaded)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		OnLoaded({}, {}, FString());
+		return;
+	}
+	Session->EnqueueRead([Session, Selector, OnLoaded]()
+	{
+		TArray<FString> Paths;
+		FString Error;
+		Session->GetRepository().ReadStashPaths(Selector, Paths, Error);
+		TSet<FString> Lfs = Session->GetRepository().FindLfsPaths(Paths);
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Paths = MoveTemp(Paths), Lfs = MoveTemp(Lfs), Error]() mutable
+		{
+			OnLoaded(MoveTemp(Paths), MoveTemp(Lfs), Error);
+		});
+	});
+}
+
+bool FGitWorkspaceModel::IsLfs(const FString& RelativePath) const
+{
+	const GitCore::FFileAttributes* Attributes = GetSnapshot()->FindAttributes(RelativePath);
+	return Attributes && Attributes->bLfs;
+}
+
+void FGitWorkspaceModel::LoadDiff(const FString& RelativePath, bool bStaged, TFunction<void(FString&&, const FString&)> OnLoaded)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		OnLoaded(FString(), FString());
+		return;
+	}
+	// Git has nothing to compare a new file with; its content is the change.
+	const GitCore::FStatusEntry* Entry = GetSnapshot()->Status.Find(RelativePath);
+	const FString NewFile = !bStaged && Entry && Entry->bUntracked ? ToAbsolute(RelativePath) : FString();
+	Session->EnqueueRead([Session, RelativePath, bStaged, NewFile, OnLoaded]()
+	{
+		FString Diff;
+		FString Error;
+		if (!NewFile.IsEmpty())
+		{
+			TArray<uint8> Bytes;
+			if (IFileManager::Get().FileSize(*NewFile) > GitCore::NewFileDiffLimit)
+			{
+				Error = LOCTEXT("NewFileTooLarge", "This new file is too large to show.").ToString();
+			}
+			else if (FFileHelper::LoadFileToArray(Bytes, *NewFile, FILEREAD_Silent))
+			{
+				Diff = GitCore::NewFileDiff(Bytes);
+			}
+			else
+			{
+				Error = LOCTEXT("NewFileUnreadable", "This new file could not be read.").ToString();
+			}
+		}
+		else
+		{
+			const GitCore::FOpResult Result = Session->GetRepository().Diff(RelativePath, bStaged, Diff);
+			if (!Result.bOk)
+			{
+				Error = Result.Message;
+			}
+		}
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Diff = MoveTemp(Diff), Error]() mutable
+		{
+			OnLoaded(MoveTemp(Diff), Error);
+		});
+	});
+}
+
+void FGitWorkspaceModel::LoadCommitDiff(const FString& Oid, const FString& RelativePath, TFunction<void(FString&&, const FString&)> OnLoaded)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		OnLoaded(FString(), FString());
+		return;
+	}
+	Session->EnqueueRead([Session, Oid, RelativePath, OnLoaded]()
+	{
+		FString Diff;
+		const GitCore::FOpResult Result = Session->GetRepository().CommitDiff(Oid, RelativePath, Diff);
+		AsyncTask(ENamedThreads::GameThread, [OnLoaded, Diff = MoveTemp(Diff), Error = Result.bOk ? FString() : Result.Message]() mutable
+		{
+			OnLoaded(MoveTemp(Diff), Error);
+		});
+	});
+}
+
+FString FGitWorkspaceModel::ToAbsolute(const FString& RelativePath) const
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	return Session.IsValid() ? Session->GetRepository().ToAbsolute(RelativePath) : FString();
+}
+
+void FGitWorkspaceModel::OpenFile(const FString& RelativePath)
+{
+	const FString File = ToAbsolute(RelativePath);
+	if (File.IsEmpty() || !IFileManager::Get().FileExists(*File))
+	{
+		return;
+	}
+	if (!IsPackagePath(RelativePath))
+	{
+		FPlatformProcess::LaunchFileInDefaultExternalApplication(*File);
+		return;
+	}
+	// External actors and objects only open as part of their level.
+	TArray<FAssetData> Assets;
+	if (IsExternalPackage(RelativePath) || !USourceControlHelpers::GetAssetData(File, Assets) || Assets.IsEmpty() || !GEditor)
+	{
+		return;
+	}
+	if (UObject* Asset = Assets[0].GetAsset())
+	{
+		GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Asset);
+	}
+}
+
+void FGitWorkspaceModel::GetBrowseTargets(const TArray<FString>& RelativePaths, TArray<FAssetData>& OutAssets, TArray<FString>& OutFolders) const
+{
+	if (const GitCore::FGitSessionPtr Session = GetSession())
+	{
+		FindContentBrowserTargets(Session->GetRepository(), RelativePaths, OutAssets, OutFolders);
+	}
+}
+
+bool FGitWorkspaceModel::CanBrowseTo(const TArray<FString>& RelativePaths) const
+{
+	TArray<FAssetData> Assets;
+	TArray<FString> Folders;
+	GetBrowseTargets(RelativePaths, Assets, Folders);
+	return !Assets.IsEmpty() || !Folders.IsEmpty();
+}
+
+void FGitWorkspaceModel::BrowseTo(const TArray<FString>& RelativePaths)
+{
+	FContentBrowserSelection Selection;
+	GetBrowseTargets(RelativePaths, Selection.SelectedAssets, Selection.SelectedFolders);
+	if (Selection.Num() > 0)
+	{
+		FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get().SyncBrowserTo(Selection);
+	}
+}
+
+TArray<FString> FGitWorkspaceModel::GetRevealTargets(const TArray<FString>& RelativePaths) const
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	return Session.IsValid() ? FindRevealTargets(Session->GetRepository(), RelativePaths) : TArray<FString>();
+}
+
+bool FGitWorkspaceModel::CanReveal(const TArray<FString>& RelativePaths) const
+{
+	return !GetRevealTargets(RelativePaths).IsEmpty();
+}
+
+void FGitWorkspaceModel::Reveal(const TArray<FString>& RelativePaths)
+{
+	const TArray<FString> Targets = GetRevealTargets(RelativePaths);
+	// Like the Content Browser's own Show in Explorer: many windows only when the user agrees.
+	if (Targets.Num() > 10 && FMessageDialog::Open(EAppMsgType::YesNo,
+		FText::Format(LOCTEXT("RevealMany", "Open {0} {1} windows?"), Targets.Num(), FPlatformMisc::GetFileManagerName())) != EAppReturnType::Yes)
+	{
+		return;
+	}
+	for (const FString& Target : Targets)
+	{
+		FPlatformProcess::ExploreFolder(*IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*Target));
+	}
+}
+
+FText FGitWorkspaceModel::RevealLabel()
+{
+	return FText::Format(LOCTEXT("RevealLabel", "Show in {0}"), FPlatformMisc::GetFileManagerName());
+}
+
+void FGitWorkspaceModel::ShowDiff(const FString& RelativePath, bool bStaged)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		return;
+	}
+	if (IsPackagePath(RelativePath))
+	{
+		const GitCore::FStatusEntry* Entry = GetSnapshot()->Status.Find(RelativePath);
+		if (!Entry || Entry->IsAdded() || Entry->IsDeleted() || IsExternalPackage(RelativePath))
+		{
+			Present(FGitActionResult::Failure(LOCTEXT("NoAssetDiff", "Only edits to existing assets can be compared. Open new assets instead.")));
+			return;
+		}
+		const FString File = ToAbsolute(RelativePath);
+		TArray<FAssetData> Assets;
+		if (USourceControlHelpers::GetAssetData(File, Assets) && !Assets.IsEmpty())
+		{
+			if (UObject* Asset = Assets[0].GetAsset())
+			{
+				FAssetToolsModule::GetModule().Get().DiffAgainstDepot(Asset, Assets[0].PackageName.ToString(), Assets[0].AssetName.ToString());
+			}
+		}
+		return;
+	}
+	const FText Title = FText::Format(LOCTEXT("DiffTitle", "{0} ({1})"), FText::FromString(FPaths::GetCleanFilename(RelativePath)),
+		bStaged ? LOCTEXT("StagedSide", "staged") : LOCTEXT("WorkingSide", "not staged"));
+	LoadDiff(RelativePath, bStaged, [Weak = AsWeak(), Title](FString&& Diff, const FString& Error)
+	{
+		if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
+		{
+			Self->ShowTextDiff(Title, Diff, Error);
+		}
+	});
+}
+
+void FGitWorkspaceModel::ShowHistory(const FString& RelativePath)
+{
+	FString PackageName;
+	if (IsPackagePath(RelativePath) && FPackageName::TryConvertFilenameToLongPackageName(ToAbsolute(RelativePath), PackageName))
+	{
+		FSourceControlWindows::DisplayRevisionHistory({PackageName});
+	}
+}
+
+void FGitWorkspaceModel::ShowCommitDiff(const GitCore::FHistoryCommit& Commit, const GitCore::FHistoryChange& Change)
+{
+	const GitCore::FGitSessionPtr Session = GetSession();
+	if (!Session.IsValid())
+	{
+		return;
+	}
+	if (!IsPackagePath(Change.Path))
+	{
+		const FText Title = FText::Format(LOCTEXT("CommitDiffTitle", "{0} in {1}"), FText::FromString(FPaths::GetCleanFilename(Change.Path)),
+			FText::FromString(GitWorkspaceText::ShortId(Commit.Oid)));
+		LoadCommitDiff(Commit.Oid, Change.Path, [Weak = AsWeak(), Title](FString&& Diff, const FString& Error)
+		{
+			if (const TSharedPtr<FGitWorkspaceModel> Self = Weak.Pin())
+			{
+				Self->ShowTextDiff(Title, Diff, Error);
+			}
+		});
+		return;
+	}
+	auto LoadRevision = [this, &Session, &Change](const FString& Oid, const FString& Path) -> UObject*
+	{
+		const TSharedRef<FGitWorkspaceRevision, ESPMode::ThreadSafe> Revision = MakeShared<FGitWorkspaceRevision, ESPMode::ThreadSafe>();
+		Revision->LocalFilename = ToAbsolute(Change.Path);
+		Revision->PathInCommit = Path;
+		Revision->CommitId = Oid;
+		Revision->ShortCommitId = GitWorkspaceText::ShortId(Oid);
+		Revision->Repository = Session->GetRepositoryRef();
+		UPackage* Package = DiffUtils::LoadPackageForDiff(Revision);
+		return Package ? Package->FindAssetInPackage() : nullptr;
+	};
+	const bool bHasOld = Change.Status != TEXT('A') && !Commit.Parents.IsEmpty();
+	UObject* NewAsset = Change.Status != TEXT('D') ? LoadRevision(Commit.Oid, Change.Path) : nullptr;
+	UObject* OldAsset = bHasOld ? LoadRevision(Commit.Parents[0], Change.OldPath.IsEmpty() ? Change.Path : Change.OldPath) : nullptr;
+	if (!NewAsset || !OldAsset)
+	{
+		Present(FGitActionResult::Failure(Change.Status == TEXT('A') ? LOCTEXT("AddedInCommit", "This asset was added in this commit; there is no earlier version to compare.")
+			: Change.Status == TEXT('D') ? LOCTEXT("DeletedInCommit", "This asset was deleted in this commit.")
+			: LOCTEXT("DiffLoadFailed", "This asset version could not be loaded for comparison.")));
+		return;
+	}
+	FRevisionInfo OldRevision;
+	OldRevision.Revision = GitWorkspaceText::ShortId(Commit.Parents[0]);
+	FRevisionInfo NewRevision;
+	NewRevision.Revision = GitWorkspaceText::ShortId(Commit.Oid);
+	FAssetToolsModule::GetModule().Get().DiffAssets(OldAsset, NewAsset, OldRevision, NewRevision);
+}
+
+void FGitWorkspaceModel::ShowTextDiff(const FText& Title, const FString& Diff, const FString& Error) const
+{
+	const TSharedRef<SGitDiffView> View = SNew(SGitDiffView);
+	if (Error.IsEmpty())
+	{
+		View->SetDiff(Diff);
+	}
+	else
+	{
+		View->SetMessage(FText::FromString(Error));
+	}
+	const TSharedRef<SWindow> Window = SNew(SWindow)
+		.Title(Title)
+		.ClientSize(FVector2D(1000.0f, 680.0f))
+		.SupportsMinimize(false);
+	Window->SetContent(
+		SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("Brushes.Panel"))
+		.Padding(4.0f)
+		[
+			View
+		]);
+	FSlateApplication::Get().AddWindow(Window);
+}
+
+#undef LOCTEXT_NAMESPACE

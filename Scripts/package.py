@@ -20,7 +20,7 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 ENGINE_VERSION = '5.8'
-MODULE = 'GitSourceControl'
+MODULE = 'GitWorkspace'
 PAYLOADS = ('LICENSE.txt', 'README.md', 'CHANGELOG.md', 'Config/FilterPlugin.ini', 'Docs/Packaging.md', 'Scripts/package.py')
 LIBRARIES = {
     'Win64': f'UnrealEditor-{MODULE}.dll',
@@ -91,7 +91,7 @@ def audit(package, engine, source=None):
         elif source is not None and digest(path) != digest(source / name):
             errors.append('File differs from the source: ' + name)
     try:
-        descriptor = json.loads((package / 'GitSourceControl.uplugin').read_text(encoding='utf-8'))
+        descriptor = json.loads((package / 'GitWorkspace.uplugin').read_text(encoding='utf-8'))
         if not descriptor.get('Installed') or MODULE not in {m['Name'] for m in descriptor['Modules']}:
             errors.append(f'The installed descriptor does not list the {MODULE} module')
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -143,7 +143,7 @@ def package_plugin(output):
         sys.exit('The output must be outside the plugin and engine folders.')
     output.mkdir(parents=True)
     script = engine / ('Engine/Build/BatchFiles/RunUAT.bat' if HOST == 'Win64' else 'Engine/Build/BatchFiles/RunUAT.sh')
-    command = [str(script), 'BuildPlugin', f'-Plugin={PLUGIN_ROOT / "GitSourceControl.uplugin"}', f'-Package={output / "Plugin"}', '-NoTargetPlatforms']
+    command = [str(script), 'BuildPlugin', f'-Plugin={PLUGIN_ROOT / "GitWorkspace.uplugin"}', f'-Package={output / "Plugin"}', '-NoTargetPlatforms']
     if HOST == 'Mac':
         command.append('-Architecture_Mac=arm64')
     print(f'Building the {HOST} editor package; log: {output / "BuildPlugin.log"}')

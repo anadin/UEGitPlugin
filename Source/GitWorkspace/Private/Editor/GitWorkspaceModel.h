@@ -1,0 +1,216 @@
+// Copyright UEGitPlugin contributors. Distributed under the MIT license.
+#pragma once
+
+#include "CoreMinimal.h"
+#include "AssetRegistry/AssetData.h"
+#include "Containers/Ticker.h"
+#include "Core/GitSession.h"
+#include "Provider/GitWorkspaceCommand.h"
+
+class FGitWorkspaceProvider;
+
+/** What an action did: shown as a notification and, when it failed, in the Git panel's banner. */
+struct FGitActionResult
+{
+	bool bOk = true;
+	FText Message;
+	FString Details;
+	/** Repository paths the action needs or touched (passed between the steps of switches and stashes). */
+	TArray<FString> Paths;
+
+	static FGitActionResult Success(const FText& InMessage = FText::GetEmpty());
+	static FGitActionResult Failure(const FText& InMessage, const FString& InDetails = FString());
+	static FGitActionResult FromOp(const GitCore::FOpResult& Op);
+};
+
+/**
+ * The editor's Git actions, shared by the status bar, the menus and the Git panel.
+ * Game thread only. Git work runs on the repository session's lanes, one action at a
+ * time; the session keeps refreshing status underneath.
+ */
+class FGitWorkspaceModel : public TSharedFromThis<FGitWorkspaceModel>
+{
+public:
+	/** Null in commandlets and before the editor integration registers. */
+	static FGitWorkspaceModel* Get();
+	static void Startup();
+	static void Shutdown();
+	/** A model bound to one provider instead of the editor's (tests). Reload steps run inline; the provider must outlive the model. */
+	static TSharedRef<FGitWorkspaceModel> CreateFor(FGitWorkspaceProvider& InProvider);
+
+	FGitWorkspaceModel() = default;
+	~FGitWorkspaceModel();
+
+	/** Git Workspace is the editor's revision control provider and found a repository. */
+	bool IsActive() const;
+	GitCore::FGitSessionPtr GetSession() const;
+	GitCore::FSessionSnapshotRef GetSnapshot() const;
+	bool IsLockingEnabled() const;
+
+	/** Broadcast after the repository state or the running action changed. */
+	DECLARE_MULTICAST_DELEGATE(FOnChanged);
+	FOnChanged& OnChanged() { return Changed; }
+
+	bool IsBusy() const;
+	/** What the running action is doing; locking or releasing several files says how many are done ("Locking files: 3 of 12"). */
+	FText GetActivity() const;
+	/** Stops the running action: at once, or after the file being locked or released. */
+	void Cancel();
+	/** The last failure, until dismissed or until the next action starts. */
+	const TOptional<FGitActionResult>& GetLastFailure() const { return LastFailure; }
+	void DismissFailure();
+
+	void Fetch();
+	/**
+	 * Pushes the branch. A push that would create a branch on the server, or change the branch this one
+	 * follows, asks first, unless bPublishing: the user chose Publish.
+	 */
+	void Push(bool bPublishing = false);
+	/** Unreal's Sync: saves, integrates incoming commits and reloads the changed packages. */
+	void Sync();
+	/** The Git panel's Pull: asks where from and how (the Pull dialog), remembers how, then runs Sync that way. */
+	void PullWithOptions();
+	/** What the Pull dialog offers: each remote's branches, with the upstream picked (without one, the likeliest branch). */
+	static GitCore::FPullOptions PullChoices(const GitCore::FSessionSnapshot& Snapshot, TMap<FString, TArray<FString>>& OutBranches);
+	/** Unreal's Submit Content dialog. */
+	void CheckIn();
+	void CheckLocks();
+
+	void Stage(const TArray<FString>& Paths);
+	void Unstage(const TArray<FString>& Paths);
+	/** Commits the index as the user last saw it; refuses if HEAD or the index changed since. A push asks first as Push does. */
+	void Commit(const FString& Message, bool bPush, TFunction<void(bool bCommitted)> OnDone = nullptr);
+	/** Discards local changes. Packages are reverted through the editor, which reloads them. */
+	void Discard(const TArray<FString>& Paths);
+	/**
+	 * Stages, unstages or discards some lines of a text file. ShownDiff is the diff from LoadDiff they were picked in;
+	 * nothing changes if the file's diff is no longer the same. Discarding keeps a copy of the file, as Revert does.
+	 */
+	void ApplyLines(const FString& RelativePath, GitCore::ELineAction Action, const FString& ShownDiff, const GitCore::FLineSelection& Lines);
+	/** Unreal's Check Out: takes the LFS locks. While nothing else runs, it is the running action, with progress and Cancel. */
+	void Lock(const TArray<FString>& Paths);
+	/** Releases locks held on Paths, counting them as it goes; bForce also releases other people's locks. */
+	void Unlock(const TArray<FString>& Paths, bool bForce);
+	/** What the lock actions would act on among some repository paths: the right-click menus offer the ones that have any. */
+	struct FLockChoices
+	{
+		/** Files Lock locks: lockable, committed (a new file has nothing on the server to lock), and locked by nobody. */
+		TArray<FString> Lock;
+		/** Your locks taken in another clone, worktree or computer, which Claim takes over. */
+		TArray<FString> Claim;
+		/** Your locks, here or elsewhere, which Unlock releases. */
+		TArray<FString> Unlock;
+		/** Other people's locks, which only a forced release frees. */
+		TArray<FString> Theirs;
+	};
+	/** Empty while locking is off. */
+	FLockChoices GetLockChoices(const TArray<FString>& RelativePaths) const;
+	/** The packages in repository folders (and theirs, all the way down) and the files locked there: what a folder's lock actions act on. */
+	TArray<FString> GetFilesInFolders(const TArray<FString>& RelativeFolders) const;
+	/**
+	 * Takes over your locks on Paths that were taken in another clone, worktree or computer, so the
+	 * files can be saved and checked in here. Nothing is sent to the server.
+	 */
+	void ClaimLocks(const TArray<FString>& Paths);
+
+	void CreateBranch(const FString& Name);
+	void SwitchBranch(const FString& Name);
+	/** Lean branching's main branch: main, master or develop, the first that follows a fetched branch on a remote. */
+	static bool FindMainBranch(const GitCore::FSessionSnapshot& Snapshot, FString& OutBranch, FString& OutUpstream);
+	/** Lean branching's Start: creates Name from the newer of the main branch and its upstream, and switches to it. Local changes come along. */
+	void StartBranch(const FString& Name);
+	/**
+	 * Lean branching's Sync, as Unreal's Sync: on the main branch it pulls with rebase; on another branch it rebases the branch
+	 * onto the main branch's upstream and moves the branch's copy on the server along. Local changes are set aside meanwhile.
+	 */
+	void SyncBranch();
+	/** Lean branching's Finish: asks, then merges the current branch into the main branch and switches to it. No file changes; nothing is pushed. */
+	void FinishBranch();
+	void StashChanges(const FString& Message, bool bIncludeUntracked);
+	void ApplyStash(const FString& Selector, bool bDrop);
+	void DropStash(const FString& Selector);
+
+	/** Reads the history of HEAD and of Upstream (empty for none) on the session's read lane; OnLoaded runs on the game thread. */
+	void LoadHistory(int32 Limit, const FString& Upstream, TFunction<void(TArray<GitCore::FHistoryCommit>&& Commits, bool bHasMore, const FString& Error)> OnLoaded);
+	void LoadCommit(const FString& Oid, TFunction<void(GitCore::FCommitDetails&& Details, const FString& Error)> OnLoaded);
+	/** A stash's files, and which of them are stored through Git LFS. OnLoaded runs on the game thread. */
+	void LoadStashPaths(const FString& Selector, TFunction<void(TArray<FString>&& Paths, TSet<FString>&& LfsPaths, const FString& Error)> OnLoaded);
+	/** A changed (or tracked package) file is stored through Git LFS, as the attribute files say. */
+	bool IsLfs(const FString& RelativePath) const;
+	/** A changed file's text diff, staged or unstaged side; a new file shows its whole content. OnLoaded runs on the game thread. */
+	void LoadDiff(const FString& RelativePath, bool bStaged, TFunction<void(FString&& Diff, const FString& Error)> OnLoaded);
+	/** How a file changed in a commit, as a text diff. OnLoaded runs on the game thread. */
+	void LoadCommitDiff(const FString& Oid, const FString& RelativePath, TFunction<void(FString&& Diff, const FString& Error)> OnLoaded);
+
+	FString ToAbsolute(const FString& RelativePath) const;
+	void OpenFile(const FString& RelativePath);
+	/** What Show in Content Browser selects for these repository files and folders: assets, and Content Browser folders. */
+	void GetBrowseTargets(const TArray<FString>& RelativePaths, TArray<FAssetData>& OutAssets, TArray<FString>& OutFolders) const;
+	bool CanBrowseTo(const TArray<FString>& RelativePaths) const;
+	/**
+	 * Selects in the Content Browser: assets and folders under a mounted content folder, a World
+	 * Partition actor's level, and the folder of an asset that no longer exists. Other files are left out.
+	 */
+	void BrowseTo(const TArray<FString>& RelativePaths);
+	/** What Show in Finder / Explorer opens: absolute files (shown selected) and folders, one per folder. */
+	TArray<FString> GetRevealTargets(const TArray<FString>& RelativePaths) const;
+	bool CanReveal(const TArray<FString>& RelativePaths) const;
+	/** Shows files and folders in Finder / Explorer, one window per folder; a file that is gone shows the folder it was in. */
+	void Reveal(const TArray<FString>& RelativePaths);
+	/** "Show in Finder", "Show in Explorer" or the platform's file manager. */
+	static FText RevealLabel();
+	/** Asset diff against the last commit, or a text diff (staged or unstaged side). */
+	void ShowDiff(const FString& RelativePath, bool bStaged);
+	void ShowHistory(const FString& RelativePath);
+	/** How a file changed in a commit: an asset diff against the parent, or the commit's text diff. */
+	void ShowCommitDiff(const GitCore::FHistoryCommit& Commit, const GitCore::FHistoryChange& Change);
+
+private:
+	enum class ELane : uint8
+	{
+		Mutation,
+		Background
+	};
+	using FWork = TUniqueFunction<FGitActionResult(GitCore::FGitSession& Session, const GitCore::FCancelTokenPtr& Cancel)>;
+	using FDone = TUniqueFunction<void(const FGitActionResult& Result)>;
+
+	FGitWorkspaceProvider& GetProvider() const;
+	/** Runs Task from the main loop, outside Slate input handling and task callbacks: package reloads need that. */
+	void RunAtSafePoint(TFunction<void()> Task) const;
+	void OnRepositoryChanged();
+	/**
+	 * Runs Work on a session lane and reports its result. False when nothing could start. Work that counts files
+	 * in Progress has it shown in the panel and, from a few seconds on, in the status bar.
+	 */
+	bool Run(const FText& InActivity, ELane Lane, FWork Work, FDone Done = nullptr, bool bQuietSuccess = false, GitCore::FLockProgressPtr Progress = nullptr);
+	/** Quick local work (staging) that queues behind a running action instead of waiting for it; only failures are reported. */
+	void RunQuick(FWork Work);
+	void Finish(const FGitActionResult& Result, bool bQuietSuccess);
+	void EndActivity();
+	/** The end of a provider operation that was the running action; the provider has reported its outcome. */
+	void OnOperationComplete(const FSourceControlOperationRef& Operation, ECommandResult::Type Result);
+	void Present(const FGitActionResult& Result);
+	/** Unreal's Sync with Options (for a model bound to a test provider, that provider's Sync of the whole repository). */
+	void SyncWith(const GitCore::FPullOptions& Options);
+	/**
+	 * Second step of branch switches and stashes: runs Op on the mutation lane while the editor
+	 * unloads, then reloads, the packages of Paths (the world too when one of its packages is affected).
+	 */
+	void ApplyAndReload(const FText& InActivity, const TArray<FString>& Paths, FWork Op);
+	void ShowTextDiff(const FText& Title, const FString& Diff, const FString& Error) const;
+
+	FGitWorkspaceProvider* BoundProvider = nullptr;
+	FDelegateHandle RepositoryChangedHandle;
+	FOnChanged Changed;
+	FText Activity;
+	TWeakPtr<GitCore::FGitSession, ESPMode::ThreadSafe> ActivitySession;
+	GitCore::FCancelTokenPtr ActivityCancel;
+	/** The provider operation the running action waits for (Lock); its progress and Cancel apply. */
+	TSharedPtr<ISourceControlOperation, ESPMode::ThreadSafe> ActivityOperation;
+	/** Files the running action has done, when it counts them itself (Unlock). */
+	GitCore::FLockProgressPtr ActivityProgress;
+	/** Shows ActivityProgress in the status bar (the provider shows its own operations'). */
+	FGitProgressBar ProgressBar;
+	FTSTicker::FDelegateHandle ProgressTicker;
+	TOptional<FGitActionResult> LastFailure;
+};
