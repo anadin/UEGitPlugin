@@ -1409,6 +1409,11 @@ bool FGitPanelHistoryLabelsTest::RunTest(const FString&)
 	TArray<FString> ChangesRow = Row(Changes);
 	TestTrue(TEXT("The row is titled: ") + GitTest::Joined(ChangesRow), GitTest::HasExactly(ChangesRow, TEXT("Uncommitted changes")));
 	TestTrue(TEXT("It counts the changes not staged"), GitTest::HasExactly(ChangesRow, TEXT("1 file not staged")));
+	// The list makes HEAD's row right after theirs. On Windows it came out as a second "Uncommitted changes" row, with
+	// no labels, author or date: commit rows read an argument they were made without (dev check now finds those).
+	const TArray<FString> HeadRow = Row(FindListed(*List, TEXT("mine")));
+	TestTrue(TEXT("HEAD's commit keeps its own row: ") + GitTest::Joined(HeadRow), GitTest::HasExactly(HeadRow, TEXT("mine"))
+		&& GitTest::HasExactly(HeadRow, TEXT("main")) && !GitTest::HasExactly(HeadRow, TEXT("Uncommitted changes")));
 	const GitHistoryGraph::FRow* ChangesGraph = History->FindGraphRow(Changes);
 	const GitHistoryGraph::FRow* HeadGraph = History->FindGraphRow(FindListed(*List, TEXT("mine")));
 	if (TestTrue(TEXT("Every row has its part of the graph"), ChangesGraph != nullptr && HeadGraph != nullptr))

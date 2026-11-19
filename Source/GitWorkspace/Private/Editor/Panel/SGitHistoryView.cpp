@@ -74,8 +74,8 @@ namespace
 	public:
 		SLATE_BEGIN_ARGS(SGitCommitRow) {}
 			SLATE_ARGUMENT(SGitHistoryView::FCommitPtr, Commit)
-			/** The uncommitted changes' row: a dot, the title and Note. */
-			SLATE_ARGUMENT(bool, bUncommitted)
+			/** The uncommitted changes' row: a dot, the title and Note. Without a default, commit rows read leftover memory. */
+			SLATE_ARGUMENT_DEFAULT(bool, bUncommitted) { false };
 			/** On HEAD's commit: the branch checked out ("HEAD" when detached). */
 			SLATE_ARGUMENT(FText, Branch)
 			SLATE_ARGUMENT(FText, BranchTooltip)

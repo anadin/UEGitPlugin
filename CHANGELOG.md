@@ -42,6 +42,7 @@
 - Pushing main after lean branching's Finish no longer goes round in circles when someone pushed to main meanwhile. The push said to pull first, and Pull, rebasing by default, refused: the finished branch's commits are on the server already, so rebasing would copy them. Pull now merges in that case and says so, and the push that follows goes through. Lean branching's Sync still only rebases.
 - Git panel: files stored through Git LFS carry a small **LFS** tag after their name, in Changes and in a commit's or stash's files.
 - The plugin is now named GitWorkspace, its module too, so it sits next to Unreal's own Git plugin instead of hiding it: both are in **Edit > Plugins**, and both providers in Connect to Revision Control. Projects that enable it as GitSourceControl change that name to GitWorkspace in their `.uproject`. Settings saved under the old name are copied over the first time, and the provider choice is unchanged. Building over an earlier build removes the old module name from the plugin's Binaries, where it would stop Unreal's own Git plugin from loading and the editor from starting. Classes that had the same names as ones in Unreal's plugin were renamed as well, since both modules now load together.
+- Git panel: on Windows, History could show your branch's latest commit as an "Uncommitted changes" row, without its labels, author, date or id; selecting it still showed the commit. Whether a row was a commit came from a setting with no default, so it read leftover memory, which happened to say "commit" on macOS.
 
 ## 4.0.0-alpha
 
